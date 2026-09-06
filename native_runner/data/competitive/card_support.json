@@ -1,0 +1,864 @@
+{
+  "version": "competitive-card-support.v1",
+  "compatibility": {
+    "mechanics_readiness_report_id": "19058712db46281ee3e3ae41dcfe13d40af695259c299f26245e44bc6ee38ca6",
+    "static_catalog_id": "6b9a35d0647e944697579421d2a766d65ea96c56b3363352ca5dd73a69907d81",
+    "case_scope_id": "7fdb0167bb462dc8bed3e3a72631bcbaeb61ecd267c0e8701c24e0bb5aa5f39b"
+  },
+  "supported_cards": [
+    {
+      "card_id": 26000000,
+      "name": "Knight",
+      "form_availability": 3,
+      "compatibility_sha256": "ca1a2ca6b46a05d724be44bd0040209c7af8c2fcfddc1640d49302fe04983262"
+    },
+    {
+      "card_id": 26000001,
+      "name": "Archer",
+      "form_availability": 1,
+      "compatibility_sha256": "bfa62e9085b7def0a70af3b2f6162d5c040e74bd07845ba3807c316d019ebee9"
+    },
+    {
+      "card_id": 26000002,
+      "name": "Goblins",
+      "form_availability": 2,
+      "compatibility_sha256": "55ec5afe9afc17438598e53ad2e69299a94ed7d4d7ff93bbb038c0c0c9db25c1"
+    },
+    {
+      "card_id": 26000003,
+      "name": "Giant",
+      "form_availability": 2,
+      "compatibility_sha256": "b39cb76a6094e65d41183dfdfa8f0be45288bff043af7b5e40f41602a22bf2f8"
+    },
+    {
+      "card_id": 26000004,
+      "name": "Pekka",
+      "form_availability": 1,
+      "compatibility_sha256": "b15acc22068617909c158ba04b4fad4e503b67444930a48601dcd69b8a5cbd4f"
+    },
+    {
+      "card_id": 26000005,
+      "name": "Minions",
+      "form_availability": 0,
+      "compatibility_sha256": "3f2013db242f77ad9ea92128464efc6a6abaf3b9a31d8967605a080554b7baa9"
+    },
+    {
+      "card_id": 26000006,
+      "name": "Balloon",
+      "form_availability": 2,
+      "compatibility_sha256": "052d43bc7a76de3f0a992649d844cf52768f6baa79af4d719a70494a5588bb85"
+    },
+    {
+      "card_id": 26000007,
+      "name": "Witch",
+      "form_availability": 1,
+      "compatibility_sha256": "d6f656a05b446371d81fbb83301a9b37d90645c2e30abdfab7f08230e0994642"
+    },
+    {
+      "card_id": 26000008,
+      "name": "Barbarians",
+      "form_availability": 1,
+      "compatibility_sha256": "734a3a178288172cd4cd361667214b3f71c5d99cb05d01c541963fb88d260abb"
+    },
+    {
+      "card_id": 26000009,
+      "name": "Golem",
+      "form_availability": 0,
+      "compatibility_sha256": "5e5c58d3a55ad5a266fc527a5a528c869eec7aeddcfca40aa18e7405a80ee115"
+    },
+    {
+      "card_id": 26000010,
+      "name": "Skeletons",
+      "form_availability": 1,
+      "compatibility_sha256": "08d16ba04fe388a7d51eb8e4f0ad4d3918a17fd48f4dec2728bec6de06569d02"
+    },
+    {
+      "card_id": 26000011,
+      "name": "Valkyrie",
+      "form_availability": 3,
+      "compatibility_sha256": "eaa724c8356a5cc818708f4c153504ee86a78bcceb934868a03cda47037c702d"
+    },
+    {
+      "card_id": 26000012,
+      "name": "SkeletonArmy",
+      "form_availability": 1,
+      "compatibility_sha256": "de1f8e9a82937d7c03c684e6fd50de12d2a795d21cc8b3f5f945d2e99b8671bb"
+    },
+    {
+      "card_id": 26000013,
+      "name": "Bomber",
+      "form_availability": 1,
+      "compatibility_sha256": "3461c587c2833e8d773f4d805f0aec00596b7480f833a63176b946b3fcac2ce6"
+    },
+    {
+      "card_id": 26000014,
+      "name": "Musketeer",
+      "form_availability": 3,
+      "compatibility_sha256": "404181eb06963bb007fe19a1848d2c18370d92d3709c36316cacf151732bfab1"
+    },
+    {
+      "card_id": 26000015,
+      "name": "BabyDragon",
+      "form_availability": 1,
+      "compatibility_sha256": "448bf4ae641c662f296386d6052c6caaa16ec385ab2463f6678b7b54f09be3d4"
+    },
+    {
+      "card_id": 26000016,
+      "name": "Prince",
+      "form_availability": 0,
+      "compatibility_sha256": "09dcaf9d4c6d3be5b6c090e09cf9abae02a89d1b491148f24f73938858d5c4aa"
+    },
+    {
+      "card_id": 26000017,
+      "name": "Wizard",
+      "form_availability": 3,
+      "compatibility_sha256": "ce7f08beb57d9933a3d1f428e34e7529e66ad5df4ab719ee1b425c921de4d90c"
+    },
+    {
+      "card_id": 26000018,
+      "name": "MiniPekka",
+      "form_availability": 2,
+      "compatibility_sha256": "aec276749fedf34bd5d434d023b6109da905f43457b285cb0f6768e3580685f3"
+    },
+    {
+      "card_id": 26000019,
+      "name": "SpearGoblins",
+      "form_availability": 0,
+      "compatibility_sha256": "341b82adea68628a4312de69607d96c44c39415d953daf9dc5be5796d0299cb2"
+    },
+    {
+      "card_id": 26000020,
+      "name": "GiantSkeleton",
+      "form_availability": 0,
+      "compatibility_sha256": "6dd2a9f6c6bf7ab8d9c1956301dda841fe895a38ccf9289578e3735a976d102c"
+    },
+    {
+      "card_id": 26000021,
+      "name": "HogRider",
+      "form_availability": 0,
+      "compatibility_sha256": "6aef3fc52d3d96b670504aa18a621e1bb84124ba55d196b2e727b66b609c2147"
+    },
+    {
+      "card_id": 26000022,
+      "name": "MinionHorde",
+      "form_availability": 1,
+      "compatibility_sha256": "9cfb6d97401e22663ee73262aacfaa9bf89d0fe8929fa928c892ec0f471803ea"
+    },
+    {
+      "card_id": 26000023,
+      "name": "IceWizard",
+      "form_availability": 0,
+      "compatibility_sha256": "ffe170e0e3c8f75e6459529d5fe48f4f48ece0a510a59ccc3f0452c1519c25a3"
+    },
+    {
+      "card_id": 26000024,
+      "name": "RoyalGiant",
+      "form_availability": 1,
+      "compatibility_sha256": "ae43a130d1110f2e5c7db6acf3ef5079aa2ac68efa8983f849f770060b234b62"
+    },
+    {
+      "card_id": 26000025,
+      "name": "SkeletonWarriors",
+      "form_availability": 0,
+      "compatibility_sha256": "4ea19a3caa7b064dada98f48dc187ec058c3ef2fea821d7812445671337216bc"
+    },
+    {
+      "card_id": 26000026,
+      "name": "Princess",
+      "form_availability": 1,
+      "compatibility_sha256": "75cc715bf4cb3e24cca37342ce16a4b1de04592871a19624a664861c99a30eb5"
+    },
+    {
+      "card_id": 26000027,
+      "name": "DarkPrince",
+      "form_availability": 2,
+      "compatibility_sha256": "55a8b8cdc3340c6ad05ca840291b71fabee6456f1ddadaddb4e818758d377e65"
+    },
+    {
+      "card_id": 26000028,
+      "name": "ThreeMusketeers",
+      "form_availability": 0,
+      "compatibility_sha256": "3afe2732de34829191918045272c39f408db01adcca2840f8f2b5cb2ced49d16"
+    },
+    {
+      "card_id": 26000029,
+      "name": "LavaHound",
+      "form_availability": 0,
+      "compatibility_sha256": "affb86d48f8c566bcc129b4e04ed84deba55d171649b61ab4a151edea8ff40a9"
+    },
+    {
+      "card_id": 26000030,
+      "name": "IceSpirits",
+      "form_availability": 1,
+      "compatibility_sha256": "1b95154192ddd37036a52376ceb11242189ff5795805d6fa02feadf9f31b324b"
+    },
+    {
+      "card_id": 26000031,
+      "name": "FireSpirits",
+      "form_availability": 0,
+      "compatibility_sha256": "d38b359aa2433cc18a4784392879988c981db0c468a26767e036188fc85ed8e0"
+    },
+    {
+      "card_id": 26000032,
+      "name": "Miner",
+      "form_availability": 0,
+      "compatibility_sha256": "cf1c26eac6ef3f3af3ce1b75d96c3bb3b2c3e5c16d326a5c1cee275da0618e69"
+    },
+    {
+      "card_id": 26000033,
+      "name": "ZapMachine",
+      "form_availability": 0,
+      "compatibility_sha256": "e0f08164bdbd52a7441b9961963f806b05ddbe06fb2fe53dbe35b776898253fc"
+    },
+    {
+      "card_id": 26000034,
+      "name": "Bowler",
+      "form_availability": 2,
+      "compatibility_sha256": "0451c2b720355329c4bbb09ebba6738da51fe334f6c1f5816d6c0d781f1afb60"
+    },
+    {
+      "card_id": 26000035,
+      "name": "RageBarbarian",
+      "form_availability": 1,
+      "compatibility_sha256": "a1a9922f1c03e2fe5ad9ebb0648b634d86b2b50fd31ef65c9c7f272a0b4343f2"
+    },
+    {
+      "card_id": 26000036,
+      "name": "BattleRam",
+      "form_availability": 1,
+      "compatibility_sha256": "7b1fcb34637d5b3fd269d41bf8f0e7cb60107800456cb56d3f2d6b8e0335e2bf"
+    },
+    {
+      "card_id": 26000037,
+      "name": "InfernoDragon",
+      "form_availability": 1,
+      "compatibility_sha256": "40dcf78d1c6c7bbbc0ef50d143d9ee310b14fd13a9e986238c8857e0c728a876"
+    },
+    {
+      "card_id": 26000038,
+      "name": "IceGolemite",
+      "form_availability": 2,
+      "compatibility_sha256": "c0fe6bb58b15e4bdce31f2001d7956adf929c4cea89e4733db6fd65918965c06"
+    },
+    {
+      "card_id": 26000039,
+      "name": "MegaMinion",
+      "form_availability": 2,
+      "compatibility_sha256": "bb3b2a2f03ea16d47eb2651b6614de0bfb4d04ec78a01cf8b4ce29002fae3a8b"
+    },
+    {
+      "card_id": 26000040,
+      "name": "BlowdartGoblin",
+      "form_availability": 1,
+      "compatibility_sha256": "2d87d2e0b167742926c0ab194c089124696ea05d202c97a83ec8fcc888283d92"
+    },
+    {
+      "card_id": 26000041,
+      "name": "GoblinGang",
+      "form_availability": 0,
+      "compatibility_sha256": "65b501748943dc89c3a0805419f80f327682087f155da4720e441777a1f3943e"
+    },
+    {
+      "card_id": 26000042,
+      "name": "ElectroWizard",
+      "form_availability": 0,
+      "compatibility_sha256": "ff284b470486c9b30072909fe49fd2afa5d06b68f32efffc7c3c893dae00cf1c"
+    },
+    {
+      "card_id": 26000043,
+      "name": "AngryBarbarians",
+      "form_availability": 1,
+      "compatibility_sha256": "8922285c136c2834d20b0d84d951ca0f3d4a6aa53021a2acfe40b1f46d0fd783"
+    },
+    {
+      "card_id": 26000044,
+      "name": "Hunter",
+      "form_availability": 1,
+      "compatibility_sha256": "fcd53ab81ff080275c415184998e8dab2db2455825ddedf9cf52b922027d6a21"
+    },
+    {
+      "card_id": 26000045,
+      "name": "AxeMan",
+      "form_availability": 1,
+      "compatibility_sha256": "426a3839ce81a3a4cad35d23c19b5a2b6caf3de91dde25894234a39f95c94c74"
+    },
+    {
+      "card_id": 26000046,
+      "name": "Assassin",
+      "form_availability": 0,
+      "compatibility_sha256": "7b77a266a2ea4c407fb234c112e021a0e5d02ffd94056ef1a88c4e067ef8839a"
+    },
+    {
+      "card_id": 26000047,
+      "name": "RoyalRecruits",
+      "form_availability": 1,
+      "compatibility_sha256": "aa1a936c5de7db690138891a0246c13435fd62c470808da7ed25c51749287a3b"
+    },
+    {
+      "card_id": 26000048,
+      "name": "DarkWitch",
+      "form_availability": 0,
+      "compatibility_sha256": "a951b785c62d33962d7e95dd8f1dd7e1aa2e842264c4a08678ed7195e771ba6b"
+    },
+    {
+      "card_id": 26000049,
+      "name": "Bats",
+      "form_availability": 1,
+      "compatibility_sha256": "91d053c67d2982cf60cfe0a3cafc358bbfb0a2cb0011f9f4b69139a76672a87b"
+    },
+    {
+      "card_id": 26000050,
+      "name": "Ghost",
+      "form_availability": 1,
+      "compatibility_sha256": "77c9d1e2c96ff908710c4d5423465d760501da39755dd6b37e5192ba470cddd7"
+    },
+    {
+      "card_id": 26000051,
+      "name": "RamRider",
+      "form_availability": 0,
+      "compatibility_sha256": "633b62ef29a57254073174de067e89e78701aa178325db9c1e3dff370a61e60c"
+    },
+    {
+      "card_id": 26000052,
+      "name": "MiniSparkys",
+      "form_availability": 0,
+      "compatibility_sha256": "2f83c258af4f37ba27efb0582a77587fbade6c74814561e1dfa16ef459f29895"
+    },
+    {
+      "card_id": 26000053,
+      "name": "Rascals",
+      "form_availability": 0,
+      "compatibility_sha256": "aa894ef8a9a891a2818404244586ad78698f20c14fb815e760e39a39aa5b62de"
+    },
+    {
+      "card_id": 26000054,
+      "name": "MovingCannon",
+      "form_availability": 0,
+      "compatibility_sha256": "1266c77971a2b8973e241d5225a3d3b5900d2e8c76417d5a3c25bce2f4e58d56"
+    },
+    {
+      "card_id": 26000055,
+      "name": "MegaKnight",
+      "form_availability": 1,
+      "compatibility_sha256": "51afce1eb9cb55056efb8d46c693458ba3bbeaa975e11653a69569c787862427"
+    },
+    {
+      "card_id": 26000056,
+      "name": "SkeletonBalloon",
+      "form_availability": 1,
+      "compatibility_sha256": "09c15047bd0e6608c0404c8869b4ccacdbf311798c8dcf2ec72366d5012f7fe1"
+    },
+    {
+      "card_id": 26000057,
+      "name": "DartBarrell",
+      "form_availability": 0,
+      "compatibility_sha256": "6729fb11b62f44bba148253677f7069dac54f7d39566109b1cabb5a65d21425a"
+    },
+    {
+      "card_id": 26000058,
+      "name": "Wallbreakers",
+      "form_availability": 1,
+      "compatibility_sha256": "e2c386aca39eada3688748949e700f394ca18a0fb8c77e2aa8f984111699e746"
+    },
+    {
+      "card_id": 26000059,
+      "name": "RoyalHogs",
+      "form_availability": 1,
+      "compatibility_sha256": "437e39c4a0cd742bfa1e2346c959369e5e5132b3afac110b2887ab7df00b5bb1"
+    },
+    {
+      "card_id": 26000060,
+      "name": "GoblinGiant",
+      "form_availability": 1,
+      "compatibility_sha256": "6d3aab984d145865b365c4a7fcea4a387441fe8a63abf399157d55233889c142"
+    },
+    {
+      "card_id": 26000061,
+      "name": "Fisherman",
+      "form_availability": 0,
+      "compatibility_sha256": "1740d7f8a464936db306478577f58c71557915a579d4c8b0063e5e4498334836"
+    },
+    {
+      "card_id": 26000062,
+      "name": "EliteArcher",
+      "form_availability": 2,
+      "compatibility_sha256": "e28e3b1f5ce9e5a00381d4cbc113cf289977a71412466c656d45fe3d5c9dc466"
+    },
+    {
+      "card_id": 26000063,
+      "name": "ElectroDragon",
+      "form_availability": 1,
+      "compatibility_sha256": "3c7fec4a1ff85cc932b0f8866a969cbc0af3efbf0fc0d48c86ed7d39e6d3371c"
+    },
+    {
+      "card_id": 26000064,
+      "name": "Firecracker",
+      "form_availability": 1,
+      "compatibility_sha256": "da041fc75fda960485d8f4560ea40c0b1f15a739a0514754674c38876f384b25"
+    },
+    {
+      "card_id": 26000065,
+      "name": "MightyMiner",
+      "form_availability": 2,
+      "compatibility_sha256": "422698809d9e36aa58b71faa9a2b3609d32b319aaff25a979b7b3b7e8c661a7d"
+    },
+    {
+      "card_id": 26000067,
+      "name": "ElixirGolem",
+      "form_availability": 0,
+      "compatibility_sha256": "c31840d0d514fe74c5ca90baf1291b530e945a87929625e2dfd819fe7d42f0f6"
+    },
+    {
+      "card_id": 26000068,
+      "name": "BattleHealer",
+      "form_availability": 0,
+      "compatibility_sha256": "f9b2c44525a21a12a16f0618b07d0b7d24304054d1d3043ad4e82da376b8e521"
+    },
+    {
+      "card_id": 26000069,
+      "name": "SkeletonKing",
+      "form_availability": 2,
+      "compatibility_sha256": "8a1eff21ab0e575e2a228cab323f8c4fdcf5ca02f7aab83b970b3bc174917434"
+    },
+    {
+      "card_id": 26000072,
+      "name": "ArcherQueen",
+      "form_availability": 2,
+      "compatibility_sha256": "53f9daecaab3ab9f8322760a911fa784c3d2786f856284b5b7e503110a12f366"
+    },
+    {
+      "card_id": 26000074,
+      "name": "GoldenKnight",
+      "form_availability": 2,
+      "compatibility_sha256": "0d290308eb54376d28fed6f176394e4cde00d54016a44fcf770c68ae23c4af66"
+    },
+    {
+      "card_id": 26000077,
+      "name": "Monk",
+      "form_availability": 2,
+      "compatibility_sha256": "57010886fa40c1f775f54a24121ec79c3358e0f9b6b59dff856b73554ef692af"
+    },
+    {
+      "card_id": 26000080,
+      "name": "SkeletonDragons",
+      "form_availability": 0,
+      "compatibility_sha256": "cfd0d43139aa41fc026ad5e55eeb107c875aff557804b4c776c2ebd9db013eb1"
+    },
+    {
+      "card_id": 26000083,
+      "name": "WitchMother",
+      "form_availability": 0,
+      "compatibility_sha256": "7d29be461e96699a09e21c546b719812b5e8296da7c94850942d95a166fb0908"
+    },
+    {
+      "card_id": 26000084,
+      "name": "ElectroSpirit",
+      "form_availability": 0,
+      "compatibility_sha256": "3ed7134bda89b8fa1c67b708c995ed7f1ccaef26bf7566d3f4d35ed9d7773a77"
+    },
+    {
+      "card_id": 26000085,
+      "name": "ElectroGiant",
+      "form_availability": 0,
+      "compatibility_sha256": "8f837ca7222dba68f24a3a2b97a2c74d66aeb65215e6ec89642d6e3262413cd9"
+    },
+    {
+      "card_id": 26000087,
+      "name": "Phoenix",
+      "form_availability": 0,
+      "compatibility_sha256": "a5efe9d379d12716f15fd51795a3f6a14901ed67bfcce6d9f2e100106e2cae0e"
+    },
+    {
+      "card_id": 26000093,
+      "name": "LittlePrince",
+      "form_availability": 2,
+      "compatibility_sha256": "e7d9bfc09985c325094b67f6a2b9440e54f0ffbf5805c00720ceee07d27ba5e5"
+    },
+    {
+      "card_id": 26000095,
+      "name": "GoblinDemolisher",
+      "form_availability": 0,
+      "compatibility_sha256": "ac035f80eaf24011150533c815727afb110ae03ea00abbeccf11bc89d0529681"
+    },
+    {
+      "card_id": 26000096,
+      "name": "GoblinMachine",
+      "form_availability": 0,
+      "compatibility_sha256": "7ae23c3c4dd4f98d5cdf09a166a90671cd2f48249f8786b0ba472588eb88b6ee"
+    },
+    {
+      "card_id": 26000097,
+      "name": "SuspiciousBush",
+      "form_availability": 0,
+      "compatibility_sha256": "4c8bf13092b9f07d687f2b8da286622d6e8120a8363c7fcaecb30738138622e1"
+    },
+    {
+      "card_id": 26000099,
+      "name": "Goblinstein",
+      "form_availability": 2,
+      "compatibility_sha256": "216568183348be317ee9d82fa3644b88dd0c596d16a71395f5b953476d9619fb"
+    },
+    {
+      "card_id": 26000101,
+      "name": "GiantBuffer",
+      "form_availability": 0,
+      "compatibility_sha256": "ca5506cfb4be005e7203c1cf0971e0230e46ad6f74365de740588637a1e7e542"
+    },
+    {
+      "card_id": 26000102,
+      "name": "Berserker",
+      "form_availability": 2,
+      "compatibility_sha256": "eb57b08f686cac743b8f85b5c9adc6b5a743654374cfb8d13a19886520de28bd"
+    },
+    {
+      "card_id": 26000103,
+      "name": "BossBandit",
+      "form_availability": 2,
+      "compatibility_sha256": "619890e4775625cde16f430dfa6b9a686714df4a39fa7267b2f9af3d15029179"
+    },
+    {
+      "card_id": 26000106,
+      "name": "Ronin",
+      "form_availability": 0,
+      "compatibility_sha256": "af4f27bae516a18c9431d8459b1e1e4232f568860e3ed476c4940a9ca83d9d1d"
+    },
+    {
+      "card_id": 27000000,
+      "name": "Cannon",
+      "form_availability": 1,
+      "compatibility_sha256": "56f0d8ddc18021e0823499d6ce610117bdfe0ca0e5fbfb072a175f6ee9d0e089"
+    },
+    {
+      "card_id": 27000001,
+      "name": "GoblinHut",
+      "form_availability": 0,
+      "compatibility_sha256": "6a6cd53b891a86aa3ca6c0b55e80340807f1962f22f6d0ce91541cf67bdb7b39"
+    },
+    {
+      "card_id": 27000002,
+      "name": "Mortar",
+      "form_availability": 1,
+      "compatibility_sha256": "64ba2e7a2608a58a9684683c9c55e6cc97d639bf8aefca758fb5fa5d97bde13b"
+    },
+    {
+      "card_id": 27000003,
+      "name": "InfernoTower",
+      "form_availability": 0,
+      "compatibility_sha256": "7dbc6e27d3606346165f870875da36f52c017e139ea1ecad98ed71ef2381412c"
+    },
+    {
+      "card_id": 27000004,
+      "name": "BombTower",
+      "form_availability": 0,
+      "compatibility_sha256": "e7c1bf1089a6d5d2d954f748bed5d83aba429d6df0eda3f5b7a6a89fc522ebb2"
+    },
+    {
+      "card_id": 27000005,
+      "name": "BarbarianHut",
+      "form_availability": 0,
+      "compatibility_sha256": "362e6238b869b8bf9527a1c891483d191a418de00c67cd06c7fa2ba449921507"
+    },
+    {
+      "card_id": 27000006,
+      "name": "Tesla",
+      "form_availability": 1,
+      "compatibility_sha256": "e5cd37ff9c05d2e4a489ce0aa7e9c86f90fc407fa1bbfc529dcd9f5bae415928"
+    },
+    {
+      "card_id": 27000007,
+      "name": "Elixir Collector",
+      "form_availability": 0,
+      "compatibility_sha256": "09f0441513b5a226ebe2081c30655c4e574841db5a28d3db841056c4738437c4"
+    },
+    {
+      "card_id": 27000008,
+      "name": "Xbow",
+      "form_availability": 0,
+      "compatibility_sha256": "1e0ef571a632e6f588e6d6ff7655a8d5a2deee29a3ab43d25c94613001346861"
+    },
+    {
+      "card_id": 27000009,
+      "name": "Tombstone",
+      "form_availability": 2,
+      "compatibility_sha256": "8012f2ea976b8b977ab257d11a517ec6a36cf67447e1066e3eab79e8dc1b580e"
+    },
+    {
+      "card_id": 27000010,
+      "name": "FirespiritHut",
+      "form_availability": 1,
+      "compatibility_sha256": "aa863d4d9050fffe6342e986f027b5949412915fc0dff79128e15462fb179a24"
+    },
+    {
+      "card_id": 27000012,
+      "name": "GoblinCage",
+      "form_availability": 1,
+      "compatibility_sha256": "c0ecb99884d2553598bc4d4c6d15b14c6d9c4cefd86222f3f4d3b2d31e65888c"
+    },
+    {
+      "card_id": 27000013,
+      "name": "GoblinDrill",
+      "form_availability": 1,
+      "compatibility_sha256": "a905b31e2eda54f1bf704aeb63a3c11fa85c13975df4fbc35d69ec14e85baa7f"
+    },
+    {
+      "card_id": 28000000,
+      "name": "Fireball",
+      "form_availability": 0,
+      "compatibility_sha256": "d58ac02335939ec52d62c0b7141f942955b97a3433bf02a5a412533570aa1b7a"
+    },
+    {
+      "card_id": 28000001,
+      "name": "Arrows",
+      "form_availability": 0,
+      "compatibility_sha256": "7e0963aedc730d69f3e9d5def43e5bcbdf53cbd9400fdfb58d01a9f1ebef07e6"
+    },
+    {
+      "card_id": 28000002,
+      "name": "Rage",
+      "form_availability": 0,
+      "compatibility_sha256": "0f193cc8aa5b6b784169dcbfb3fb4faa49836f98f1379bccd2bcc11ef1954eaa"
+    },
+    {
+      "card_id": 28000003,
+      "name": "Rocket",
+      "form_availability": 0,
+      "compatibility_sha256": "7bd1e2e738903eeba18f668321a5de1e4299c4e7bbf294982b860d875c8324b5"
+    },
+    {
+      "card_id": 28000004,
+      "name": "GoblinBarrel",
+      "form_availability": 1,
+      "compatibility_sha256": "ddfea8ac1b7e6b20ef50e57fca2aabfb9462183fbabb50ea61bd140c185df4de"
+    },
+    {
+      "card_id": 28000005,
+      "name": "Freeze",
+      "form_availability": 0,
+      "compatibility_sha256": "9c3534b6b9469d80f851b7d897fc0243e3fd1008f51c7d819059a165f74baa9d"
+    },
+    {
+      "card_id": 28000006,
+      "name": "Mirror",
+      "form_availability": 0,
+      "compatibility_sha256": "ad5291249307606d89a267c3a4836e35e7271d210e06aa7a567d09ef92e1c7f1"
+    },
+    {
+      "card_id": 28000007,
+      "name": "Lightning",
+      "form_availability": 0,
+      "compatibility_sha256": "99715d0f230dbc673ad93bc068f642c6baec4309bc2739d1a552b77072a35354"
+    },
+    {
+      "card_id": 28000008,
+      "name": "Zap",
+      "form_availability": 1,
+      "compatibility_sha256": "444b6c04d91085316f9e9063be5e7eee578377b5660561b5329dc7484e22ec2a"
+    },
+    {
+      "card_id": 28000009,
+      "name": "Poison",
+      "form_availability": 0,
+      "compatibility_sha256": "56c142a831320480bad74871f7c33fb549b922a2c2cfc9e7cf215b4cbdc577eb"
+    },
+    {
+      "card_id": 28000010,
+      "name": "Graveyard",
+      "form_availability": 0,
+      "compatibility_sha256": "4c7c2de5f29a15204f2e74ab14a95e100cdf72d0025a1c70d20577195b5d12bd"
+    },
+    {
+      "card_id": 28000011,
+      "name": "Log",
+      "form_availability": 0,
+      "compatibility_sha256": "d8e48b5c898556afe6f24e3b6b816b08469c67d8df98849812b23d409e6848c1"
+    },
+    {
+      "card_id": 28000012,
+      "name": "Tornado",
+      "form_availability": 0,
+      "compatibility_sha256": "64478bef8c048e9b7d16eed7357ffd915b82d738d1482f4b401fb40224d9c1a1"
+    },
+    {
+      "card_id": 28000013,
+      "name": "Clone",
+      "form_availability": 0,
+      "compatibility_sha256": "d2588b8e8dcd000ea6e4f8276641eb5401a1fcaccecd0baa2ad34e113cb7ada4"
+    },
+    {
+      "card_id": 28000014,
+      "name": "Earthquake",
+      "form_availability": 0,
+      "compatibility_sha256": "ef255f9f05b46871ff212a94c494e8140b9f256343e1a68f906e916603edb59f"
+    },
+    {
+      "card_id": 28000015,
+      "name": "BarbLog",
+      "form_availability": 2,
+      "compatibility_sha256": "d37c8ab19bcfeaf2ca5f80e3566a851ea2c10aa9725d544491e2720b7cb7e596"
+    },
+    {
+      "card_id": 28000016,
+      "name": "Heal",
+      "form_availability": 0,
+      "compatibility_sha256": "b55a8b35a002d6a0c83e8b4642e8ff2129215a14c0d84b8d37b19cefbebbb489"
+    },
+    {
+      "card_id": 28000017,
+      "name": "Snowball",
+      "form_availability": 1,
+      "compatibility_sha256": "591a9da2e480d9f0c283f325a36952a5e241856e496a6b98c4e9edc9da202b28"
+    },
+    {
+      "card_id": 28000018,
+      "name": "RoyalDelivery",
+      "form_availability": 0,
+      "compatibility_sha256": "06d6a8b135c130761e9ced149cf28e20b93bac6de1da5bf92abc49ecf2819784"
+    },
+    {
+      "card_id": 28000023,
+      "name": "DarkMagic",
+      "form_availability": 0,
+      "compatibility_sha256": "83250afe42c1a7c4abda1cd8bba8e4c68173ab451d9be19ad8323ba7138f03ef"
+    },
+    {
+      "card_id": 28000024,
+      "name": "GoblinCurse",
+      "form_availability": 0,
+      "compatibility_sha256": "01ea557253225aeafbc0e2b0865dd8b7b8bb056937079ad0433e2b9967ef7c7a"
+    },
+    {
+      "card_id": 28000025,
+      "name": "MergeMaiden",
+      "form_availability": 0,
+      "compatibility_sha256": "a5b2dc04c44dfd5fc0f08c15e12794dfaf8d95723a18586b70c93fb55307e0ff"
+    },
+    {
+      "card_id": 28000026,
+      "name": "Vines",
+      "form_availability": 0,
+      "compatibility_sha256": "127ff12c6086630c0dc7a3c78842908b036723fb1d277008005b3f80bbb37fdd"
+    }
+  ],
+  "excluded_cards": [
+    {
+      "card_id": 26000066,
+      "name": "SuperWitch"
+    },
+    {
+      "card_id": 26000070,
+      "name": "SuperLavaHound"
+    },
+    {
+      "card_id": 26000071,
+      "name": "SuperEliteArcher"
+    },
+    {
+      "card_id": 26000073,
+      "name": "SuperHogRider"
+    },
+    {
+      "card_id": 26000075,
+      "name": "SuperIceGolemite"
+    },
+    {
+      "card_id": 26000076,
+      "name": "CHAR_DISABLED_1"
+    },
+    {
+      "card_id": 26000078,
+      "name": "SuperArcher"
+    },
+    {
+      "card_id": 26000079,
+      "name": "RoyalRecruits_Chess"
+    },
+    {
+      "card_id": 26000081,
+      "name": "SuperHogRiderTerry"
+    },
+    {
+      "card_id": 26000082,
+      "name": "SuperMiniPekka"
+    },
+    {
+      "card_id": 26000086,
+      "name": "PrinceBuff"
+    },
+    {
+      "card_id": 26000088,
+      "name": "CHAR_DISABLED_3"
+    },
+    {
+      "card_id": 26000089,
+      "name": "CHAR_DISABLED_4"
+    },
+    {
+      "card_id": 26000090,
+      "name": "CHAR_DISABLED_5"
+    },
+    {
+      "card_id": 26000091,
+      "name": "CHAR_DISABLED_6"
+    },
+    {
+      "card_id": 26000092,
+      "name": "CHAR_DISABLED_7"
+    },
+    {
+      "card_id": 26000094,
+      "name": "TriWizards"
+    },
+    {
+      "card_id": 26000098,
+      "name": "SuperKnight"
+    },
+    {
+      "card_id": 26000100,
+      "name": "SkeletonWarriors_SpookyChess"
+    },
+    {
+      "card_id": 26000104,
+      "name": "MergeMaiden_Normal"
+    },
+    {
+      "card_id": 26000105,
+      "name": "MergeMaiden_Mounted"
+    },
+    {
+      "card_id": 27000011,
+      "name": "BarbarianLauncher"
+    },
+    {
+      "card_id": 27000014,
+      "name": "GoblinPartyHut"
+    },
+    {
+      "card_id": 27000015,
+      "name": "DarkElixir_Bottle"
+    },
+    {
+      "card_id": 27000016,
+      "name": "ElixirBarrel"
+    },
+    {
+      "card_id": 27000017,
+      "name": "GoblinRocketSilo"
+    },
+    {
+      "card_id": 28000019,
+      "name": "GlobalClone"
+    },
+    {
+      "card_id": 28000020,
+      "name": "GoblinPartyRocket"
+    },
+    {
+      "card_id": 28000021,
+      "name": "WarmSpell"
+    },
+    {
+      "card_id": 28000022,
+      "name": "GlobalLightning"
+    }
+  ]
+}

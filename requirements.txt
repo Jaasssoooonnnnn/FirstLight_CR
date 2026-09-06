@@ -1,0 +1,10 @@
+torch==2.5.1
+numpy==2.1.2
+orjson==3.10.16
+pillow==11.0.0
+pyarrow==19.0.0
+safetensors==0.4.5
+sc-compression==0.6.5
+zstandard==0.25.0
+wandb==0.22.3
+tzdata

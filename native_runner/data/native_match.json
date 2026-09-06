@@ -1,0 +1,31 @@
+{
+  "battle": {
+    "gmt": 1,
+    "plt": 1,
+    "t1s": 0,
+    "t2s": 0,
+    "gamemode": 72000006,
+    "hm": false,
+    "lvlcap": 0,
+    "cardlvlmin": 0,
+    "stp": 0,
+    "trail": 170000000,
+    "te": -1,
+    "tps": 1,
+    "deck0": {"hdr": "BD01", "sp": [], "sc": [{"d": 159000000, "l": 1, "t": 0, "c": 1}]},
+    "deck1": {"hdr": "BD01", "sp": [], "sc": [{"d": 159000000, "l": 1, "t": 0, "c": 1}]},
+    "avatar0": {"accountID.lo": 1, "accountID.hi": 0, "expLevel": 1, "name": "Player 1", "arena": 54000001, "welo": -1, "scr": 0, "lti": 0, "npc": false},
+    "avatar1": {"accountID.lo": 2, "accountID.hi": 0, "expLevel": 1, "name": "Player 2", "arena": 54000001, "welo": -1, "scr": 0, "lti": 0, "npc": false},
+    "location": 15000199,
+    "arena": 54000001,
+    "hbd": [
+      {"em": {"ce": [], "de": []}, "sk": {"os": [], "ss": [], "rnd": false}, "bn": {"bg": 0, "fg": 0}, "kt": 1},
+      {"em": {"ce": [], "de": []}, "sk": {"os": [], "ss": [], "rnd": false}, "bn": {"bg": 0, "fg": 0}, "kt": 1}
+    ]
+  },
+  "endTick": 7200,
+  "cmd": [],
+  "evt": [],
+  "rndSeed": 1,
+  "time": -1
+}

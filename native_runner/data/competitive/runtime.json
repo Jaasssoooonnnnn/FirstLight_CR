@@ -1,0 +1,2971 @@
+{
+  "schema": "firstlight-runtime-facts.v1",
+  "timelines": {
+    "Default": {
+      "name": "Default",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 28000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "RampUp": {
+      "name": "RampUp",
+      "starting_elixir": 3.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 28000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 7000,
+          "visible_rate": 40,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 5600,
+          "visible_rate": 50,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "DoubleElixir": {
+      "name": "DoubleElixir",
+      "starting_elixir": 0.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 300,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "TripleElixir": {
+      "name": "TripleElixir",
+      "starting_elixir": 0.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 300,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "TeamVsTeam": {
+      "name": "TeamVsTeam",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 40000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 20000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 13300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "TeamVsTeam_DoubleElixir": {
+      "name": "TeamVsTeam_DoubleElixir",
+      "starting_elixir": 0.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 300,
+          "full_bar_ms": 20000,
+          "visible_rate": 20,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "TeamVsTeam_TripleElixir": {
+      "name": "TeamVsTeam_TripleElixir",
+      "starting_elixir": 0.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 300,
+          "full_bar_ms": 13300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "TeamVsTeam_RampUp": {
+      "name": "TeamVsTeam_RampUp",
+      "starting_elixir": 3.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 40000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 20000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 13300,
+          "visible_rate": 30,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 10000,
+          "visible_rate": 40,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 8000,
+          "visible_rate": 50,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "SuddenDeath": {
+      "name": "SuddenDeath",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 300,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 180,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "RageMode": {
+      "name": "RageMode",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 20750,
+          "visible_rate": 13,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 10550,
+          "visible_rate": 27,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 7000,
+          "visible_rate": 40,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "Tutorial": {
+      "name": "Tutorial",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 0,
+          "section_type": "Normal",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 0,
+          "full_bar_ms": 28000,
+          "visible_rate": 10,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "Spawning": {
+      "name": "Spawning",
+      "starting_elixir": 3.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 28000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "TeamVsTeam_Spawning": {
+      "name": "TeamVsTeam_Spawning",
+      "starting_elixir": 3.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 40000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 20000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 13300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "Pve": {
+      "name": "Pve",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 0,
+          "section_type": "Normal",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 0,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "7xElixir": {
+      "name": "7xElixir",
+      "starting_elixir": 0.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 300,
+          "full_bar_ms": 4000,
+          "visible_rate": 70,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "ClanWar_BoatBattle": {
+      "name": "ClanWar_BoatBattle",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 120,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 60,
+          "section_type": "BonusTime",
+          "flags": [
+            "No60sWarning"
+          ]
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 0,
+          "full_bar_ms": 21000,
+          "visible_rate": 15,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 0,
+          "full_bar_ms": 10550,
+          "visible_rate": 27,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 0,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "DoubleToTripleElixir": {
+      "name": "DoubleToTripleElixir",
+      "starting_elixir": 3.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 180,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "ElixirBarrel": {
+      "name": "ElixirBarrel",
+      "starting_elixir": 3.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 150000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 150000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 150000,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "Default_short": {
+      "name": "Default_short",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 120,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 60,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 30,
+          "full_bar_ms": 28000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 30,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "TeamVsTeam_Default_short": {
+      "name": "TeamVsTeam_Default_short",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 120,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 60,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 30,
+          "full_bar_ms": 40000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 20000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 30,
+          "full_bar_ms": 13300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "Default_UltimateClash": {
+      "name": "Default_UltimateClash",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 28000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "TeamVsTeam_UltimateClash": {
+      "name": "TeamVsTeam_UltimateClash",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 40000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 20000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 13300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "Crazy_Arena": {
+      "name": "Crazy_Arena",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 18666,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 9333,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 6200,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "AllRandom": {
+      "name": "AllRandom",
+      "starting_elixir": 4.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 28000,
+          "visible_rate": 10,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 90,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 30,
+          "full_bar_ms": 9300,
+          "visible_rate": 30,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "Crazy_Arena_InfiniteElixir": {
+      "name": "Crazy_Arena_InfiniteElixir",
+      "starting_elixir": 0.0,
+      "sections": [
+        {
+          "length_seconds": 180,
+          "section_type": "Normal",
+          "flags": []
+        },
+        {
+          "length_seconds": 120,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 300,
+          "full_bar_ms": 4000,
+          "visible_rate": 70,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 50,
+          "visible_rate": 100,
+          "notify_change": true
+        },
+        {
+          "length_seconds": 60,
+          "full_bar_ms": 50,
+          "visible_rate": 100,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    },
+    "Crazy_Arena_SuddenDeath": {
+      "name": "Crazy_Arena_SuddenDeath",
+      "starting_elixir": 6.0,
+      "sections": [
+        {
+          "length_seconds": 300,
+          "section_type": "Overtime",
+          "flags": []
+        }
+      ],
+      "elixir_rates": [
+        {
+          "length_seconds": 120,
+          "full_bar_ms": 14000,
+          "visible_rate": 20,
+          "notify_change": true
+        }
+      ],
+      "source_path": "runtime-update/csv_logic/battle_timelines.csv",
+      "source_sha256": "fc79fccde0bea55d7ec200151a76155e22050a5a6f17eb885f82e69d55d3a999",
+      "version": "battle-timeline.v1"
+    }
+  },
+  "game_modes": {
+    "72000000": [
+      "BlindDeck",
+      "Default"
+    ],
+    "72000001": [
+      "DoubleElixir",
+      "DoubleElixir"
+    ],
+    "72000002": [
+      "Invalid_1",
+      "Default"
+    ],
+    "72000003": [
+      "HeroChallenge_draft",
+      "Default"
+    ],
+    "72000004": [
+      "Invalid_2",
+      "Default"
+    ],
+    "72000005": [
+      "DraftMode",
+      "Default"
+    ],
+    "72000006": [
+      "Ladder",
+      "Default"
+    ],
+    "72000007": [
+      "Friendly",
+      "Default"
+    ],
+    "72000008": [
+      "Training",
+      "Default"
+    ],
+    "72000009": [
+      "Tournament",
+      "Default"
+    ],
+    "72000010": [
+      "Challenge",
+      "Default"
+    ],
+    "72000011": [
+      "DoubleElixir_Friendly",
+      "DoubleElixir"
+    ],
+    "72000012": [
+      "Invalid_3",
+      "Default"
+    ],
+    "72000013": [
+      "DraftModeInsane",
+      "DoubleElixir"
+    ],
+    "72000014": [
+      "TeamVsTeam",
+      "TeamVsTeam"
+    ],
+    "72000015": [
+      "RetroRoyale",
+      "Default"
+    ],
+    "72000016": [
+      "CardRelease",
+      "Default"
+    ],
+    "72000017": [
+      "CardReleaseDraft",
+      "Default"
+    ],
+    "72000018": [
+      "PvE",
+      "Pve"
+    ],
+    "72000019": [
+      "TvE",
+      "Default"
+    ],
+    "72000020": [
+      "PvE_Boss",
+      "Default"
+    ],
+    "72000021": [
+      "PvE_Tutorial",
+      "Tutorial"
+    ],
+    "72000022": [
+      "TeamVsTeamDraft",
+      "TeamVsTeam"
+    ],
+    "72000023": [
+      "TeamVsTeamLadder",
+      "TeamVsTeam"
+    ],
+    "72000024": [
+      "Overtime_Tournament",
+      "SuddenDeath"
+    ],
+    "72000025": [
+      "GoldRush_Tournament",
+      "Default"
+    ],
+    "72000026": [
+      "TeamVsTeamChallenge",
+      "TeamVsTeam"
+    ],
+    "72000027": [
+      "TripleElixir_Tournament",
+      "TripleElixir"
+    ],
+    "72000028": [
+      "RampUpElixir_Tournament",
+      "RampUp"
+    ],
+    "72000029": [
+      "TeamVsTeamCrowns",
+      "TeamVsTeam"
+    ],
+    "72000030": [
+      "TeamVsTeamDraftChallenge",
+      "TeamVsTeam"
+    ],
+    "72000031": [
+      "Overtime_Friendly",
+      "SuddenDeath"
+    ],
+    "72000032": [
+      "TripleElixir_Friendly",
+      "TripleElixir"
+    ],
+    "72000033": [
+      "RampUpElixir_Friendly",
+      "RampUp"
+    ],
+    "72000034": [
+      "TeamVsTeam_DoubleElixir_Friendly",
+      "TeamVsTeam_DoubleElixir"
+    ],
+    "72000035": [
+      "TeamVsTeam_DoubleElixir_Tournament",
+      "TeamVsTeam_DoubleElixir"
+    ],
+    "72000036": [
+      "TeamVsTeam_Overtime_Friendly",
+      "SuddenDeath"
+    ],
+    "72000037": [
+      "TeamVsTeam_Overtime_Tournament",
+      "SuddenDeath"
+    ],
+    "72000038": [
+      "TeamVsTeam_RampUpElixir_Friendly",
+      "TeamVsTeam_RampUp"
+    ],
+    "72000039": [
+      "TeamVsTeam_RampUpElixir_Tournament",
+      "TeamVsTeam_RampUp"
+    ],
+    "72000040": [
+      "TeamVsTeam_DraftModeInsane_Friendly",
+      "TeamVsTeam_DoubleElixir"
+    ],
+    "72000041": [
+      "Invalid",
+      "Default"
+    ],
+    "72000042": [
+      "PickMode",
+      "Default"
+    ],
+    "72000043": [
+      "TeamVsTeamLadder_GoldRush",
+      "TeamVsTeam"
+    ],
+    "72000044": [
+      "Ladder_GoldRush",
+      "Default"
+    ],
+    "72000045": [
+      "Touchdown",
+      "DoubleElixir"
+    ],
+    "72000046": [
+      "TeamVsTeamLadder_GemRush",
+      "TeamVsTeam"
+    ],
+    "72000047": [
+      "Ladder_GemRush",
+      "Default"
+    ],
+    "72000048": [
+      "GemRush_Tournament",
+      "Default"
+    ],
+    "72000049": [
+      "TeamVsTeam_Touchdown",
+      "DoubleElixir"
+    ],
+    "72000050": [
+      "Touchdown_Draft",
+      "DoubleElixir"
+    ],
+    "72000051": [
+      "TeamVsTeam_Touchdown_Draft",
+      "DoubleElixir"
+    ],
+    "72000052": [
+      "MirrorDeck",
+      "Default"
+    ],
+    "72000053": [
+      "TeamVsTeam_MirrorDeck",
+      "TeamVsTeam"
+    ],
+    "72000054": [
+      "Friendly_FixedDeckOrder",
+      "Default"
+    ],
+    "72000055": [
+      "TeamVsTeam_FixedDeckOrder",
+      "TeamVsTeam"
+    ],
+    "72000056": [
+      "MirrorDeck_H",
+      "Default"
+    ],
+    "72000057": [
+      "TeamVsTeam_MirrorDeck_H",
+      "TeamVsTeam"
+    ],
+    "72000058": [
+      "KingOfTheHill",
+      "Default"
+    ],
+    "72000059": [
+      "ModernRoyale",
+      "Default"
+    ],
+    "72000060": [
+      "Overtime_Ladder",
+      "SuddenDeath"
+    ],
+    "72000061": [
+      "DoubleElixir_Ladder",
+      "DoubleElixir"
+    ],
+    "72000062": [
+      "TripleElixir_Ladder",
+      "TripleElixir"
+    ],
+    "72000063": [
+      "NOTINUSE1",
+      "Default"
+    ],
+    "72000064": [
+      "NOTINUSE2",
+      "Default"
+    ],
+    "72000065": [
+      "Showdown_Friendly",
+      "Default"
+    ],
+    "72000066": [
+      "Showdown_Ladder",
+      "Default"
+    ],
+    "72000067": [
+      "TeamVsTeam_DoubleElixir_Ladder",
+      "TeamVsTeam_DoubleElixir"
+    ],
+    "72000068": [
+      "TeamVsTeam_Overtime_Ladder",
+      "SuddenDeath"
+    ],
+    "72000069": [
+      "CaptureTower_Friendly",
+      "Default"
+    ],
+    "72000070": [
+      "RampUpElixir_Ladder",
+      "RampUp"
+    ],
+    "72000071": [
+      "Rage_Friendly",
+      "RageMode"
+    ],
+    "72000072": [
+      "MirrorDeck_CW",
+      "Default"
+    ],
+    "72000073": [
+      "Rage_Ladder",
+      "RageMode"
+    ],
+    "72000074": [
+      "LavaFloor_Friendly",
+      "Default"
+    ],
+    "72000075": [
+      "Event_NewArena1",
+      "Default"
+    ],
+    "72000076": [
+      "Event_NewArena2",
+      "Default"
+    ],
+    "72000077": [
+      "Event_NewArena3",
+      "Default"
+    ],
+    "72000078": [
+      "Event_NewArena4",
+      "Default"
+    ],
+    "72000079": [
+      "Event_NewArena5",
+      "Default"
+    ],
+    "72000080": [
+      "Event_NewArena6",
+      "Default"
+    ],
+    "72000081": [
+      "Event_NewArena7",
+      "Default"
+    ],
+    "72000082": [
+      "Event_NewArena8",
+      "Default"
+    ],
+    "72000083": [
+      "Event_NewArena9",
+      "Default"
+    ],
+    "72000084": [
+      "Event_NewArena10",
+      "Default"
+    ],
+    "72000085": [
+      "Event_NewArena11",
+      "Default"
+    ],
+    "72000086": [
+      "Rage_Tournament",
+      "RageMode"
+    ],
+    "72000087": [
+      "ClassicDecks_Friendly",
+      "Default"
+    ],
+    "72000088": [
+      "TeamVsTeam_Rage_Ladder",
+      "RageMode"
+    ],
+    "72000089": [
+      "ThreeVsThree",
+      "Default"
+    ],
+    "72000090": [
+      "ThreeVsThreeHeist",
+      "Default"
+    ],
+    "72000091": [
+      "Heist_Friendly",
+      "Default"
+    ],
+    "72000092": [
+      "Heist_Draft",
+      "Default"
+    ],
+    "72000093": [
+      "Event_Shocktober",
+      "Default"
+    ],
+    "72000094": [
+      "HeroChallenge1v1",
+      "Default"
+    ],
+    "72000095": [
+      "TeamVsTeam_TripleElixir_Ladder",
+      "TeamVsTeam_TripleElixir"
+    ],
+    "72000096": [
+      "Heist_Tournament",
+      "Default"
+    ],
+    "72000097": [
+      "SpawnPigsMode_Friendly",
+      "Default"
+    ],
+    "72000098": [
+      "ClanWarMiniCollection_Friendly",
+      "Default"
+    ],
+    "72000099": [
+      "ClassicDecks_Helsinki2016",
+      "Default"
+    ],
+    "72000100": [
+      "ClassicDecks_KingsCup1",
+      "Default"
+    ],
+    "72000101": [
+      "ClanWarMiniCollection_Ladder",
+      "Default"
+    ],
+    "72000102": [
+      "ClanWarMiniCollection_Tournament",
+      "Default"
+    ],
+    "72000103": [
+      "Boosts_Friendly",
+      "Default"
+    ],
+    "72000104": [
+      "Snowball_bombardment",
+      "Default"
+    ],
+    "72000105": [
+      "RampUpElixirSpawnPigsMode_Friendly",
+      "Spawning"
+    ],
+    "72000106": [
+      "DraftSpawnPigsMode_Friendly",
+      "Default"
+    ],
+    "72000107": [
+      "RampUpElixirSpawnPigsMode_Tournament",
+      "Spawning"
+    ],
+    "72000108": [
+      "EventDeckrSpawnPigsMode_Tournament",
+      "Default"
+    ],
+    "72000109": [
+      "RampUpElixirEventDeckSpawnPigsMode_Friendly",
+      "Spawning"
+    ],
+    "72000110": [
+      "RampUpElixirDraftSpawnPigsMode_Friendly",
+      "Spawning"
+    ],
+    "72000111": [
+      "TeamVsTeamSpellSupportDraft",
+      "Default"
+    ],
+    "72000112": [
+      "RampFatigue",
+      "RampUp"
+    ],
+    "72000113": [
+      "TestBuff",
+      "Default"
+    ],
+    "72000114": [
+      "HeroChallenge_draft2",
+      "Default"
+    ],
+    "72000115": [
+      "HeroChallenge_draft3",
+      "Default"
+    ],
+    "72000116": [
+      "ElixirCollectorCapture_Friendly",
+      "Default"
+    ],
+    "72000117": [
+      "CaptureTheEgg_Friendly",
+      "Default"
+    ],
+    "72000118": [
+      "DoubleDeck_Friendly",
+      "DoubleElixir"
+    ],
+    "72000119": [
+      "DoubleDeck_Tournament",
+      "DoubleElixir"
+    ],
+    "72000120": [
+      "RampUpElixirRageJacksMode_Tournament",
+      "Spawning"
+    ],
+    "72000121": [
+      "EventDeck_Rage_SpawnJacks_Friendly",
+      "RageMode"
+    ],
+    "72000122": [
+      "Draft_Rage_SpawnJacks_Friendly",
+      "RageMode"
+    ],
+    "72000123": [
+      "ElixirCollectorCapture_Tournament",
+      "Default"
+    ],
+    "72000124": [
+      "CaptureTheEgg_Tournament",
+      "Default"
+    ],
+    "72000125": [
+      "Obstacles_Friendly",
+      "Default"
+    ],
+    "72000126": [
+      "Mega_Boss_PVE",
+      "Default"
+    ],
+    "72000127": [
+      "CaptureTheFish_Friendly",
+      "Default"
+    ],
+    "72000128": [
+      "RockyBoat_Friendly",
+      "Default"
+    ],
+    "72000129": [
+      "BlindDeck_FloodHounds",
+      "Default"
+    ],
+    "72000130": [
+      "Neutral_Fisherman",
+      "Default"
+    ],
+    "72000131": [
+      "ClassicDecks2_Friendly",
+      "Default"
+    ],
+    "72000132": [
+      "Heist_Ladder",
+      "Default"
+    ],
+    "72000133": [
+      "RampUpElixirSpawnWBsMode_Tournament",
+      "Spawning"
+    ],
+    "72000134": [
+      "RampUpElixirSpawnWBsMode_Ladder",
+      "Spawning"
+    ],
+    "72000135": [
+      "RampUpElixirSpawnWBsMode_Draft",
+      "Spawning"
+    ],
+    "72000136": [
+      "RampUpElixirSpawnWBsMode_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000137": [
+      "RampUpElixirSpawnWBsMode_2v2_Draft",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000138": [
+      "RampUpElixirSpawnWBsMode_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000139": [
+      "RampUpElixirSpawnWBsMode_Friendly",
+      "Spawning"
+    ],
+    "72000140": [
+      "NeutralFisherman_Friendly",
+      "Default"
+    ],
+    "72000141": [
+      "NeutralFisherman_Tournament",
+      "Default"
+    ],
+    "72000142": [
+      "NeutralFisherman_Ladder",
+      "Default"
+    ],
+    "72000143": [
+      "NeutralFisherman_Draft",
+      "Default"
+    ],
+    "72000144": [
+      "NeutralFisherman_Draft_2v2",
+      "TeamVsTeam"
+    ],
+    "72000145": [
+      "NeutralFisherman_Ladder_2v2",
+      "TeamVsTeam"
+    ],
+    "72000146": [
+      "NeutralFisherman_Tournament_2v2",
+      "TeamVsTeam"
+    ],
+    "72000147": [
+      "NeutralFisherman_Friendly_2v2",
+      "TeamVsTeam"
+    ],
+    "72000148": [
+      "CaptureTheFish_Tournament",
+      "Default"
+    ],
+    "72000149": [
+      "BlindDeck_FloodHounds_2v2",
+      "TeamVsTeam"
+    ],
+    "72000150": [
+      "EventDeck_LegsAndSpells",
+      "Default"
+    ],
+    "72000151": [
+      "RampUpElixirSpawnGuardsMode_Tournament",
+      "Spawning"
+    ],
+    "72000152": [
+      "RampUpElixirSpawnGuardsMode_Ladder",
+      "Spawning"
+    ],
+    "72000153": [
+      "RampUpElixirSpawnGuardsMode_Draft",
+      "Spawning"
+    ],
+    "72000154": [
+      "RampUpElixirSpawnGuardsMode_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000155": [
+      "RampUpElixirSpawnGuardsMode_2v2_Draft",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000156": [
+      "RampUpElixirSpawnGuardsMode_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000157": [
+      "RampUpElixirSpawnGuardsMode_Friendly",
+      "Spawning"
+    ],
+    "72000158": [
+      "SpawnGuardsMode_Tournament",
+      "Default"
+    ],
+    "72000159": [
+      "SpawnGuardsMode_Ladder",
+      "Default"
+    ],
+    "72000160": [
+      "SpawnGuardsMode_Draft",
+      "Default"
+    ],
+    "72000161": [
+      "SpawnGuardsMode_2v2_Tournament",
+      "TeamVsTeam"
+    ],
+    "72000162": [
+      "SpawnGuardsMode_2v2_Draft",
+      "TeamVsTeam"
+    ],
+    "72000163": [
+      "SpawnGuardsMode_2v2_Ladder",
+      "TeamVsTeam"
+    ],
+    "72000164": [
+      "SpawnGuardsMode_Friendly",
+      "Default"
+    ],
+    "72000165": [
+      "SpawnSkeletonsMode_Tournament",
+      "Default"
+    ],
+    "72000166": [
+      "SpawnSkeletonsMode_Ladder",
+      "Default"
+    ],
+    "72000167": [
+      "SpawnSkeletonsMode_Draft",
+      "Default"
+    ],
+    "72000168": [
+      "SpawnSkeletonsMode_2v2_Tournament",
+      "TeamVsTeam"
+    ],
+    "72000169": [
+      "SpawnSkeletonsMode_2v2_Draft",
+      "TeamVsTeam"
+    ],
+    "72000170": [
+      "SpawnSkeletonsMode_2v2_Ladder",
+      "TeamVsTeam"
+    ],
+    "72000171": [
+      "SpawnSkeletonsMode_Friendly",
+      "Default"
+    ],
+    "72000172": [
+      "NOTINUSE3",
+      "Default"
+    ],
+    "72000173": [
+      "RampUpElixirSpawnBanditMode_Tournament",
+      "Default"
+    ],
+    "72000174": [
+      "RampUpElixirSpawnBanditMode_Ladder",
+      "Default"
+    ],
+    "72000175": [
+      "RampUpElixirSpawnBanditMode_Draft",
+      "Default"
+    ],
+    "72000176": [
+      "RampUpElixirSpawnBanditMode_2v2_Tournament",
+      "TeamVsTeam"
+    ],
+    "72000177": [
+      "RampUpElixirSpawnBanditMode_2v2_Draft",
+      "TeamVsTeam"
+    ],
+    "72000178": [
+      "RampUpElixirSpawnBanditMode_2v2_Ladder",
+      "TeamVsTeam"
+    ],
+    "72000179": [
+      "RampUpElixirSpawnBanditMode_Friendly",
+      "Default"
+    ],
+    "72000180": [
+      "RampUpElixirSpawnGhostMode_Tournament",
+      "Spawning"
+    ],
+    "72000181": [
+      "RampUpElixirSpawnGhostMode_Ladder",
+      "Spawning"
+    ],
+    "72000182": [
+      "RampUpElixirSpawnGhostMode_Draft",
+      "Spawning"
+    ],
+    "72000183": [
+      "RampUpElixirSpawnGhostMode_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000184": [
+      "RampUpElixirSpawnGhostMode_2v2_Draft",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000185": [
+      "RampUpElixirSpawnGhostMode_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000186": [
+      "RampUpElixirSpawnGhostMode_Friendly",
+      "Spawning"
+    ],
+    "72000187": [
+      "RampUpElixirSkeletonParty_Friendly",
+      "Spawning"
+    ],
+    "72000188": [
+      "RampUpElixirSkeletonParty_Draft",
+      "Spawning"
+    ],
+    "72000189": [
+      "RampUpElixirSkeletonParty_2v2",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000190": [
+      "RampUpElixirSkeletonParty_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000191": [
+      "RampUpElixirSkeletonParty_Tournament",
+      "Spawning"
+    ],
+    "72000192": [
+      "RampUpElixirSkeletonParty_Ladder",
+      "Spawning"
+    ],
+    "72000193": [
+      "LegendaryParty_Blind",
+      "Default"
+    ],
+    "72000194": [
+      "Draft_Competitive",
+      "Default"
+    ],
+    "72000195": [
+      "RampUpElixirSpawnPigsMode_Ladder",
+      "Spawning"
+    ],
+    "72000196": [
+      "RampUpElixirSpawnPigsMode_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000197": [
+      "RampUpElixirRageJacksMode_Ladder",
+      "Spawning"
+    ],
+    "72000198": [
+      "RampUpElixirRageJacksMode_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000199": [
+      "CrownRush_Tournament",
+      "Default"
+    ],
+    "72000200": [
+      "TeamVsTeamLadder_CrownRush",
+      "TeamVsTeam"
+    ],
+    "72000201": [
+      "Ladder_CrownRush",
+      "Default"
+    ],
+    "72000202": [
+      "Event_ElixirGolemTease",
+      "Default"
+    ],
+    "72000203": [
+      "Touchdown_MegaDeck_Challenge",
+      "DoubleElixir"
+    ],
+    "72000204": [
+      "Touchdown_MegaDeck_Ladder",
+      "DoubleElixir"
+    ],
+    "72000205": [
+      "RampUpElixirSpawnRamRiders_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000206": [
+      "RampUpElixirSpawnRamRiders_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000207": [
+      "Blind_LuckyLadies_Friendly",
+      "Default"
+    ],
+    "72000208": [
+      "Event_FirecrackerTease",
+      "Default"
+    ],
+    "72000209": [
+      "RampUpElixirSpawnBalloons_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000210": [
+      "RampUpElixirSpawnBalloons_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000211": [
+      "RampUpElixirSpawnBalloons_Tournament",
+      "Spawning"
+    ],
+    "72000212": [
+      "RampUpElixirSpawnBalloons_Ladder",
+      "Spawning"
+    ],
+    "72000213": [
+      "ElixirCollectorCapture_Ladder",
+      "Default"
+    ],
+    "72000214": [
+      "CaptureTheEgg_Ladder",
+      "Default"
+    ],
+    "72000215": [
+      "RampUpElixirDeliveryDrop_Tournament",
+      "Spawning"
+    ],
+    "72000216": [
+      "EventDeck_4orLess_TripleElixir",
+      "TripleElixir"
+    ],
+    "72000217": [
+      "RampUpElixirSpawnEBarbMode_Tournament",
+      "Spawning"
+    ],
+    "72000218": [
+      "7xElixir_Tournament",
+      "7xElixir"
+    ],
+    "72000219": [
+      "RampUpElixirSpawnSparkyMode_Tournament",
+      "DoubleElixir"
+    ],
+    "72000220": [
+      "EventDeck_RoyalBirthday",
+      "Default"
+    ],
+    "72000221": [
+      "RampUpElixirDeliveryDrop_Ladder",
+      "Spawning"
+    ],
+    "72000222": [
+      "RampUpElixirSpawnRascals_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000223": [
+      "RampUpElixirSpawnRascals_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000224": [
+      "RampUpElixirSpawnRascals_Tournament",
+      "Spawning"
+    ],
+    "72000225": [
+      "RampUpElixirSpawnRascals_Ladder",
+      "Spawning"
+    ],
+    "72000226": [
+      "RampUpElixirSpawnEGolems_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000227": [
+      "RampUpElixirSpawnEGolems_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000228": [
+      "RampUpElixirSpawnEGolems_Tournament",
+      "Spawning"
+    ],
+    "72000229": [
+      "RampUpElixirSpawnEGolems_Ladder",
+      "Spawning"
+    ],
+    "72000230": [
+      "RampUpElixirSpawnEGolems_Friendly",
+      "Spawning"
+    ],
+    "72000231": [
+      "RampUpElixirSpawnEBarbMode_Friendly",
+      "Spawning"
+    ],
+    "72000232": [
+      "7xElixir_Friendly",
+      "7xElixir"
+    ],
+    "72000233": [
+      "RampUpElixirSpawnSparkyMode_Friendly",
+      "DoubleElixir"
+    ],
+    "72000234": [
+      "7xElixir_Party",
+      "7xElixir"
+    ],
+    "72000235": [
+      "RampUpElixirSpawnPrinces_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000236": [
+      "RampUpElixirSpawnPrinces_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000237": [
+      "RampUpElixirSpawnPrinces_Tournament",
+      "Spawning"
+    ],
+    "72000238": [
+      "RampUpElixirSpawnPrinces_Ladder",
+      "Spawning"
+    ],
+    "72000239": [
+      "RampUpElixirSpawnPrinces_Friendly",
+      "Spawning"
+    ],
+    "72000240": [
+      "RampUpElixirSpawnSkeleDrags_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000241": [
+      "RampUpElixirSpawnSkeleDrags_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000242": [
+      "RampUpElixirSpawnSkeleDrags_Tournament",
+      "Spawning"
+    ],
+    "72000243": [
+      "RampUpElixirSpawnSkeleDrags_Ladder",
+      "Spawning"
+    ],
+    "72000244": [
+      "RampUpElixirSpawnSkeleDrags_Friendly",
+      "Spawning"
+    ],
+    "72000245": [
+      "RampUpElixirSpawnFirecracker_2v2_Tournament",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000246": [
+      "RampUpElixirSpawnFirecracker_2v2_Ladder",
+      "TeamVsTeam_Spawning"
+    ],
+    "72000247": [
+      "RampUpElixirSpawnFirecracker_Tournament",
+      "Spawning"
+    ],
+    "72000248": [
+      "RampUpElixirSpawnFirecracker_Ladder",
+      "Spawning"
+    ],
+    "72000249": [
+      "RampUpElixirSpawnFirecracker_Friendly",
+      "Spawning"
+    ],
+    "72000250": [
+      "RampUpElixirSpawnHealSpirits_Friendly",
+      "Spawning"
+    ],
+    "72000251": [
+      "RampUpElixirSpawnHealSpirits_Ladder",
+      "Spawning"
+    ],
+    "72000252": [
+      "RampUpElixirSpawnHealSpirits_Tournament",
+      "Spawning"
+    ],
+    "72000253": [
+      "GIANT_Rage_Buff_Tournament",
+      "Default"
+    ],
+    "72000254": [
+      "MirrorDeck_Friendly",
+      "Default"
+    ],
+    "72000255": [
+      "GlobalHeal_NoBuildings_Tournament",
+      "TripleElixir"
+    ],
+    "72000256": [
+      "Archetype_Beatdown_Tournament",
+      "Default"
+    ],
+    "72000257": [
+      "Archetype_Bridgespam_Tournament",
+      "Default"
+    ],
+    "72000258": [
+      "Archetype_Siege_and_Air_Tournament",
+      "Default"
+    ],
+    "72000259": [
+      "Archetype_Tower_Damage_Tournament",
+      "Default"
+    ],
+    "72000260": [
+      "Archetype_High_Damage_Tournament",
+      "Default"
+    ],
+    "72000261": [
+      "7xElixir_Ladder",
+      "7xElixir"
+    ],
+    "72000262": [
+      "RampUpElixirSpawnSparkyMode_Ladder",
+      "DoubleElixir"
+    ],
+    "72000263": [
+      "RampUpElixirSpawnEBarbMode_Ladder",
+      "Spawning"
+    ],
+    "72000264": [
+      "MortarCapture_Ladder",
+      "Default"
+    ],
+    "72000265": [
+      "Duel_1v1_Party",
+      "Default"
+    ],
+    "72000266": [
+      "ClanWar_BoatBattle",
+      "ClanWar_BoatBattle"
+    ],
+    "72000267": [
+      "CW_Duel_1v1",
+      "Default"
+    ],
+    "72000268": [
+      "CW_Battle_1v1",
+      "Default"
+    ],
+    "72000269": [
+      "CW_BotTrainer_1v1",
+      "Default"
+    ],
+    "72000270": [
+      "BotBattle",
+      "Default"
+    ],
+    "72000271": [
+      "RampUpElixirSpawnFireSpirits_Friendly",
+      "Spawning"
+    ],
+    "72000272": [
+      "RampUpElixirSpawnFireSpirits_Ladder",
+      "Spawning"
+    ],
+    "72000273": [
+      "RampUpElixirSpawnFireSpirits_Tournament",
+      "Spawning"
+    ],
+    "72000274": [
+      "RAMRIDER_Rage_Buff_Tournament",
+      "Default"
+    ],
+    "72000275": [
+      "MortarCapture_Friendly",
+      "Default"
+    ],
+    "72000276": [
+      "MortarCapture_Tournament",
+      "Default"
+    ],
+    "72000277": [
+      "RampUpElixirFireSpiritsParty_Ladder",
+      "Spawning"
+    ],
+    "72000278": [
+      "Electro_Spirit_Tournament",
+      "Default"
+    ],
+    "72000279": [
+      "MEGAKNIGHT_Rage_Buff_Tournament",
+      "Default"
+    ],
+    "72000280": [
+      "Fantasy_Royale_Challenge_2020_Predefined",
+      "Default"
+    ],
+    "72000281": [
+      "RampUpElixirSpawnPigsMode_WithMotherWitch_Tournament",
+      "Spawning"
+    ],
+    "72000282": [
+      "PEKKA_Invis_Buff_Tournament",
+      "Default"
+    ],
+    "72000283": [
+      "Princess_Tournament",
+      "Default"
+    ],
+    "72000284": [
+      "Prince_Tournament",
+      "Default"
+    ],
+    "72000285": [
+      "RampUpElixirSpawnYetAnotherSkeletons_Tournament",
+      "Spawning"
+    ],
+    "72000286": [
+      "TeamVsTeam_TripleElixir_Friendly",
+      "TeamVsTeam_TripleElixir"
+    ],
+    "72000287": [
+      "TeamVsTeam_Rage_Friendly",
+      "RageMode"
+    ],
+    "72000288": [
+      "Event_SkeletonKing_Tease",
+      "Default"
+    ],
+    "72000289": [
+      "Event_ArcherQueen_Tease",
+      "Default"
+    ],
+    "72000290": [
+      "Event_GoldenKnight_Tease",
+      "Default"
+    ],
+    "72000291": [
+      "Challenge_AllCards_EventDeck",
+      "Default"
+    ],
+    "72000292": [
+      "DoubleElixir_AllCards_EventDeck",
+      "DoubleElixir"
+    ],
+    "72000293": [
+      "TripleElixir_AllCards_EventDeck",
+      "TripleElixir"
+    ],
+    "72000294": [
+      "Rage_AllCards_EventDeck",
+      "RageMode"
+    ],
+    "72000295": [
+      "RampUpElixir_AllCards_EventDeck",
+      "RampUp"
+    ],
+    "72000296": [
+      "Overtime_AllCards_EventDeck",
+      "SuddenDeath"
+    ],
+    "72000297": [
+      "Event_NewArena12",
+      "Default"
+    ],
+    "72000298": [
+      "Event_NewArena13",
+      "Default"
+    ],
+    "72000299": [
+      "Event_NewArena14",
+      "Default"
+    ],
+    "72000300": [
+      "Event_NewArena15",
+      "Default"
+    ],
+    "72000301": [
+      "Event_SuperLavaHound",
+      "Default"
+    ],
+    "72000302": [
+      "Event_ValentinesDay_MagicArcher_and_Princess_EventDeck",
+      "Default"
+    ],
+    "72000303": [
+      "Event_RandomElixir_Ladder",
+      "DoubleElixir"
+    ],
+    "72000304": [
+      "Boosts_LevelUp_Permanent_Friendly",
+      "Default"
+    ],
+    "72000305": [
+      "Boosts_Rage_Permanent_Friendly",
+      "Default"
+    ],
+    "72000306": [
+      "Boosts_Heal_Permanent_Friendly",
+      "Default"
+    ],
+    "72000307": [
+      "SpawnSpells_Friendly",
+      "Default"
+    ],
+    "72000308": [
+      "Event_MightyMiner_Tease",
+      "Default"
+    ],
+    "72000309": [
+      "Event_MiningTime_MightyMiner_and_Miner_EventDeck",
+      "Default"
+    ],
+    "72000310": [
+      "SpawnPoison_Friendly",
+      "Default"
+    ],
+    "72000311": [
+      "Event_SuperWitch",
+      "Default"
+    ],
+    "72000312": [
+      "GIANTSKELE_Rage_Buff_Tournament",
+      "Default"
+    ],
+    "72000313": [
+      "Event_GoblinsVsSkeletons",
+      "Default"
+    ],
+    "72000314": [
+      "Duel_1v1_Friendly",
+      "Default"
+    ],
+    "72000315": [
+      "PickBan_1v1_Friendly",
+      "Default"
+    ],
+    "72000316": [
+      "Duel_1v1_Tournament",
+      "Default"
+    ],
+    "72000317": [
+      "Event_SuperMiniPekka_PancakesSpawn",
+      "Spawning"
+    ],
+    "72000318": [
+      "Event_SuperMiniPekka",
+      "Default"
+    ],
+    "72000319": [
+      "Event_Barbarian_Barrel_Spawn",
+      "Spawning"
+    ],
+    "72000320": [
+      "Event_BarbarianLauncher",
+      "Default"
+    ],
+    "72000321": [
+      "Touchdown_ClanWar",
+      "DoubleElixir"
+    ],
+    "72000322": [
+      "MirrorDeck_3Elixir",
+      "Default"
+    ],
+    "72000323": [
+      "Ranked1v1",
+      "Default"
+    ],
+    "72000324": [
+      "YetAnotherBat_Tournament",
+      "Spawning"
+    ],
+    "72000325": [
+      "Event_Monk_Tease",
+      "Default"
+    ],
+    "72000326": [
+      "Event_Phoenix_Tease",
+      "Default"
+    ],
+    "72000327": [
+      "Ranked1v1_GoldRush",
+      "Default"
+    ],
+    "72000328": [
+      "Ranked1v1_CrownRush",
+      "Default"
+    ],
+    "72000329": [
+      "SpawnPhoenixMode_Tournament",
+      "Default"
+    ],
+    "72000330": [
+      "Event_Monk_Meta",
+      "Default"
+    ],
+    "72000331": [
+      "GlobalClone_Friendly",
+      "Default"
+    ],
+    "72000332": [
+      "Event_SantaHogRider",
+      "Default"
+    ],
+    "72000333": [
+      "PickMode_Tournament",
+      "Default"
+    ],
+    "72000334": [
+      "Event_SuperMagicArcher",
+      "Default"
+    ],
+    "72000335": [
+      "Event_SuperIceGolemite",
+      "Default"
+    ],
+    "72000336": [
+      "CommunityBan2023_Tournament",
+      "Default"
+    ],
+    "72000337": [
+      "CaptureTheSparky_Friendly",
+      "Default"
+    ],
+    "72000338": [
+      "GoblinOutbreak_1",
+      "Default"
+    ],
+    "72000339": [
+      "GoblinOutbreak_2",
+      "Default"
+    ],
+    "72000340": [
+      "GoblinOutbreak_3",
+      "Default"
+    ],
+    "72000341": [
+      "GoblinOutbreak_4",
+      "Default"
+    ],
+    "72000342": [
+      "Event_GoblinPartyHut",
+      "Default"
+    ],
+    "72000343": [
+      "Event_GoblinPartyRocket",
+      "Default"
+    ],
+    "72000344": [
+      "Event_SuperArcher",
+      "Default"
+    ],
+    "72000345": [
+      "PickMode_Tournament_GoldRush",
+      "Default"
+    ],
+    "72000346": [
+      "PickMode_Tournament_CrownRush",
+      "Default"
+    ],
+    "72000347": [
+      "Showdown_AllCards_EventDeck",
+      "Default"
+    ],
+    "72000348": [
+      "Draft_Competitive_SuperCards",
+      "Default"
+    ],
+    "72000349": [
+      "Event_SuperArcher_SpawnGolem",
+      "Default"
+    ],
+    "72000350": [
+      "CaptureTheQueen_Friendly",
+      "Default"
+    ],
+    "72000351": [
+      "BattleGround",
+      "Default"
+    ],
+    "72000352": [
+      "Event_SuperArcher_SpawnGolem_2",
+      "Default"
+    ],
+    "72000353": [
+      "Event_SuperHogRider_Terry",
+      "Default"
+    ],
+    "72000354": [
+      "Event_Mega_Monk",
+      "Default"
+    ],
+    "72000355": [
+      "ClassicDecks_Champion_Friendly",
+      "Default"
+    ],
+    "72000356": [
+      "Neutral_Rock_Barbarians",
+      "Default"
+    ],
+    "72000357": [
+      "Evo_Firecracker_Challenge",
+      "Default"
+    ],
+    "72000358": [
+      "Evo_Barbarian_Challenge",
+      "Default"
+    ],
+    "72000359": [
+      "Evo_Skeleton_Challenge",
+      "Default"
+    ],
+    "72000360": [
+      "Evo_RoyalGiant_Challenge",
+      "Default"
+    ],
+    "72000361": [
+      "Event_Evo_Barb",
+      "Default"
+    ],
+    "72000362": [
+      "Event_Evo_Barb_FC",
+      "Default"
+    ],
+    "72000363": [
+      "Event_Evo_Barb_FC_RG",
+      "Default"
+    ],
+    "72000364": [
+      "Event_Evo_All",
+      "Default"
+    ],
+    "72000365": [
+      "TeamVsTeam_RockArena",
+      "TeamVsTeam"
+    ],
+    "72000366": [
+      "Event_DarkElixir_Spawn",
+      "Default"
+    ],
+    "72000367": [
+      "Event_Evo_Mortar",
+      "Default"
+    ],
+    "72000368": [
+      "Event_Fixed_Sparky",
+      "Default"
+    ],
+    "72000369": [
+      "Event_Evo_Knight",
+      "Default"
+    ],
+    "72000370": [
+      "Event_HP_Regen_Tower",
+      "Default"
+    ],
+    "72000371": [
+      "Challenge_AllCards_EventDeck_Evo",
+      "Default"
+    ],
+    "72000372": [
+      "Overtime_AllCards_EventDeck_Evo",
+      "SuddenDeath"
+    ],
+    "72000373": [
+      "Event_Chess_Board",
+      "DoubleToTripleElixir"
+    ],
+    "72000374": [
+      "Event_Evo_RoyalRecruits",
+      "Default"
+    ],
+    "72000375": [
+      "Event_Prince_Buff",
+      "Default"
+    ],
+    "72000376": [
+      "Event_RestlessDead",
+      "Default"
+    ],
+    "72000377": [
+      "Event_MysteryBuff",
+      "Default"
+    ],
+    "72000378": [
+      "Event_TrickOrTreat",
+      "Default"
+    ],
+    "72000379": [
+      "Event_GlobalCurse",
+      "Default"
+    ],
+    "72000380": [
+      "PvE_CardDelivery_Test_1",
+      "Tutorial"
+    ],
+    "72000381": [
+      "CardDelivery_LittlePrince_1",
+      "Tutorial"
+    ],
+    "72000382": [
+      "CardDelivery_LittlePrince_2",
+      "Tutorial"
+    ],
+    "72000383": [
+      "CardDelivery_LittlePrince_3",
+      "Tutorial"
+    ],
+    "72000384": [
+      "Event_Elixir_Barrels",
+      "ElixirBarrel"
+    ],
+    "72000385": [
+      "TeamVsTeam_Rage_Friendly_Brawl",
+      "RageMode"
+    ],
+    "72000386": [
+      "Challenge_AllCards_EventDeck_Evo_20win",
+      "Default"
+    ],
+    "72000387": [
+      "Event_Evo_IceSpirits",
+      "Default"
+    ],
+    "72000388": [
+      "PickMode_TeamVsTeam_Test",
+      "TeamVsTeam"
+    ],
+    "72000389": [
+      "Event_Evo_IceSpirits_TeamVsTeam",
+      "TeamVsTeam"
+    ],
+    "72000390": [
+      "Event_Blizzard_Mode",
+      "Default"
+    ],
+    "72000391": [
+      "Event_Blizzard_Mode_TeamVsTeam",
+      "TeamVsTeam"
+    ],
+    "72000392": [
+      "Snowball_bombardment_TeamVsTeam",
+      "TeamVsTeam"
+    ],
+    "72000393": [
+      "MirrorDeck_EVO",
+      "Default"
+    ],
+    "72000394": [
+      "TeamVsTeam_MirrorDeck_EVO",
+      "TeamVsTeam"
+    ],
+    "72000395": [
+      "EventDeck_Cannoneer_Launch",
+      "Default"
+    ],
+    "72000396": [
+      "EventDeck_Cannoneer_Launch_TeamVsTeam",
+      "TeamVsTeam"
+    ],
+    "72000397": [
+      "Event_DarkElixir_Spawn_TeamVsTeam",
+      "TeamVsTeam"
+    ],
+    "72000398": [
+      "DraftMode_Cannoneer",
+      "Default"
+    ],
+    "72000399": [
+      "TeamVsTeamDraft_Cannoneer",
+      "TeamVsTeam"
+    ],
+    "72000400": [
+      "EventDeck_LoveBuff",
+      "Default"
+    ],
+    "72000401": [
+      "TeamVsTeam_EventDeck_LoveBuff",
+      "TeamVsTeam"
+    ],
+    "72000402": [
+      "EventDeck_BomberEVO_Launch",
+      "Default"
+    ],
+    "72000403": [
+      "TeamVsTeam_EventDeck_BomberEVO_Launch",
+      "TeamVsTeam"
+    ],
+    "72000404": [
+      "TeamVsTeam_Fixed_Sparky",
+      "TeamVsTeam"
+    ],
+    "72000405": [
+      "Event_GlobalLightning",
+      "Default"
+    ],
+    "72000406": [
+      "TeamVsTeam_Event_GlobalLightning",
+      "TeamVsTeam"
+    ],
+    "72000407": [
+      "TeamVsTeam_Event_GoblinPartyRocket",
+      "TeamVsTeam"
+    ],
+    "72000408": [
+      "Event_ElectroBuffs",
+      "Default"
+    ],
+    "72000409": [
+      "TeamVsTeam_Event_ElectroBuffs",
+      "TeamVsTeam"
+    ],
+    "72000410": [
+      "CardDelivery_DaggerDuchess_1",
+      "Tutorial"
+    ],
+    "72000411": [
+      "CardDelivery_DaggerDuchess_2",
+      "Tutorial"
+    ],
+    "72000412": [
+      "CardDelivery_DaggerDuchess_3",
+      "Tutorial"
+    ],
+    "72000413": [
+      "EventDeck_DaggerDuchess_Launch",
+      "Default"
+    ],
+    "72000414": [
+      "EventDeck_DaggerDuchess_Launch_TeamVsTeam",
+      "TeamVsTeam"
+    ],
+    "72000415": [
+      "DraftMode_DaggerDuchess",
+      "Default"
+    ],
+    "72000416": [
+      "TeamVsTeamDraft_DaggerDuchess",
+      "TeamVsTeam"
+    ],
+    "72000417": [
+      "Event_Fixed_Mortar",
+      "Default"
+    ],
+    "72000418": [
+      "TeamVsTeam_Fixed_Mortar",
+      "TeamVsTeam"
+    ],
+    "72000419": [
+      "TeamVsTeam_BattleGround",
+      "TeamVsTeam"
+    ],
+    "72000420": [
+      "EventDeck_SpellCauldron",
+      "Default"
+    ],
+    "72000421": [
+      "TeamVsTeam_SpellCauldron",
+      "TeamVsTeam"
+    ],
+    "72000422": [
+      "EventDeck_Void_Launch",
+      "Default"
+    ],
+    "72000423": [
+      "TeamVsTeam_Void_Launch",
+      "TeamVsTeam"
+    ],
+    "72000424": [
+      "EventDeck_TriWizard",
+      "Default"
+    ],
+    "72000425": [
+      "TeamVsTeam_TriWizard",
+      "TeamVsTeam"
+    ],
+    "72000426": [
+      "TeamVsTeam_GoblinPartyHut",
+      "TeamVsTeam"
+    ],
+    "72000427": [
+      "Event_GoblinBuffs",
+      "Default"
+    ],
+    "72000428": [
+      "TeamVsTeam_GoblinBuffs",
+      "TeamVsTeam"
+    ],
+    "72000429": [
+      "ClassicDecks_Evo",
+      "Default"
+    ],
+    "72000430": [
+      "TeamVsTeam_ClassicDecks_Evo",
+      "TeamVsTeam"
+    ],
+    "72000431": [
+      "GoblinTrail_Tutorial",
+      "Tutorial"
+    ],
+    "72000432": [
+      "Goblin_Ladder",
+      "Default"
+    ],
+    "72000433": [
+      "EventDeck_GoblinRocketSilo",
+      "Default"
+    ],
+    "72000434": [
+      "TeamVsTeam_GoblinRocketSilo",
+      "TeamVsTeam"
+    ],
+    "72000435": [
+      "TeamVsTeam_Elixir_Barrels",
+      "ElixirBarrel"
+    ],
+    "72000436": [
+      "EventDeck_Drill_Launch",
+      "Default"
+    ],
+    "72000437": [
+      "TeamVsTeam_Drill_Launch",
+      "TeamVsTeam"
+    ],
+    "72000438": [
+      "TeamVsTeam_Challenge_AllCards_EventDeck",
+      "TeamVsTeam"
+    ],
+    "72000439": [
+      "Event_GoblinBush_Spawn",
+      "Default"
+    ],
+    "72000440": [
+      "TeamVsTeam_GoblinBush_Spawn",
+      "TeamVsTeam"
+    ],
+    "72000441": [
+      "Challenge_AllCards_EventDeck_NewHotness",
+      "Default"
+    ],
+    "72000442": [
+      "EventDeck_PekkaEvo_Launch",
+      "Default_UltimateClash"
+    ],
+    "72000443": [
+      "Draft_SKvsSMPekka",
+      "Default_UltimateClash"
+    ],
+    "72000444": [
+      "EventDeck_4Card",
+      "Default_short"
+    ],
+    "72000445": [
+      "EventDeck_Berserk",
+      "Default"
+    ],
+    "72000446": [
+      "TeamVsTeam_PekkaEvo_Launch",
+      "TeamVsTeam_UltimateClash"
+    ],
+    "72000447": [
+      "TeamVsTeam_4Card",
+      "TeamVsTeam_Default_short"
+    ],
+    "72000448": [
+      "TeamVsTeam_Berserk",
+      "TeamVsTeam_UltimateClash"
+    ],
+    "72000449": [
+      "EventDeck_SpawnMelee",
+      "Default_UltimateClash"
+    ],
+    "72000450": [
+      "Ranked1v1_NewArena",
+      "Default"
+    ],
+    "72000451": [
+      "Ranked1v1_NewArena_GoldRush",
+      "Default"
+    ],
+    "72000452": [
+      "Ranked1v1_NewArena_CrownRush",
+      "Default"
+    ],
+    "72000453": [
+      "DraftMode_UltimateClash",
+      "Default_UltimateClash"
+    ],
+    "72000454": [
+      "EventDeck_SKvsSMPekka",
+      "Default_UltimateClash"
+    ],
+    "72000455": [
+      "TeamVsTeam_SKvsSMPekka",
+      "TeamVsTeam_UltimateClash"
+    ],
+    "72000456": [
+      "Ladder_TeamVsTeam",
+      "Default"
+    ],
+    "72000457": [
+      "202410_Event_Spooky_Chess",
+      "DoubleToTripleElixir"
+    ],
+    "72000458": [
+      "202410_Event_Blackout",
+      "Default"
+    ],
+    "72000459": [
+      "TeamVsTeam_Blackout",
+      "TeamVsTeam"
+    ],
+    "72000460": [
+      "EventDeck_GoblinStein_Launch",
+      "Default"
+    ],
+    "72000461": [
+      "TeamVsTeam_GoblinStein_Launch",
+      "TeamVsTeam"
+    ],
+    "72000462": [
+      "CardDelivery_Goblinstein_1",
+      "Tutorial"
+    ],
+    "72000463": [
+      "CardDelivery_Goblinstein_2",
+      "Tutorial"
+    ],
+    "72000464": [
+      "Ranked1v1_NewArena2",
+      "Default"
+    ],
+    "72000465": [
+      "Ranked1v1_NewArena2_GoldRush",
+      "Default"
+    ],
+    "72000466": [
+      "Ranked1v1_NewArena2_CrownRush",
+      "Default"
+    ],
+    "72000467": [
+      "EventDeck_Cannon_Evo_Launch",
+      "Default"
+    ],
+    "72000468": [
+      "EventDeck_Phoenix_Spawner",
+      "Default"
+    ],
+    "72000469": [
+      "DraftMode_Princess",
+      "Default"
+    ],
+    "72000470": [
+      "TeamVsTeamDraft_Princess",
+      "TeamVsTeam"
+    ],
+    "72000471": [
+      "EventDeck_Spawn_ SantaHogRider",
+      "Default"
+    ],
+    "72000472": [
+      "TeamVsTeamDraft_Spawn_ SantaHogRider",
+      "TeamVsTeam"
+    ],
+    "72000473": [
+      "EventDeck_Gift_Delivery",
+      "Default"
+    ],
+    "72000474": [
+      "Challenge_AllCards_EventDeck_NoSet",
+      "Default"
+    ],
+    "72000475": [
+      "DoubleElixir_AllCards_EventDeck_NoSet",
+      "DoubleElixir"
+    ],
+    "72000476": [
+      "TripleElixir_AllCards_EventDeck_NoSet",
+      "TripleElixir"
+    ],
+    "72000477": [
+      "Draft_Competitive_Cannoneer",
+      "Default"
+    ],
+    "72000478": [
+      "EventDeck_Holiday_Feast",
+      "Default"
+    ],
+    "72000479": [
+      "TeamVsTeam_Holiday_Feast",
+      "TeamVsTeam"
+    ],
+    "72000480": [
+      "Draft_Competitive_Chef",
+      "Default"
+    ],
+    "72000481": [
+      "Ladder_Classic",
+      "Default"
+    ],
+    "72000482": [
+      "EventDeck_RuneGiant_Launch",
+      "Default"
+    ],
+    "72000483": [
+      "Overtime_AllCards_EventDeck_NoSet",
+      "SuddenDeath"
+    ],
+    "72000484": [
+      "CardDelivery_RuneBerserker_1",
+      "Tutorial"
+    ],
+    "72000485": [
+      "CardDelivery_RuneBerserker_2",
+      "Tutorial"
+    ],
+    "72000486": [
+      "Touchdown_Event",
+      "DoubleElixir"
+    ],
+    "72000487": [
+      "EventDeck_LoveBuff_Event",
+      "Default"
+    ],
+    "72000488": [
+      "TeamVsTeam_EventDeck_LoveBuff_Event",
+      "TeamVsTeam"
+    ],
+    "72000489": [
+      "MirrorMatch_Tournament_Premade_Decks",
+      "Default"
+    ],
+    "72000490": [
+      "Draft_Competitive_Princess",
+      "Default"
+    ],
+    "72000491": [
+      "All_Random",
+      "AllRandom"
+    ],
+    "72000492": [
+      "GameModePlugin",
+      "Default"
+    ],
+    "72000493": [
+      "7xElixir_Friendly_EventDeck",
+      "7xElixir"
+    ],
+    "72000494": [
+      "Event_GoblinPartyRocket_2025",
+      "Default"
+    ],
+    "72000495": [
+      "CaptureTheEgg_EventDeck",
+      "Default"
+    ],
+    "72000496": [
+      "Ladder_TeamVsTeam_Level15Cap",
+      "Default"
+    ],
+    "72000497": [
+      "Event_Blizzard_Mode_2026",
+      "DoubleElixir"
+    ],
+    "72000498": [
+      "Event_Blizzard_Mode_TeamVsTeam_2026",
+      "TeamVsTeam_DoubleElixir"
+    ],
+    "72000499": [
+      "Touchdown_Event_4Card",
+      "DoubleElixir"
+    ],
+    "72000500": [
+      "RampUp_Friendly_EventDeck_4Card",
+      "RampUp"
+    ],
+    "72000501": [
+      "All_Random_Princess",
+      "AllRandom"
+    ],
+    "72000502": [
+      "Crazy_Arena",
+      "Crazy_Arena"
+    ],
+    "72000503": [
+      "FloodHounds_Draft",
+      "Default"
+    ],
+    "72000504": [
+      "Crazy_Arena_EpicOnly",
+      "Crazy_Arena"
+    ],
+    "72000505": [
+      "Chaos_1v1_Draft",
+      "Crazy_Arena"
+    ],
+    "72000506": [
+      "Chaos_1v1_TripleDraft",
+      "Crazy_Arena"
+    ],
+    "72000507": [
+      "Chaos_1v1_MegaDraft",
+      "Crazy_Arena"
+    ],
+    "72000508": [
+      "Chaos_1v1_MegaDraft_S1",
+      "Crazy_Arena"
+    ],
+    "72000509": [
+      "Chaos_1v1_MegaDraft_S2",
+      "Crazy_Arena"
+    ],
+    "72000510": [
+      "Crazy_Arena_InfiniteElixir",
+      "Crazy_Arena_InfiniteElixir"
+    ],
+    "72000511": [
+      "Crazy_Arena_SuddenDeath",
+      "Crazy_Arena_SuddenDeath"
+    ],
+    "72000512": [
+      "Chaos_1v1_MegaDraft_All",
+      "Crazy_Arena"
+    ]
+  },
+  "game_modes_source": "runtime-update/csv_logic/game_modes.csv",
+  "game_modes_sha256": "da2e430e23d36d24de7d334c74b7c2dd1d0038a431271f2fb90b31cdb5e117da",
+  "content_version": "15.535.86",
+  "content_manifest_sha1": "41d8df308b22bf144c2a4f2b75f6e6fbf69a0c82",
+  "libg_build_id": "90e6f351f0dec4a28b494c3812d2629fd45d5a83"
+}
