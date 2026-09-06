@@ -13,6 +13,7 @@
 <p align="center">
   <a href="docs/getting_started.md">安装指南</a> ·
   <a href="docs/training.md">训练指南</a> ·
+  <a href="docs/training_history.md">训练历程</a> ·
   <a href="checkpoints/README.md">模型</a> ·
   <a href="docs/architecture.md">系统架构</a> ·
   <a href="docs/policy_service.md">策略 API</a>
@@ -25,6 +26,8 @@
 ## 预训练模型
 
 **我们已训练出较强的《皇室战争》通用模型，以及达到名人堂级水平的 2.6 速猪专精模型。**
+
+作者使用速猪模型，将一个账号打上了名人堂。[训练历程](docs/training_history.md)记录了五个核心模型的演进、固定 IL 训练的歪路，以及模型评测结果。
 
 想尝试不同卡组，选择 **General**；想体验 2.6 速猪，选择 **Hog 2.6 specialist**。模型已包含在仓库中，按照[快速开始](#快速开始)打开界面即可对战。[模型说明](checkpoints/README.md)列出了各文件的用途和评测方法。
 
@@ -118,6 +121,7 @@ Copy-Item .env.example .env
 | 指南 | 内容 |
 | --- | --- |
 | [安装指南](docs/getting_started.md) | 依赖、`.env`、本地构建、安装与控制台 |
+| [训练历程](docs/training_history.md) | 五个核心模型、实验转折、评测结果与打法取舍 |
 | [训练指南](docs/training.md) | 回放缓存、IL、批量模拟、Linux guest 与 PPO |
 | [系统架构](docs/architecture.md) | 环境、策略、训练与回放的源码导览 |
 | [模型](checkpoints/README.md) | 模型选择、加载与评测指标 |

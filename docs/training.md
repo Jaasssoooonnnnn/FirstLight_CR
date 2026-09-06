@@ -1,6 +1,6 @@
 # Training and simulation · 训练与模拟
 
-[English home](../README.md) · [中文首页](../README.zh-CN.md) · [Installation / 安装](getting_started.md)
+[English home](../README.md) · [中文首页](../README.zh-CN.md) · [Installation / 安装](getting_started.md) · [Training history / 训练历程](training_history.md)
 
 Run commands from the repository root with the Python dependencies installed. Windows supports cache building, inference, evaluation, and the console. The IL/PPO launchers target Linux with CUDA and NCCL.
 

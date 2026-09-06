@@ -1,6 +1,6 @@
 # Models · 模型
 
-[English home](../README.md) · [中文首页](../README.zh-CN.md) · [Training / 训练](../docs/training.md)
+[English home](../README.md) · [中文首页](../README.zh-CN.md) · [Training / 训练](../docs/training.md) · [Training history / 训练历程](../docs/training_history.md)
 
 FirstLight CR includes a **strong general-purpose agent** and a **Hall of Fame–level 2.6 Hog Cycle specialist**, alongside IL checkpoints. Select a model in the match interface, or pass its path to the evaluator or policy service.
 
@@ -10,15 +10,19 @@ FirstLight CR 提供**较强的通用模型**、**名人堂级 2.6 速猪专精�
 
 | Model / 模型 | Use / 用途 | File / 文件 |
 | --- | --- | --- |
-| General / 通用模型 | Play with different decks; initialize PPO / 尝试不同卡组，作为 PPO 起点 | [General/checkpoint-step-00000460.pt](General/checkpoint-step-00000460.pt) |
-| IL / 模仿学习模型 | Compare an IL policy with other agents / 对比 IL 策略与其他模型 | [IL/checkpoint-step-00029396.pt](IL/checkpoint-step-00029396.pt) |
-| Active IL / Active IL 模型 | Additional IL checkpoint for comparison / 用于对比的另一份 IL 模型 | [active IL/checkpoint-step-00000030.pt](<active IL/checkpoint-step-00000030.pt>) |
-| Hog 2.6 specialist 1 / 2.6 速猪专精 1 | Play the 2.6 Hog Cycle deck / 使用 2.6 速猪卡组对战 | [2_6hog_expert/hog26-specialist1.pt](2_6hog_expert/hog26-specialist1.pt) |
-| Hog 2.6 specialist 2 / 2.6 速猪专精 2 | Second specialist checkpoint for comparison / 用于对比的另一份速猪专精模型 | [2_6hog_expert/hog26-specialist2.pt](2_6hog_expert/hog26-specialist2.pt) |
+| General / 通用模型 | u460: stronger with cheap decks; more ordinary with expensive decks / u460：小费较好，大费一般 | [General/checkpoint-step-00000460.pt](General/checkpoint-step-00000460.pt) |
+| IL / 模仿学习模型 | Human-like play across decks, modest overall strength / 各类卡组打法像真人，整体实力一般 | [IL/checkpoint-step-00029396.pt](IL/checkpoint-step-00029396.pt) |
+| Active IL / Active IL 模型 | PPO-adjusted IL: more active, better with expensive decks; cheap-deck play regressed / PPO 调整的积极版 IL：大费较好，小费有所退化 | [active IL/checkpoint-step-00000030.pt](<active IL/checkpoint-step-00000030.pt>) |
+| Hog 2.6 specialist 1 / 2.6 速猪专精 1 | u192: the more proactive specialist / u192：更积极一些的速猪模型 | [2_6hog_expert/hog26-specialist1.pt](2_6hog_expert/hog26-specialist1.pt) |
+| Hog 2.6 specialist 2 / 2.6 速猪专精 2 | u616: more passive, stronger measured match results / u616：更被动，模型对战成绩更强 | [2_6hog_expert/hog26-specialist2.pt](2_6hog_expert/hog26-specialist2.pt) |
 
-Choose General for a first match. For a Hog specialist, select the Hog Rider, Musketeer, Cannon, Fireball, The Log, Skeletons, Ice Golem, and Ice Spirit deck. Set card forms in the interface for the matchup you want to play.
+These playstyle descriptions summarize the author’s hands-on observations. The author reached Hall of Fame on an account using the Hog specialist; the [training history](../docs/training_history.md) separates that account result from model-versus-model evaluations and explains each model’s origin.
 
-第一次对战可选 General。使用速猪专精模型时，卡组选择野猪骑士、火枪手、加农炮、火球、滚木、骷髅兵、冰人和冰精灵，并在界面中设置本场使用的卡牌形态。
+上述打法特点来自作者的实战观察。作者使用速猪模型将一个账号打上了名人堂；[训练历程](../docs/training_history.md)分别记录这项账号成绩和模型对战评测，并说明各模型的来源。
+
+Choose General for a first match. For the trained Hog specialist deck, select Hog Rider, Hero Musketeer, Evolved Cannon, Fireball, The Log, Evolved Skeletons, Ice Golem, and Ice Spirit; set those forms explicitly in the interface.
+
+第一次对战可选 General。体验训练时的速猪卡组，请选择野猪骑士、精英火枪手、觉醒加农炮、火球、滚木、觉醒骷髅兵、冰人和冰精灵，并在界面中明确设置这些形态。
 
 ## Local inference · 本地推理
 

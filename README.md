@@ -14,6 +14,7 @@
 <p align="center">
   <a href="docs/getting_started.md">Installation</a> ·
   <a href="docs/training.md">Training</a> ·
+  <a href="docs/training_history.md">Training history</a> ·
   <a href="checkpoints/README.md">Models</a> ·
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="docs/policy_service.md">Policy API</a>
@@ -26,6 +27,8 @@
 ## Pretrained models
 
 **We have trained a strong general-purpose Clash Royale agent and a Hall of Fame–level 2.6 Hog Cycle specialist.**
+
+The author reached Hall of Fame on an account using the Hog specialist. Read the [training history](docs/training_history.md) for the five-model progression, the fixed-IL detour, and model evaluation results.
 
 Choose **General** to try different decks, or a **Hog 2.6 specialist** for Hog Cycle. The models are included in the repository; follow the [quick start](#quick-start) to play against them. The [model guide](checkpoints/README.md) explains each checkpoint and how to evaluate it.
 
@@ -119,6 +122,7 @@ All guides include English and Chinese.
 | Guide | Contents |
 | --- | --- |
 | [Getting started](docs/getting_started.md) | Requirements, `.env`, local build, installation, and console |
+| [Training history](docs/training_history.md) | Five main models, experiments, results, and playstyle tradeoffs |
 | [Training](docs/training.md) | Replay cache, IL, batch simulation, Linux guests, and PPO |
 | [Architecture](docs/architecture.md) | Environment, policy, training, and replay source map |
 | [Models](checkpoints/README.md) | Model selection, loading, and evaluation metrics |
