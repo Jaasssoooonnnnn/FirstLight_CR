@@ -1,0 +1,14 @@
+* text=auto
+*.py text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.inc text eol=lf
+*.S text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.json text eol=lf
+*.gz binary
+*.pt binary
+*.png binary
+*.ico binary
+*.gif binary

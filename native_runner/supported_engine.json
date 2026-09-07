@@ -1,0 +1,12 @@
+{
+  "schema": "firstlight-offline-engine.v1",
+  "package": "nullsroyale.rel.free",
+  "apk_version": "15.535.13",
+  "apk_version_code": 150535013,
+  "abi": "arm64-v8a",
+  "apk_sha256": "685c115ee432d5fd2d7be856a58ea0cb029c9c187aa9061f3cd250994dfbcf2a",
+  "libg_sha256": "110aa2b5cac391c498645e072b0d88729428c2c2845e7e2737ca8ee979059783",
+  "resource_directory": "nr_15.535.13_release_ff1c6c29",
+  "runtime_content_version": "15.535.86",
+  "runtime_fingerprint_sha256": "e0cb2fb9eb2fdd0df1afcb00df3e3ba61cf25aa8b24e39c17cc391d952a4e339"
+}

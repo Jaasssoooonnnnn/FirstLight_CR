@@ -1,0 +1,105 @@
+{
+  "schema": "v4-ppo-focus-decks.v1",
+  "decks": [
+    {
+      "rank": 1,
+      "card_keys": ["royal-ghost-ev1", "battle-ram-ev1", "wizard-hero", "giant-skeleton", "mother-witch", "vines", "zappies", "barbarian-barrel"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 2,
+      "card_keys": ["electro-dragon-ev1", "elite-barbarians-ev1", "berserker-hero", "golem", "skeleton-dragons", "tornado", "barbarian-barrel", "elixir-collector"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 3,
+      "card_keys": ["skeleton-barrel-ev1", "mortar-ev1", "berserker-hero", "cannon-cart", "fireball", "minions", "rascals", "barbarian-barrel"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 4,
+      "card_keys": ["royal-hogs-ev1", "archers-ev1", "goblinstein", "lightning", "skeletons", "electro-spirit", "barbarian-barrel", "bomb-tower"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 5,
+      "card_keys": ["firecracker-ev1", "cannon-ev1", "mighty-miner", "hog-rider", "earthquake", "skeletons", "electro-spirit", "barbarian-barrel"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 6,
+      "card_keys": ["archers-ev1", "tesla-ev1", "knight-hero", "x-bow", "fireball", "skeletons", "electro-spirit", "the-log"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 7,
+      "card_keys": ["cannon-ev1", "skeletons-ev1", "musketeer-hero", "hog-rider", "fireball", "ice-golem", "ice-spirit", "the-log"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 8,
+      "card_keys": ["elite-barbarians-ev1", "minion-horde-ev1", "boss-bandit", "hog-rider", "executioner", "guards", "freeze", "zap"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 9,
+      "card_keys": ["baby-dragon-ev1", "zap-ev1", "mega-minion-hero", "lava-hound", "barbarians", "fireball", "balloon", "tombstone"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 10,
+      "card_keys": ["elite-barbarians-ev1", "zap-ev1", "mini-pekka-hero", "golem", "phoenix", "night-witch", "bomber", "arrows"],
+      "tower_key": "royal-chef"
+    },
+    {
+      "rank": 11,
+      "card_keys": ["baby-dragon-ev1", "inferno-dragon-ev1", "knight-hero", "balloon", "bowler", "tornado", "freeze", "barbarian-barrel"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 12,
+      "card_keys": ["wizard-ev1", "zap-ev1", "mini-pekka-hero", "giant", "sparky", "vines", "tornado", "heal-spirit"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 13,
+      "card_keys": ["goblin-drill-ev1", "giant-snowball-ev1", "berserker-hero", "fireball", "bomber", "fire-spirit", "skeletons", "cannon"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 14,
+      "card_keys": ["elite-barbarians-ev1", "ice-golem-hero", "golden-knight", "three-musketeers", "royal-ghost", "barbarian-barrel", "heal-spirit", "elixir-collector"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 15,
+      "card_keys": ["furnace-ev1", "valkyrie-ev1", "berserker-hero", "graveyard", "poison", "goblin-hut", "ice-spirit", "barbarian-barrel"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 16,
+      "card_keys": ["royal-giant-ev1", "royal-ghost-ev1", "barbarian-barrel-hero", "hunter", "fisherman", "fireball", "skeletons", "electro-spirit"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 17,
+      "card_keys": ["goblin-cage-ev1", "royal-recruits-ev1", "golden-knight", "barbarian-barrel", "royal-hogs", "flying-machine", "zappies", "arrows"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 18,
+      "card_keys": ["battle-ram-ev1", "inferno-dragon-ev1", "mini-pekka-hero", "mega-knight", "mother-witch", "bomber", "freeze", "zap"],
+      "tower_key": "dagger-duchess"
+    },
+    {
+      "rank": 19,
+      "card_keys": ["battle-ram-ev1", "royal-ghost-ev1", "magic-archer-hero", "pekka", "fireball", "electro-wizard", "bandit", "zap"],
+      "tower_key": "tower-princess"
+    },
+    {
+      "rank": 20,
+      "card_keys": ["elite-barbarians-ev1", "giant-hero", "mega-minion-hero", "dark-prince", "fireball", "bomber", "zap", "rage"],
+      "tower_key": "dagger-duchess"
+    }
+  ]
+}
