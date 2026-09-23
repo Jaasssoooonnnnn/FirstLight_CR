@@ -329,6 +329,50 @@ def test_special_tower_troop_runtime_reaches_fair_tower_state() -> None:
         )
 
 
+def test_royal_chef_runtime_can_end_after_both_side_towers_fall() -> None:
+    ordinary = _ordinary()
+    for slot in (4, 5):
+        ordinary["objects"][slot]["hp"] = 0  # type: ignore[index]
+    rich = _rich(ordinary)
+    _set_tower_troop_runtime(rich, by_slot={})
+    env = _environment(_RichNativeStub(ordinary, rich), build_card_catalog())
+
+    observations, _ = _reset_rich(
+        env,
+        match_config=MatchConfig(
+            deck0=SEMANTIC_BASELINE_DECK,
+            deck1=SEMANTIC_BASELINE_DECK,
+            tower_troop1_id=159_000_004,
+        ),
+    )
+
+    for observation in observations.values():
+        chef_king = next(
+            tower for tower in observation.towers
+            if tower.owner == 1 and tower.tower_kind == "king"
+        )
+        assert chef_king.active
+        assert chef_king.tower_troop_runtime is None
+        assert (
+            chef_king.runtime_provenance.field_evidence["tower_troop_runtime"]
+            == SemanticEvidenceLevel.NOT_APPLICABLE
+        )
+
+    ordinary["objects"][5]["hp"] = 1  # type: ignore[index]
+    rich = _rich(ordinary)
+    _set_tower_troop_runtime(rich, by_slot={})
+    env = _environment(_RichNativeStub(ordinary, rich), build_card_catalog())
+    with pytest.raises(BattleEnvError, match="active special Tower Troop lacks"):
+        _reset_rich(
+            env,
+            match_config=MatchConfig(
+                deck0=SEMANTIC_BASELINE_DECK,
+                deck1=SEMANTIC_BASELINE_DECK,
+                tower_troop1_id=159_000_004,
+            ),
+        )
+
+
 def test_exact_tower_activation_sets_public_status_from_native_event() -> None:
     before = _ordinary()
     before_rich = _rich(before)

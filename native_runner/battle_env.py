@@ -1245,7 +1245,13 @@ class BattleEnvV1:
             tower_active = item is not None and hp > 0
             tower_runtime_relevant = tower_active and (
                 (kind != "king" and tower_troop_id == 159_000_002)
-                or (kind == "king" and configured_tower_troops[owner] == ROYAL_CHEF_TOWER_TROOP_ID)
+                or (
+                    kind == "king"
+                    and configured_tower_troops[owner] == ROYAL_CHEF_TOWER_TROOP_ID
+                    # The Chef action can disappear while its king tower remains
+                    # alive after both side towers are destroyed.
+                    and surviving_side_towers[owner] > 0
+                )
             )
             if rich_context is not None and item is not None:
                 rich_item = rich_context.item_for_raw(item)
