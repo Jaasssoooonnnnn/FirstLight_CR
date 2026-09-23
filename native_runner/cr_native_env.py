@@ -2871,7 +2871,12 @@ class NativeClashEnv:
         return self._request(f"inject {payload}")
 
     def queue_hand_action_at(
-        self, action: HandAction, *, execute_tick: int | None = None, execute_in_ticks: int | None = None
+        self,
+        action: HandAction,
+        *,
+        execute_tick: int | None = None,
+        execute_in_ticks: int | None = None,
+        clamp_late: bool = False,
     ) -> dict[str, Any]:
         """Queue a hand action for an exact observable application tick.
 
@@ -2880,6 +2885,8 @@ class NativeClashEnv:
         tick rather than the start of the native 20-tick command-age interval.
         The method does not advance time, so both owners can be
         queued from the same pre-step state before one shared ``step`` call.
+        ``clamp_late`` keeps live policy commands valid if inference finishes
+        too close to or after their observation-anchored deadline.
         """
 
         if action.owner not in (0, 1):
@@ -2895,6 +2902,8 @@ class NativeClashEnv:
             before = self.observe()
             current_tick = int(before["tick"])
             applied_tick = int(execute_tick) if execute_tick is not None else current_tick + int(execute_in_ticks or 1)
+            if clamp_late and execute_tick is not None and applied_tick <= current_tick + 2:
+                applied_tick = current_tick + LIVE_COMMAND_AGE_TICKS
             applied_tick = max(FIRST_PLAYABLE_TICK + 1, applied_tick)
             # The engine consumes a command while advancing from t2 to the
             # following state.  Therefore a state observed at applied_tick was

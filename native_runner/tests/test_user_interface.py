@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,132 @@ class _EmptyTree:
         return None
 
 
+def test_manual_match_uses_previous_defaults_without_settings_controls() -> None:
+    app = object.__new__(interface.CRHarnessInterface)
+    preset = interface.MATCH_PRESETS[0]
+    app.deck0_editor = SimpleNamespace(values=lambda: (preset.deck0, preset.forms0))
+    app.deck1_editor = SimpleNamespace(values=lambda: (preset.deck1, preset.forms1))
+
+    config = app._match_config()
+
+    assert config.deck0 == preset.deck0
+    assert config.deck1 == preset.deck1
+    assert config.seed == 20260728
+    assert (config.level_cap, config.minimum_card_level, config.king_tower_level) == (11, 11, 11)
+    assert (config.owner0_name, config.owner1_name) == ("PEKKA-11-A", "PEKKA-11-B")
+
+
+def test_model_deck_role_check_blocks_three_evolutions_before_start(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    app = object.__new__(interface.CRHarnessInterface)
+    app.busy = False
+    app.model_checkpoint_var = _FakeVar(str(checkpoint))
+    app.model_deck0_editor = SimpleNamespace(values=lambda: (
+        (26000021, 26000030, 26000014, 26000038, 28000011, 27000000, 28000000, 26000010),
+        (0, 1, 2, 0, 0, 1, 0, 1),
+    ))
+    app.model_deck1_editor = SimpleNamespace(values=lambda: (
+        interface.PEKKA_BRIDGE_SPAM_DECK, interface.PEKKA_BRIDGE_SPAM_FORMS,
+    ))
+    errors: list[BaseException] = []
+    app._show_error = errors.append
+    app._confirm_replace_owned_session = lambda _kind: pytest.fail("session changed before role validation")
+
+    app.start_model_match()
+
+    assert len(errors) == 1
+    assert "3 张觉醒、1 张英雄" in str(errors[0])
+    assert "改为“基础”" in str(errors[0])
+    assert interface.validate_model_deck_roles((0, 0, 2, 0, 0, 1, 0, 1)) is None
+
+
+def test_model_match_launches_deterministic_argmax(monkeypatch, tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setattr(interface, "REPOSITORY_ROOT", tmp_path)
+    app = object.__new__(interface.CRHarnessInterface)
+    app.busy = False
+    app.owns_native_session = True
+    app.model_checkpoint_var = _FakeVar(str(checkpoint))
+    app.model_status_var = _FakeVar()
+    app.model_deck0_editor = SimpleNamespace(values=lambda: (
+        interface.PEKKA_BRIDGE_SPAM_DECK, interface.PEKKA_BRIDGE_SPAM_FORMS,
+    ))
+    app.model_deck1_editor = app.model_deck0_editor
+    app._confirm_replace_owned_session = lambda _kind: True
+    app._check_operation_conflicts = lambda: True
+    app.stop_replay = lambda: None
+    app._terminate_overlay = lambda: None
+    app._set_model_active = lambda _active: None
+    captured: dict[str, object] = {}
+
+    def launch(module, _log_path, **options):
+        captured.update(module=module, **options)
+        return SimpleNamespace(poll=lambda: 0, returncode=0), None
+
+    app._launch_python = launch
+    app._background = lambda _name, run, _success, _failed: run()
+
+    app.start_model_match()
+
+    assert captured["module"] == "native_runner.training.v4.offline_agent"
+    assert "deterministic" in captured and captured["deterministic"] is None
+    assert app.model_status_var.get() == "正在准备离线 VM 和模型…"
+
+
+def test_ai_duel_launches_both_checkpoints_and_decks(monkeypatch, tmp_path: Path) -> None:
+    checkpoints = (tmp_path / "top.pt", tmp_path / "bottom.pt")
+    for checkpoint in checkpoints:
+        checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setattr(interface, "REPOSITORY_ROOT", tmp_path)
+    app = object.__new__(interface.CRHarnessInterface)
+    app.busy = False
+    app.owns_native_session = True
+    app.duel_checkpoint0_var = _FakeVar(str(checkpoints[0]))
+    app.duel_checkpoint1_var = _FakeVar(str(checkpoints[1]))
+    app.duel_deck0_editor = SimpleNamespace(values=lambda: (
+        interface.PEKKA_BRIDGE_SPAM_DECK, interface.PEKKA_BRIDGE_SPAM_FORMS,
+    ))
+    app.duel_deck1_editor = app.duel_deck0_editor
+    app.duel_status_var = _FakeVar()
+    app._confirm_replace_owned_session = lambda _kind: True
+    app._check_operation_conflicts = lambda: True
+    app.stop_replay = lambda: None
+    app._terminate_overlay = lambda: None
+    app._set_model_active = lambda _active: None
+    captured: dict[str, object] = {}
+
+    def launch(module, _log_path, **options):
+        captured.update(module=module, **options)
+        return SimpleNamespace(poll=lambda: 0, returncode=0), None
+
+    app._launch_python = launch
+    app._background = lambda _name, run, _success, _failed: run()
+
+    app.start_ai_duel()
+
+    assert captured["module"] == "native_runner.training.v4.offline_duel"
+    assert (captured["checkpoint_0"], captured["checkpoint_1"]) == checkpoints
+    config = json.loads((app.model_artifact_dir / "match.json").read_text(encoding="utf-8"))
+    assert config["deck0"] == list(interface.PEKKA_BRIDGE_SPAM_DECK)
+    assert config["deck1"] == list(interface.PEKKA_BRIDGE_SPAM_DECK)
+    assert app.model_match_kind == "duel"
+
+
+def test_force_ai_play_sends_request_to_chosen_side(tmp_path: Path) -> None:
+    app = object.__new__(interface.CRHarnessInterface)
+    app.model_match_kind = "duel"
+    app.model_active = True
+    app.model_artifact_dir = tmp_path
+    app.model_process = SimpleNamespace(poll=lambda: None)
+
+    app.force_ai_play(1)
+
+    assert (tmp_path / "force-1").exists()
+    assert not (tmp_path / "force-0").exists()
+
+
 def test_custom_collected_replay_directory_is_exclusive(
     monkeypatch,
     tmp_path: Path,
@@ -52,7 +179,6 @@ def test_custom_collected_replay_directory_is_exclusive(
     app.collected_limit_var = _FakeVar("500")
     app.collected_query_var = _FakeVar("")
     app.collected_replay_status_var = _FakeVar()
-    app.collected_dataset_note_var = _FakeVar()
     app.collected_replay_tree = _EmptyTree()
     app.collected_replay_entries = {}
     captured: dict[str, object] = {}
@@ -73,7 +199,6 @@ def test_custom_collected_replay_directory_is_exclusive(
     assert captured["limit"] == 500
     assert captured["query"] == ""
     assert captured["personal_dataset_roots"] == ()
-    assert app.collected_dataset_note_var.get() == "仅当前目录"
     assert "显示 0 条采集回放" in app.collected_replay_status_var.get()
 
 
@@ -540,3 +665,24 @@ def test_every_selectable_card_has_game_chinese_and_english_labels() -> None:
         assert card.display == f"{chinese} / {english}  [{card.card_id}]"
     assert interface.CARD_NAMES[26000013] == ("炸弹兵", "Bomber")
     assert interface.CARD_NAMES[26000045] == ("飞斧屠夫", "Executioner")
+
+
+def test_saved_decks_round_trip_keeps_card_order_and_forms(tmp_path: Path) -> None:
+    path = tmp_path / "custom_decks.json"
+    saved = interface.SavedDeck("我的皮卡牌组", interface.PEKKA_BRIDGE_SPAM_DECK, interface.PEKKA_BRIDGE_SPAM_FORMS)
+
+    assert interface.load_saved_decks(path) == {}
+    interface.write_saved_decks(path, {saved.name: saved})
+
+    assert interface.load_saved_decks(path) == {saved.name: saved}
+    assert "我的皮卡牌组" in path.read_text(encoding="utf-8")
+
+
+def test_saved_decks_reject_invalid_file_without_replacing_it(tmp_path: Path) -> None:
+    path = tmp_path / "custom_decks.json"
+    path.write_text('{"version": 1, "decks": [{"name": "坏牌组", "deck": [], "forms": []}]}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="卡牌或形态不正确"):
+        interface.load_saved_decks(path)
+
+    assert path.read_text(encoding="utf-8").startswith('{"version": 1')

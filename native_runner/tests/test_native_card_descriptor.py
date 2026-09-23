@@ -243,6 +243,42 @@ def test_absolute_hand_queue_rejects_a_late_native_injection(
         )
 
 
+def test_observation_anchored_hand_queue_falls_back_after_missed_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = NativeClashEnv()
+    observation = {
+        "tick": 130,
+        "players": [
+            {
+                "owner": 0,
+                "accountId": 123,
+                "hand": [
+                    {
+                        "handIndex": 0,
+                        "deckSlot": 0,
+                        "cardId": 26_000_001,
+                        "commandCardId": 26_000_001,
+                        "cardParameter": _packed(form_code=0, deck_slot=0, cost=3),
+                        "cost": 3,
+                    }
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(env, "observe", lambda: observation)
+    monkeypatch.setattr(env, "inject_command", lambda _command: {"ok": True, "tick": 130})
+
+    receipt = env.queue_hand_action_at(
+        HandAction(0, 0, 9_000, 10_000),
+        execute_tick=129,
+        clamp_late=True,
+    )
+
+    assert receipt["queuedAtTick"] == 130
+    assert receipt["executeTick"] == 150
+
+
 def test_resident_hand_queue_accepts_legacy_success_receipt_without_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -133,3 +134,65 @@ def test_offline_session_keeps_lstm_actions_and_ability_candidates(monkeypatch: 
     )
     assert model.actions.validations == 2
     assert tensorizer.ended == 1
+
+
+@pytest.mark.parametrize("can_deploy", [False, True])
+def test_forced_play_only_overrides_gate_when_a_deploy_is_legal(monkeypatch, can_deploy: bool) -> None:
+    @dataclass(frozen=True)
+    class Candidates:
+        mask: torch.Tensor
+        variant: torch.Tensor
+
+    @dataclass(frozen=True)
+    class Batch:
+        candidates: Candidates
+
+        def to_model_input(self, _device):
+            return self
+
+    batch = Batch(Candidates(
+        mask=torch.tensor([[True, True]]), variant=torch.tensor([[1, 0]]),
+    ))
+
+    class Actions:
+        def validate(self, _config, *, candidate_count):
+            assert candidate_count == 2
+
+    class Tensorizer(_FakeTensorizer):
+        def tensorize(self, _observation, *, validate):
+            return batch
+
+    class Model:
+        def initial_state(self, *_args, **_kwargs):
+            return "initial"
+
+        def forward(self, selected, *_args, **_kwargs):
+            assert selected.candidates.mask.tolist() == [[False, True]]
+            return "context"
+
+        def act_after_preselected_act(self, selected, context, *, validate):
+            assert context == "context"
+            return SimpleNamespace(actions=Actions(), next_state="forced")
+
+        def act(self, selected, *_args, **_kwargs):
+            assert selected is batch
+            return SimpleNamespace(actions=Actions(), next_state="normal")
+
+    class Legality:
+        def __init__(self, *_args):
+            pass
+
+        def candidate_mask(self):
+            return torch.tensor([[False, can_deploy]])
+
+    monkeypatch.setattr("native_runner.training.v4.policy_session.ShadowCandidateLegality", Legality)
+    monkeypatch.setattr(
+        "native_runner.training.v4.policy_session.decode_action_sequence_v4",
+        lambda *_args, **_kwargs: DecodedActionSequenceV4(owner=0),
+    )
+    session = PolicySessionV4(Model(), Tensorizer(), device="cpu")  # type: ignore[arg-type]
+    session.start_episode(_observation(), initial_elixir={0: 6.0, 1: 6.0})
+
+    session.decide(_observation(), force_act=True)
+
+    assert session.state == ("forced" if can_deploy else "normal")

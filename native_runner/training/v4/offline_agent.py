@@ -13,7 +13,6 @@ import torch
 from ...battle_env import BattleEnvV1
 from ...contracts import ActionKind, ActionV1
 from ...cr_native_env import (
-    COMMAND_CONSUMPTION_STEPS,
     DEFAULT_HOST,
     DEFAULT_PORT,
     LIVE_COMMAND_AGE_TICKS,
@@ -31,9 +30,10 @@ from .policy_session import build_policy_session_v4, load_policy_v4
 def _rendered_action(action: ActionV1) -> ActionV1:
     if action.kind != ActionKind.PLAY_CARD:
         return action
-    # Match manual play: command age is 20 ticks, followed by consumption.
-    # Keep the model's chosen within-turn offset in addition to that delay.
-    offset = action.execute_offset_ticks + COMMAND_CONSUMPTION_STEPS
+    # A zero-delay policy play targets decision tick + 21: next-tick input
+    # followed by the native 20-tick command interval. BattleEnv anchors
+    # this target to the decision observation, even if inference finishes later.
+    offset = action.execute_offset_ticks + LIVE_COMMAND_AGE_TICKS
     return replace(
         action,
         execute_offset_ticks=offset,

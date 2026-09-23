@@ -51,6 +51,22 @@ FORM_HERO = "精英（英雄）"
 FORM_TO_MASK = {FORM_BASE: 0, FORM_EVOLUTION: 1, FORM_HERO: 2}
 MASK_TO_FORM = {value: key for key, value in FORM_TO_MASK.items()}
 
+
+def validate_model_deck_roles(forms: Sequence[int]) -> None:
+    """Reject model form selections that exceed the loaded V4 input contract."""
+
+    if len(forms) != 8 or any(int(mask) not in MASK_TO_FORM for mask in forms):
+        raise ValueError("模型牌组的 8 个形态设置无效")
+    evolution_count = sum(int(mask) == 1 for mask in forms)
+    hero_count = sum(int(mask) == 2 for mask in forms)
+    if evolution_count > 2 or hero_count > 2 or evolution_count + hero_count > 3:
+        raise ValueError(
+            f"模型牌组当前有 {evolution_count} 张觉醒、{hero_count} 张英雄形态；"
+            "V4 模型最多支持 2 张觉醒、2 张英雄，且两类合计不超过 3 张。"
+            "请把多余的形态改为“基础”后再开始。"
+        )
+
+
 SPEED_XBOW_DECK = (27000008, 26000000, 26000001, 27000006, 26000010, 26000084, 28000000, 28000011)
 SPEED_XBOW_FORMS = (0, 2, 1, 1, 0, 0, 0, 0)
 PEKKA_BRIDGE_SPAM_DECK = (26000036, 26000050, 26000062, 26000004, 26000046, 26000042, 28000000, 28000008)
@@ -591,6 +607,59 @@ class MatchPreset:
     forms1: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class SavedDeck:
+    name: str
+    deck: tuple[int, ...]
+    forms: tuple[int, ...]
+
+
+def load_saved_decks(path: Path) -> dict[str, SavedDeck]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("decks"), list):
+            raise ValueError("文件格式不正确")
+        decks: dict[str, SavedDeck] = {}
+        for item in data["decks"]:
+            if not isinstance(item, dict):
+                raise ValueError("牌组条目不正确")
+            name, deck, forms = item.get("name"), item.get("deck"), item.get("forms")
+            if not isinstance(name, str) or not name.strip() or name != name.strip() or name in decks:
+                raise ValueError("牌组名称不正确或重复")
+            if (
+                not isinstance(deck, list) or len(deck) != 8
+                or any(type(card_id) is not int for card_id in deck) or len(set(deck)) != 8
+                or not isinstance(forms, list) or len(forms) != 8
+                or any(type(mask) is not int or mask not in MASK_TO_FORM for mask in forms)
+            ):
+                raise ValueError(f"牌组“{name}”的卡牌或形态不正确")
+            decks[name] = SavedDeck(name, tuple(deck), tuple(forms))
+        return decks
+    except (OSError, ValueError) as error:
+        raise ValueError(f"无法读取自定义牌组 {path}：{error}") from error
+
+
+def write_saved_decks(path: Path, decks: Mapping[str, SavedDeck]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix="custom-decks-", suffix=".tmp", delete=False
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(
+                {"version": 1, "decks": [asdict(decks[name]) for name in sorted(decks)]},
+                output, ensure_ascii=False, indent=2,
+            )
+            output.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 MATCH_PRESETS = (
     MatchPreset(
         "P.E.K.K.A Bridge Spam (Evo Ram/Ghost + Hero Magic Archer)",
@@ -679,7 +748,11 @@ def load_replay_entries(directory: Path) -> tuple[ReplayEntry, ...]:
 
 
 class DeckEditor:
-    def __init__(self, parent: Any, *, title: str, options: Sequence[CardOption]) -> None:
+    def __init__(
+        self, parent: Any, *, title: str, options: Sequence[CardOption],
+        on_save: Callable[[DeckEditor], None], on_load: Callable[[DeckEditor], None],
+        on_delete: Callable[[DeckEditor], None],
+    ) -> None:
         import tkinter as tk
         from tkinter import ttk
 
@@ -687,32 +760,74 @@ class DeckEditor:
         self.by_display = {item.display: item for item in self.options}
         self.by_id = {item.card_id: item for item in self.options}
         self.frame = ttk.LabelFrame(parent, text=title, padding=10)
+        saved = ttk.Frame(self.frame)
+        saved.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        ttk.Label(saved, text="自定义牌组").pack(side="left", padx=(0, 6))
+        self.saved_deck_var = tk.StringVar()
+        self.saved_deck_box = ttk.Combobox(saved, textvariable=self.saved_deck_var, state="readonly", width=17)
+        self.saved_deck_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        for label, command in (("载入", on_load), ("保存", on_save), ("删除", on_delete)):
+            ttk.Button(saved, text=label, command=lambda action=command: action(self)).pack(side="left", padx=(0, 4))
         for column, label in enumerate(("槽位", "卡牌", "形态")):
             ttk.Label(self.frame, text=label, style="Muted.TLabel").grid(
-                row=0, column=column, padx=(0, 8 if column < 2 else 0), sticky="w"
+                row=1, column=column, padx=(0, 8 if column < 2 else 0), sticky="w"
             )
         self.card_vars: list[Any] = []
+        self.card_boxes: list[Any] = []
+        self.selected_cards = [""] * 8
         self.form_vars: list[Any] = []
         self.form_boxes: list[Any] = []
         values = tuple(item.display for item in self.options)
         for slot in range(8):
-            ttk.Label(self.frame, text=str(slot + 1)).grid(row=slot + 1, column=0, padx=(0, 8), pady=3, sticky="e")
+            ttk.Label(self.frame, text=str(slot + 1)).grid(row=slot + 2, column=0, padx=(0, 8), pady=3, sticky="e")
             for column, choices, width, variables in (
                 (1, values, 31, self.card_vars),
                 (2, (FORM_BASE,), 14, self.form_vars),
             ):
                 variable = tk.StringVar(value=FORM_BASE if column == 2 else "")
-                box = ttk.Combobox(self.frame, textvariable=variable, values=choices, state="readonly", width=width)
-                box.grid(row=slot + 1, column=column, padx=(0, 8 if column == 1 else 0), pady=3, sticky="ew")
+                box = ttk.Combobox(
+                    self.frame, textvariable=variable, values=choices,
+                    state="normal" if column == 1 else "readonly", width=width,
+                )
+                box.grid(row=slot + 2, column=column, padx=(0, 8 if column == 1 else 0), pady=3, sticky="ew")
                 variables.append(variable)
                 if column == 1:
+                    self.card_boxes.append(box)
+                    variable.trace_add("write", lambda *_args, index=slot: self._filter_card(index))
+                    box.bind("<FocusIn>", lambda _event, widget=box: widget.selection_range(0, "end"))
+                    box.bind(
+                        "<FocusOut>",
+                        lambda _event, index=slot: self.frame.after_idle(lambda: self._restore_card(index)),
+                    )
                     box.bind("<<ComboboxSelected>>", lambda _event, index=slot: self._card_changed(index))
                 else:
                     self.form_boxes.append(box)
         self.frame.columnconfigure(1, weight=1)
 
+    def _filter_card(self, index: int) -> None:
+        query = self.card_vars[index].get().strip().casefold()
+        if self.card_vars[index].get() in self.by_display:
+            query = ""
+        values = tuple(
+            item.display
+            for item in self.options
+            if not query or any(query in name.casefold() for name in CARD_NAMES[item.card_id])
+        )
+        self.card_boxes[index].configure(values=values)
+
+    def _restore_card(self, index: int) -> None:
+        focus = str(self.frame.tk.call("focus"))
+        if focus.startswith(f"{self.card_boxes[index]}.popdown"):
+            return
+        if self.card_vars[index].get() in self.by_display:
+            self._card_changed(index)
+        else:
+            self.card_vars[index].set(self.selected_cards[index])
+
     def _card_changed(self, index: int) -> None:
         option = self.by_display.get(self.card_vars[index].get())
+        if option is not None:
+            self.selected_cards[index] = option.display
         forms = option.forms if option is not None else (FORM_BASE,)
         self.form_boxes[index].configure(values=forms)
         if self.form_vars[index].get() not in forms:
@@ -758,6 +873,15 @@ class CRHarnessInterface:
         self.root = root
         self.log_path = log_path
         self.card_options = load_card_options()
+        user_data = Path(os.environ["LOCALAPPDATA"]) / "FirstLight_CR" if os.environ.get("LOCALAPPDATA") else Path.home() / ".firstlight_cr"
+        self.saved_decks_path = user_data / "custom_decks.json"
+        self.saved_decks_error: ValueError | None = None
+        try:
+            self.saved_decks = load_saved_decks(self.saved_decks_path)
+        except ValueError as error:
+            self.saved_decks = {}
+            self.saved_decks_error = error
+        self.deck_editors: list[DeckEditor] = []
         self.busy = False
         self.owns_native_session = False
         self.native: Any | None = None
@@ -774,6 +898,7 @@ class CRHarnessInterface:
         self.vm3_resetting = False
         self.model_stop_requested = threading.Event()
         self.model_active = False
+        self.model_match_kind = "human"
         self.model_after_stop: Callable[[], None] | None = None
         self.model_process: subprocess.Popen[Any] | None = None
         self.model_log: Any | None = None
@@ -798,8 +923,6 @@ class CRHarnessInterface:
         style.configure(
             "HeaderTitle.TLabel", background="#14243a", foreground="#ffffff", font=("Microsoft YaHei UI", 18, "bold")
         )
-        style.configure("HeaderSub.TLabel", background="#14243a", foreground="#b8c7da")
-        style.configure("Status.TLabel", background="#14243a", foreground="#dbeafe")
         style.configure("Muted.TLabel", foreground="#5d6b7b")
         style.configure(
             "Primary.TButton",
@@ -812,24 +935,28 @@ class CRHarnessInterface:
         style.configure("Danger.TButton", foreground="#991b1b")
         style.configure("TNotebook.Tab", padding=(18, 8))
 
-        self._build_header(preflight)
+        self._build_header()
         notebook = ttk.Notebook(root)
         notebook.pack(fill=tk.BOTH, expand=True, padx=14, pady=(12, 8))
         self.model_tab = ttk.Frame(notebook, padding=12)
+        self.duel_tab = ttk.Frame(notebook, padding=12)
         self.match_tab = ttk.Frame(notebook, padding=12)
         self.replay_tab = ttk.Frame(notebook, padding=12)
         self.collected_replay_tab = ttk.Frame(notebook, padding=12)
-        notebook.add(self.model_tab, text="1  模型对局")
-        notebook.add(self.match_tab, text="2  手动 native 对局")
-        notebook.add(self.replay_tab, text="3  训练回放")
-        notebook.add(self.collected_replay_tab, text="4  采集回放")
+        notebook.add(self.model_tab, text="1  Human VS AI")
+        notebook.add(self.duel_tab, text="2  AI VS AI")
+        notebook.add(self.match_tab, text="3  手动 native 对局")
+        notebook.add(self.replay_tab, text="4  训练回放")
+        notebook.add(self.collected_replay_tab, text="5  采集回放")
         self._build_model_tab()
+        self._build_duel_tab()
         self._build_match_tab()
+        self._refresh_saved_deck_choices()
         self._build_replay_tab()
         self._build_collected_replay_tab()
         self._build_footer()
-        self._apply_preflight(preflight)
-        self._append_log("界面已就绪；离线 VM 只在实际操作时检测，不会停止训练。")
+        if self.saved_decks_error is not None:
+            self._show_error(self.saved_decks_error)
 
     def _row(self, parent: Any, title: str = "", **layout: Any) -> Any:
         from tkinter import ttk
@@ -893,8 +1020,7 @@ class CRHarnessInterface:
 
         ttk.Label(parent, text=text, style="Muted.TLabel", wraplength=wraplength, justify="left").pack(**layout)
 
-    def _build_header(self, preflight: PreflightReport) -> None:
-        import tkinter as tk
+    def _build_header(self) -> None:
         from tkinter import ttk
 
         header = ttk.Frame(self.root, style="Header.TFrame", padding=(18, 14))
@@ -902,16 +1028,6 @@ class CRHarnessInterface:
         title = ttk.Frame(header, style="Header.TFrame")
         title.pack(side="left", fill="y")
         ttk.Label(title, text="FirstLight CR 控制台", style="HeaderTitle.TLabel").pack(anchor="w")
-        ttk.Label(
-            title, style="HeaderSub.TLabel", text="离线模型对局 · 双边手动 native 对局 · 训练回放 · RoyaleAPI 采集回放"
-        ).pack(anchor="w", pady=(2, 0))
-        status = ttk.Frame(header, style="Header.TFrame")
-        status.pack(side="right", fill="y")
-        for name in ("vm_status", "resource_status", "training_status"):
-            variable = tk.StringVar()
-            setattr(self, name + "_var", variable)
-            ttk.Label(status, textvariable=variable, style="Status.TLabel").pack(anchor="e")
-        ttk.Button(status, text="刷新资源", command=self.refresh_preflight).pack(anchor="e", pady=(5, 0))
 
     def _build_model_tab(self) -> None:
         from tkinter import ttk
@@ -923,16 +1039,19 @@ class CRHarnessInterface:
         self._buttons(
             settings,
             (
-                (None, "刷新列表", self.refresh_model_checkpoints, ""),
                 (None, "选择文件…", self.choose_model_checkpoint, ""),
             ),
         )
         decks = ttk.Frame(self.model_tab)
         decks.pack(fill="both", expand=True, pady=(10, 8))
         preset = MATCH_PRESETS[0]
-        for owner, title in enumerate(("上方牌组", "下方牌组")):
-            editor = DeckEditor(decks, title=title, options=self.card_options)
+        for owner, title in enumerate(("模型卡组", "你的卡组")):
+            editor = DeckEditor(
+                decks, title=title, options=self.card_options,
+                on_save=self.save_custom_deck, on_load=self.load_custom_deck, on_delete=self.delete_custom_deck,
+            )
             editor.frame.pack(side="left", fill="both", expand=True, padx=(6 if owner else 0, 0 if owner else 6))
+            self.deck_editors.append(editor)
             editor.set_deck(
                 preset.deck0 if owner == 0 else preset.deck1, preset.forms0 if owner == 0 else preset.forms1
             )
@@ -949,57 +1068,91 @@ class CRHarnessInterface:
         self._status(
             self.model_tab, "model_status", "选择模型与双方牌组，然后开始离线对局。", fill="x", pady=(8, 0), align="w"
         )
-        self._note(
-            self.model_tab, "模型控制上方，你通过鼠标覆盖层控制下方。四个页面共用同一个离线 VM。", fill="x", pady=(5, 0)
-        )
         self.refresh_model_checkpoints()
 
-    def _build_match_tab(self) -> None:
-        import tkinter as tk
+    def _build_duel_tab(self) -> None:
         from tkinter import ttk
 
-        settings = self._row(self.match_tab, "对局设置")
-        fields = (
-            ("preset", "预设", MATCH_PRESETS[0].name, 0, 0, 1),
-            ("seed", "随机种子", "20260728", 0, 2, 1),
-            ("level", "统一等级", "11", 0, 4, 1),
-            ("owner0_name", "上方名称", "PEKKA-11-A", 1, 0, 1),
-            ("owner1_name", "下方名称", "PEKKA-11-B", 1, 2, 3),
+        checkpoints = self._row(self.duel_tab, "双方模型")
+        for owner, label in enumerate(("上方 AI Checkpoint", "下方 AI Checkpoint")):
+            row = self._row(checkpoints, pady=(0 if owner == 0 else 8, 0))
+            ttk.Label(row, text=label).pack(side="left")
+            box = self._input(row, f"duel_checkpoint{owner}", values=(), width=65)
+            box.pack(side="left", fill="x", expand=True, padx=8)
+            setattr(self, f"duel_checkpoint{owner}_box", box)
+            self._buttons(row, ((None, "选择文件…", lambda side=owner: self.choose_duel_checkpoint(side), ""),))
+        decks = ttk.Frame(self.duel_tab)
+        decks.pack(fill="both", expand=True, pady=(10, 8))
+        preset = MATCH_PRESETS[0]
+        for owner, title in enumerate(("上方 AI 卡组", "下方 AI 卡组")):
+            editor = DeckEditor(
+                decks, title=title, options=self.card_options,
+                on_save=self.save_custom_deck, on_load=self.load_custom_deck, on_delete=self.delete_custom_deck,
+            )
+            editor.frame.pack(side="left", fill="both", expand=True, padx=(6 if owner else 0, 0 if owner else 6))
+            self.deck_editors.append(editor)
+            editor.set_deck(
+                preset.deck0 if owner == 0 else preset.deck1, preset.forms0 if owner == 0 else preset.forms1
+            )
+            setattr(self, f"duel_deck{owner}_editor", editor)
+        actions = self._row(self.duel_tab)
+        self._buttons(actions, (
+            ("start_duel_button", "开始 AI 对局", self.start_ai_duel, "primary"),
+            ("stop_duel_button", "停止对局", self.stop_model_match, "stop"),
+            ("force_duel_0_button", "强制上方下牌", lambda: self.force_ai_play(0), "stop"),
+            ("force_duel_1_button", "强制下方下牌", lambda: self.force_ai_play(1), "stop"),
+            (None, "Reset 离线 VM 进程", self.reset_vm3, "right"),
+        ))
+        self._status(self.duel_tab, "duel_status", "选择双方模型和卡组，然后开始对局。", fill="x", pady=(8, 0), align="w")
+        self.refresh_duel_checkpoints()
+
+    def refresh_duel_checkpoints(self) -> None:
+        values = tuple(str(path) for path in discover_model_checkpoints())
+        for owner in (0, 1):
+            box = getattr(self, f"duel_checkpoint{owner}_box")
+            variable = getattr(self, f"duel_checkpoint{owner}_var")
+            box.configure(values=values)
+            if variable.get() not in values:
+                variable.set(values[0] if values else "")
+
+    def choose_duel_checkpoint(self, owner: int) -> None:
+        from tkinter import filedialog
+
+        selected = filedialog.askopenfilename(
+            parent=self.root, title=f"选择{'上方' if owner == 0 else '下方'} AI Checkpoint",
+            initialdir=str(REPOSITORY_ROOT / "checkpoints"),
+            filetypes=(("PyTorch checkpoint", "*.pt"), ("所有文件", "*.*")),
         )
-        for name, label, value, row, column, span in fields:
-            ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", pady=row * 8)
-            if name == "level":
-                self.level_var = tk.StringVar(value=value)
-                widget = ttk.Spinbox(settings, from_=1, to=16, textvariable=self.level_var, width=5)
-            else:
-                options = {"width": 12} if name == "seed" else {}
-                if name == "preset":
-                    options.update(
-                        values=tuple(item.name for item in MATCH_PRESETS), command=self._apply_selected_preset, width=43
-                    )
-                widget = self._input(settings, name, value=value, **options)
-            widget.grid(row=row, column=column + 1, columnspan=span, padx=(6, 18), pady=row * 8, sticky="ew")
-        settings.columnconfigure(1, weight=2)
-        settings.columnconfigure(3, weight=1)
+        if selected:
+            box = getattr(self, f"duel_checkpoint{owner}_box")
+            value = str(Path(selected).resolve())
+            box.configure(values=(value, *tuple(item for item in box.cget("values") if item != value)))
+            getattr(self, f"duel_checkpoint{owner}_var").set(value)
+
+    def _build_match_tab(self) -> None:
+        from tkinter import ttk
 
         decks = ttk.Frame(self.match_tab)
         decks.pack(fill="both", expand=True, pady=(12, 8))
         for owner, title in enumerate(("上方 · 红方（owner 0）", "下方 · 蓝方（owner 1）")):
-            editor = DeckEditor(decks, title=title, options=self.card_options)
+            editor = DeckEditor(
+                decks, title=title, options=self.card_options,
+                on_save=self.save_custom_deck, on_load=self.load_custom_deck, on_delete=self.delete_custom_deck,
+            )
             editor.frame.pack(side="left", fill="both", expand=True, padx=(6 if owner else 0, 0 if owner else 6))
+            self.deck_editors.append(editor)
             setattr(self, f"deck{owner}_editor", editor)
         actions = self._row(self.match_tab)
         self._buttons(
             actions,
             (
                 ("start_match_button", "启动 native 对局并打开鼠标覆盖层", self.start_match, "primary"),
-                (None, "复制上方到下方", self.copy_top_to_bottom, ""),
-                (None, "交换上下牌组", self.swap_decks, ""),
                 (None, "Reset VM3 进程", self.reset_vm3, ""),
             ),
         )
-        self._note(actions, "形态表示该卡槽可用的形态；觉醒仍按正常轮转，“精英”对应 Hero 形态。", side="right")
-        self._apply_selected_preset()
+        preset = MATCH_PRESETS[0]
+        self.deck0_editor.set_deck(preset.deck0, preset.forms0)
+        self.deck1_editor.set_deck(preset.deck1, preset.forms1)
 
     def _replay_table(self, tab: Any, columns: Mapping[str, tuple[str, int]], start: Callable[[], None]) -> Any:
         from tkinter import ttk
@@ -1056,7 +1209,6 @@ class CRHarnessInterface:
         self.replay_run_box = self._input(top, "replay_run", values=(), width=44, command=self.refresh_replays)
         self.replay_run_box.pack(side="left", padx=8)
         self._buttons(top, ((None, "刷新回放", self.refresh_replay_runs, ""),))
-        self._note(top, "当前旧回放只记录训练目录和完成序号，不等同于单一 checkpoint。", side="right")
         self.replay_tree = self._replay_table(
             self.replay_tab,
             {
@@ -1099,7 +1251,6 @@ class CRHarnessInterface:
             side="left", padx=8
         )
         self._buttons(filter_row, ((None, "刷新列表", self.refresh_collected_replays, ""),))
-        self._status(filter_row, "collected_dataset_note", side="right")
         self.collected_replay_tree = self._replay_table(
             self.collected_replay_tab,
             {
@@ -1111,22 +1262,12 @@ class CRHarnessInterface:
             self.start_collected_replay,
         )
         self._build_replay_controls(self.collected_replay_tab, collected=True)
-        self._note(
-            self.collected_replay_tab,
-            "玩家 Tag 会搜索对局双方；“采集源玩家”仅表示最先保存该 replay 的遍历对象；"
-            "播放时会固定在下方、上下翻转坐标并保持左右方向。"
-            "初始手牌按整场出牌序列推断并稳定随机；"
-            "SQLite stage、集中 Parquet 与完整个人 Parquet 都只读，不会影响采集器。",
-            anchor="w",
-            pady=(8, 0),
-        )
         self.refresh_collected_replays()
 
     def _build_footer(self) -> None:
         import tkinter as tk
 
         footer = self._row(self.root, padx=14, pady=(0, 10))
-        self._status(footer, "operation", "就绪", side="left")
         self._note(footer, f"日志：{self.log_path}", side="right")
         self.log_text = tk.Text(
             self.root,
@@ -1147,7 +1288,6 @@ class CRHarnessInterface:
         self.log_text.insert("end", f"[{timestamp}] {message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
-        self.operation_var.set(message)
 
     def _post(self, callback: Callable[..., Any], *args: Any) -> None:
         self.root.after(0, callback, *args)
@@ -1181,32 +1321,6 @@ class CRHarnessInterface:
 
     def _progress(self, message: str) -> None:
         self._post(self._append_log, message)
-
-    def _apply_preflight(self, report: PreflightReport) -> None:
-        vm_mark = "·" if report.vm.detail == "离线 VM 将在实际操作时检测" else "✓" if report.vm.ready else "!"
-        self.vm_status_var.set(f"{vm_mark} {report.vm.detail}")
-        gpu_text = (
-            f"GPU {report.gpu.utilization_percent:.0f}% · 显存 {report.gpu.memory_used_percent:.0f}%"
-            if report.gpu.available
-            and report.gpu.utilization_percent is not None
-            and report.gpu.memory_used_percent is not None
-            else "GPU 状态不可用"
-        )
-        self.resource_status_var.set(f"内存 {report.memory.used_percent:.0f}% · {gpu_text}")
-        self.training_status_var.set(
-            "训练运行中：" + ", ".join(str(item.pid) for item in report.training_processes)
-            if report.training_processes
-            else "未检测到训练"
-        )
-
-    def refresh_preflight(self) -> None:
-        if not self.busy:
-            self._append_log("正在刷新资源状态；不会探测 离线 VM…")
-            self._background(
-                "preflight",
-                lambda: collect_preflight_report(check_vm=False),
-                lambda report: (self._apply_preflight(report), self._append_log("状态刷新完成。")),
-            )
 
     def refresh_model_checkpoints(self) -> None:
         checkpoints = discover_model_checkpoints()
@@ -1242,7 +1356,86 @@ class CRHarnessInterface:
         self.model_active = active
         self._set_busy(active)
         self.model_checkpoint_box.configure(state="disabled" if active else "readonly")
-        self.stop_model_button.configure(state="normal" if active else "disabled")
+        for owner in (0, 1):
+            getattr(self, f"duel_checkpoint{owner}_box").configure(state="disabled" if active else "readonly")
+            getattr(self, f"force_duel_{owner}_button").configure(state="disabled")
+        self.stop_model_button.configure(state="normal" if active and self.model_match_kind == "human" else "disabled")
+        self.stop_duel_button.configure(state="normal" if active and self.model_match_kind == "duel" else "disabled")
+
+    def force_ai_play(self, owner: int) -> None:
+        if self.model_match_kind != "duel" or not self.model_active or self.model_artifact_dir is None:
+            return
+        if self.model_process is None or self.model_process.poll() is not None:
+            return
+        (self.model_artifact_dir / f"force-{owner}").touch()
+
+    def start_ai_duel(self) -> None:
+        from .match_factory import MatchConfig
+
+        if self.busy:
+            return
+        try:
+            checkpoints = tuple(
+                Path(getattr(self, f"duel_checkpoint{owner}_var").get()).resolve() for owner in (0, 1)
+            )
+            for checkpoint in checkpoints:
+                if not checkpoint.is_file():
+                    raise FileNotFoundError(checkpoint)
+            deck0, forms0 = self.duel_deck0_editor.values()
+            deck1, forms1 = self.duel_deck1_editor.values()
+            validate_model_deck_roles(forms0)
+            validate_model_deck_roles(forms1)
+            config = MatchConfig(
+                deck0=deck0, deck1=deck1,
+                deck0_form_availability=forms0, deck1_form_availability=forms1,
+                seed=20260728, level_cap=11, minimum_card_level=11, king_tower_level=11,
+                owner0_name="AI-0", owner1_name="AI-1",
+            )
+        except (ValueError, OSError) as error:
+            self._show_error(error)
+            return
+        if not self._confirm_replace_owned_session("AI 对局") or not self._check_operation_conflicts():
+            return
+        self.stop_replay()
+        self._terminate_overlay()
+        self.model_match_kind = "duel"
+        self._set_model_active(True)
+        self.model_stop_requested = threading.Event()
+        self.duel_status_var.set("正在准备离线 VM 和双方模型…")
+        artifact = REPOSITORY_ROOT / "runs" / "interface" / f"duel-{time.time_ns()}"
+        artifact.mkdir(parents=True, exist_ok=True)
+        (artifact / "match.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
+        self.model_artifact_dir = artifact
+
+        def run():
+            if not self.owns_native_session:
+                ensure_offline_runner(self._progress)
+            if self.model_stop_requested.is_set():
+                return None, 0
+            process, log = self._launch_python(
+                "native_runner.training.v4.offline_duel", artifact / "console.log",
+                checkpoint_0=checkpoints[0], checkpoint_1=checkpoints[1],
+                match_config=artifact / "match.json", host=CONTROL_HOST, port=CONTROL_PORT,
+                speed=1.0, artifact_dir=artifact,
+            )
+            self.model_process, self.model_log = process, log
+            announced = False
+            while process.poll() is None:
+                if self.model_stop_requested.is_set():
+                    (artifact / "stop").touch()
+                if not announced and (artifact / "ready.json").is_file():
+                    announced = True
+                    self._post(self._model_ready, process, 0)
+                time.sleep(0.1)
+            return process, process.returncode
+
+        def failed(error):
+            self._set_model_active(False)
+            self.duel_status_var.set(f"AI 对局失败：{error}")
+            self._show_error(error)
+            self._after_model_stopped()
+
+        self._background("offline-duel", run, lambda result: self._model_finished(*result), failed)
 
     def start_model_match(self) -> None:
         from .match_factory import MatchConfig
@@ -1257,6 +1450,7 @@ class CRHarnessInterface:
             level = 11
             deck0, forms0 = self.model_deck0_editor.values()
             deck1, forms1 = self.model_deck1_editor.values()
+            validate_model_deck_roles(forms0)
             config = MatchConfig(
                 deck0=deck0,
                 deck1=deck1,
@@ -1277,6 +1471,7 @@ class CRHarnessInterface:
             return
         self.stop_replay()
         self._terminate_overlay()
+        self.model_match_kind = "human"
         self._set_model_active(True)
         self.model_stop_requested = threading.Event()
         self.model_status_var.set("正在准备离线 VM 和模型…")
@@ -1299,6 +1494,7 @@ class CRHarnessInterface:
                 host=CONTROL_HOST,
                 port=CONTROL_PORT,
                 speed=speed,
+                deterministic=None,
                 artifact_dir=artifact,
             )
             self.model_process, self.model_log = process, log
@@ -1327,6 +1523,11 @@ class CRHarnessInterface:
         from .cr_native_env import NativeClashEnv
 
         self.native = NativeClashEnv(CONTROL_HOST, CONTROL_PORT, timeout=15.0)
+        if self.model_match_kind == "duel":
+            for side in (0, 1):
+                getattr(self, f"force_duel_{side}_button").configure(state="normal")
+            self.duel_status_var.set("双方 AI 正在对局。")
+            return
         self._launch_overlay(owner=1 - owner)
         self.model_status_var.set(f"模型控制{'上方' if owner == 0 else '下方'}；你控制另一方。")
 
@@ -1340,12 +1541,14 @@ class CRHarnessInterface:
         self._terminate_overlay()
         self._set_model_active(False)
         result_path = self.model_artifact_dir / "result.json"
+        status = self.duel_status_var if self.model_match_kind == "duel" else self.model_status_var
         if exit_code == 0 and result_path.is_file():
             result = json.loads(result_path.read_text(encoding="utf-8"))
             label = "对局结束" if result.get("terminated") else "对局已停止"
-            self.model_status_var.set(f"{label} · 模型决策 {result.get('decisions', 0)} 次")
+            decisions = result.get("decisions", 0)
+            status.set(f"{label} · 模型决策 {sum(decisions) if isinstance(decisions, list) else decisions} 次")
         else:
-            self.model_status_var.set(
+            status.set(
                 f"模型进程已退出（exit={exit_code}），日志：{self.model_artifact_dir / 'console.log'}"
             )
 
@@ -1360,7 +1563,9 @@ class CRHarnessInterface:
         self.model_stop_requested.set()
         if self.model_artifact_dir is not None:
             (self.model_artifact_dir / "stop").touch()
-        self.model_status_var.set("正在停止离线模型对局…")
+        (self.duel_status_var if self.model_match_kind == "duel" else self.model_status_var).set(
+            "正在停止离线模型对局…"
+        )
 
     def _wait_model_stopped(self) -> None:
         process = self.model_process
@@ -1376,54 +1581,106 @@ class CRHarnessInterface:
                 process.kill()
                 process.wait(timeout=2.0)
 
-    def _apply_selected_preset(self) -> None:
-        preset = next((item for item in MATCH_PRESETS if item.name == self.preset_var.get()), MATCH_PRESETS[0])
-        self.deck0_editor.set_deck(preset.deck0, preset.forms0)
-        self.deck1_editor.set_deck(preset.deck1, preset.forms1)
+    def _refresh_saved_deck_choices(self) -> None:
+        names = tuple(sorted(self.saved_decks, key=str.casefold))
+        for editor in self.deck_editors:
+            editor.saved_deck_box.configure(values=names)
+            if editor.saved_deck_var.get() not in self.saved_decks:
+                editor.saved_deck_var.set("")
 
-    def copy_top_to_bottom(self) -> None:
+    def _saved_decks_available(self) -> bool:
+        if self.saved_decks_error is not None:
+            self._show_error(self.saved_decks_error)
+            return False
+        return True
+
+    def save_custom_deck(self, editor: DeckEditor) -> None:
+        from tkinter import messagebox, simpledialog
+
+        if not self._saved_decks_available():
+            return
         try:
-            deck, forms = self.deck0_editor.values()
-            self.deck1_editor.set_deck(deck, forms)
+            deck, forms = editor.values()
         except ValueError as error:
             self._show_error(error)
-
-    def swap_decks(self) -> None:
+            return
+        name = simpledialog.askstring(
+            "保存自定义牌组", "给当前牌组起个名字：", initialvalue=editor.saved_deck_var.get(), parent=self.root
+        )
+        if name is None:
+            return
+        name = name.strip()
+        if not name or len(name) > 50 or any(ord(char) < 32 for char in name):
+            self._show_error(ValueError("牌组名称需要 1–50 个字符，且不能包含换行或控制字符"))
+            return
+        if name in self.saved_decks and not messagebox.askyesno(
+            "覆盖自定义牌组", f"“{name}”已存在，是否用当前牌组覆盖？", parent=self.root
+        ):
+            return
+        updated = {**self.saved_decks, name: SavedDeck(name, deck, forms)}
         try:
-            deck0, forms0 = self.deck0_editor.values()
-            deck1, forms1 = self.deck1_editor.values()
-            self.deck0_editor.set_deck(deck1, forms1)
-            self.deck1_editor.set_deck(deck0, forms0)
+            write_saved_decks(self.saved_decks_path, updated)
+        except OSError as error:
+            self._show_error(error)
+            return
+        self.saved_decks = updated
+        self._refresh_saved_deck_choices()
+        editor.saved_deck_var.set(name)
+        self._append_log(f"已保存自定义牌组：{name}")
+
+    def load_custom_deck(self, editor: DeckEditor) -> None:
+        if not self._saved_decks_available():
+            return
+        name = editor.saved_deck_var.get()
+        saved = self.saved_decks.get(name)
+        if saved is None:
+            self._show_error(ValueError("请先选择要载入的自定义牌组"))
+            return
+        try:
+            editor.set_deck(saved.deck, saved.forms)
         except ValueError as error:
             self._show_error(error)
+            return
+        self._append_log(f"已载入自定义牌组：{name}")
+
+    def delete_custom_deck(self, editor: DeckEditor) -> None:
+        from tkinter import messagebox
+
+        if not self._saved_decks_available():
+            return
+        name = editor.saved_deck_var.get()
+        if name not in self.saved_decks:
+            self._show_error(ValueError("请先选择要删除的自定义牌组"))
+            return
+        if not messagebox.askyesno("删除自定义牌组", f"确定删除“{name}”？", parent=self.root):
+            return
+        updated = {key: deck for key, deck in self.saved_decks.items() if key != name}
+        try:
+            write_saved_decks(self.saved_decks_path, updated)
+        except OSError as error:
+            self._show_error(error)
+            return
+        self.saved_decks = updated
+        self._refresh_saved_deck_choices()
+        self._append_log(f"已删除自定义牌组：{name}")
 
     def _match_config(self) -> Any:
         from .match_factory import MatchConfig
 
         deck0, forms0 = self.deck0_editor.values()
         deck1, forms1 = self.deck1_editor.values()
-        try:
-            seed = int(self.seed_var.get())
-            level = int(self.level_var.get())
-        except ValueError as error:
-            raise ValueError("Seed 和等级必须是整数") from error
-        if not 1 <= level <= 16:
-            raise ValueError("等级必须在 1..16")
-        owner0_name = self.owner0_name_var.get().strip()
-        owner1_name = self.owner1_name_var.get().strip()
-        if not owner0_name or not owner1_name:
-            raise ValueError("双方名称不能为空")
+        level = 11
         return MatchConfig(
             deck0=deck0,
             deck1=deck1,
             deck0_form_availability=forms0,
             deck1_form_availability=forms1,
-            seed=seed,
+            seed=20260728,
             level_cap=level,
             minimum_card_level=level,
             king_tower_level=level,
-            owner0_name=owner0_name,
-            owner1_name=owner1_name,
+            owner0_name="PEKKA-11-A",
+            owner1_name="PEKKA-11-B",
         )
 
     def _owned_pids(self) -> tuple[int, ...]:
@@ -1461,6 +1718,7 @@ class CRHarnessInterface:
         self.busy = busy
         state = "disabled" if busy else "normal"
         self.start_model_button.configure(state=state)
+        self.start_duel_button.configure(state=state)
         self.start_match_button.configure(state=state)
         self.start_replay_button.configure(state=state)
         self.start_collected_replay_button.configure(state=state)
@@ -1666,7 +1924,6 @@ class CRHarnessInterface:
         self.collected_replay_entries.clear()
         dataset_root = Path(self.collected_dataset_var.get()).expanduser().resolve()
         using_default = dataset_root == DEFAULT_DATASET_ROOT.resolve()
-        self.collected_dataset_note_var.set("默认目录 + 完整个人数据集" if using_default else "仅当前目录")
         try:
             entries = list_collected_replays(
                 dataset_root=dataset_root,

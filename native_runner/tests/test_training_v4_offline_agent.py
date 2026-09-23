@@ -55,8 +55,10 @@ def test_model_overlay_uses_manual_play_path_for_human_side(owner, hand_temporar
     card = {"handIndex": 0, "cardId": 26000000, "cost": 3}
     app = object.__new__(NativeOverlayApp)
     app.owner = owner
+    app.card_specs = {}
     app.env = SimpleNamespace(
         observe=lambda: {
+            "tick": 1000,
             "players": [
                 {
                     "owner": owner,
@@ -67,11 +69,12 @@ def test_model_overlay_uses_manual_play_path_for_human_side(owner, hand_temporar
                 }
             ]
         },
-        play_immediate=lambda action: queued.append(action),
+        queue_hand_action_at=lambda action, **kwargs: queued.append((action, kwargs)),
     )
     selection = Selection(owner, 0, 0, card["cardId"], 3, "Knight")
     assert app._run_play(selection, 3000, 6000).outcome == "accepted"
-    assert queued[0].owner == owner
+    assert queued[0][0].owner == owner
+    assert queued[0][1] == {"execute_tick": 1021, "clamp_late": True}
     with pytest.raises(RunnerError):
         app._run_play(Selection(1 - owner, 0, 0, card["cardId"], 3, "Knight"), 3000, 6000)
     app.request_pause_toggle()
@@ -92,10 +95,13 @@ def test_model_cards_preserve_native_command_age_and_policy_delay():
         execute_offset_ticks=4,
     )
     rendered = offline_agent._rendered_action(action)
-    assert rendered.execute_offset_ticks == 25
+    assert rendered.execute_offset_ticks == 24
     assert rendered.metadata["native_command_age_ticks"] == 20
     assert rendered.card_id == action.card_id
     assert rendered.target_grid == action.target_grid
+    assert offline_agent._rendered_action(
+        ActionV1.play(0, 0, (3, 6), execute_offset_ticks=1)
+    ).execute_offset_ticks == 21
     wait = ActionV1.wait(0, ticks=5)
     assert offline_agent._rendered_action(wait) is wait
 

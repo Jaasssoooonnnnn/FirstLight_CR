@@ -14,7 +14,7 @@ import torch
 from ...battle_env import BattleEnvV1
 from ...contracts import ObservationV1
 from .checkpoint import load_actor_critic_checkpoint
-from .decoding import decode_action_sequence_v4
+from .decoding import ShadowCandidateLegality, decode_action_sequence_v4
 from .expert import POLICY_DECISION_TICKS
 from .factory import build_episode_tensorizer_v4, build_production_model_v4
 from .model import UniversalCardPolicyV4
@@ -22,6 +22,7 @@ from .native_actions import DecodedActionSequenceV4
 from .tensorizer import UniversalObservationTensorizerV4
 from .tensors import (
     ActiveEffectSetV4,
+    CANDIDATE_DEPLOY,
     PolicyOutputV4,
     RelationEdgesV4,
     RecurrentPolicyStateV4,
@@ -271,20 +272,31 @@ class PolicySessionV4:
         self._first_decision = True
 
     @torch.inference_mode()
-    def decide(self, observation: ObservationV1) -> PolicyDecisionV4:
+    def decide(self, observation: ObservationV1, *, force_act: bool = False) -> PolicyDecisionV4:
         if not self._episode_started or self.state is None:
             raise RuntimeError("start_episode must run before offline V4 inference")
         if observation.owner != self.actor_owner:
             raise ValueError("offline observation owner changed during the battle")
 
         host_batch = self.tensorizer.tensorize(observation, validate=self.validate_tensors)
+        if force_act:
+            deploy = host_batch.candidates.variant == CANDIDATE_DEPLOY
+            legal = ShadowCandidateLegality(host_batch.candidates, self.tensorizer.config).candidate_mask()
+            force_act = bool((legal & deploy).any().item())
+            if force_act:
+                host_batch = replace(host_batch, candidates=replace(
+                    host_batch.candidates, mask=host_batch.candidates.mask & deploy
+                ))
         episode_start = torch.tensor([self._first_decision], dtype=torch.bool, device=self.device)
         started_ns = time.perf_counter_ns()
-        if self._cuda_graph is not None:
+        if self._cuda_graph is not None and not force_act:
             output = self._cuda_graph.run(self.model, host_batch, self.state, episode_start)
         else:
             model_batch = host_batch.to_model_input(self.device)
-            if self.sample:
+            if force_act:
+                context = self.model.forward(model_batch, self.state, episode_start=episode_start, validate=self.validate_tensors)
+                output = self.model.act_after_preselected_act(model_batch, context, validate=self.validate_tensors)
+            elif self.sample:
                 output = self.model.sample_for_ppo_rollout(
                     model_batch, self.state, episode_start=episode_start, validate=self.validate_tensors
                 )

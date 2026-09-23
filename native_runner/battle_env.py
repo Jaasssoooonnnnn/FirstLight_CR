@@ -2471,7 +2471,29 @@ class BattleEnvV1:
                         or int(runtime_identity_fields["max_charges"]) != expected_max_charges
                     ):
                         raise BattleEnvError("legal ability source drifted from its static cooldown/charge contract")
-                    queued = self.native.queue_ability_action_at(ability_action, execute_in_ticks=execute_in)
+                    try:
+                        queued = self.native.queue_ability_action_at(ability_action, execute_in_ticks=execute_in)
+                    except RunnerError as error:
+                        if str(error) != "could not resolve one ready native champion ability source":
+                            raise
+                        # A live renderer can advance after the policy observation:
+                        # a previously ready source may be gone at command time.
+                        self._emit_event(
+                            tick=self._canonical_tick(before_native_tick),
+                            event_type="action_rejected",
+                            owner=action.owner,
+                            entity_id=action.source_entity,
+                            data={
+                                "action_id": action.action_id,
+                                "kind": ActionKind.ACTIVATE_ABILITY.value,
+                                "ability_id": state.ability_id,
+                                "reason": "native_ability_source_no_longer_ready",
+                                "compound_index": compound_index,
+                                "compound_size": len(normalized[owner]),
+                                "private_to": action.owner,
+                            },
+                        )
+                        continue
                     expected = int(queued["executeTick"])
                     cast_ticks = int(math.ceil(float(ability_spec.cast_time_ms or 0) / TICK_MS))
                     attestation_grace_ticks = max(
@@ -2527,7 +2549,17 @@ class BattleEnvV1:
                 x, y = self._world_target(action)
                 execute_in = max(1, action.execute_offset_ticks or 1)
                 hand_action = HandAction(action.owner, action.hand_slot, x, y)
-                queued = self.native.queue_hand_action_at(hand_action, execute_in_ticks=execute_in)
+                if action.metadata.get("native_command_age_ticks") is not None:
+                    # The renderer continues during inference.  Policy offsets
+                    # describe time since the decision observation, so do not
+                    # restart the clock when the native queue is reached.
+                    queued = self.native.queue_hand_action_at(
+                        hand_action,
+                        execute_tick=before_native_tick + execute_in,
+                        clamp_late=True,
+                    )
+                else:
+                    queued = self.native.queue_hand_action_at(hand_action, execute_in_ticks=execute_in)
                 if bool(queued.get("terminalCanceled")):
                     self._emit_event(
                         tick=self._canonical_tick(int(queued["executeTick"])),

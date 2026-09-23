@@ -200,6 +200,7 @@ class FakeNativeEnv:
         *,
         execute_tick: int | None = None,
         execute_in_ticks: int | None = None,
+        clamp_late: bool = False,
     ) -> dict[str, Any]:
         if (execute_tick is None) == (execute_in_ticks is None):
             raise ValueError("pass exactly one execution time")
@@ -738,6 +739,28 @@ class BattleEnvironmentTests(unittest.TestCase):
         self.assertEqual(
             executed[0].data["expected_execution_tick"], FIRST_PLAYABLE_TICK + 3
         )
+
+    def test_rendered_model_play_uses_decision_tick_when_native_has_advanced(self) -> None:
+        env, native = _make_env()
+        _reset(env)
+        decision_tick = int(env.raw_observation["tick"])
+        native.state["tick"] = decision_tick + 4
+        play = ActionV1.play(
+            owner=0,
+            hand_slot=0,
+            grid=(8, 10),
+            execute_offset_ticks=21,
+            next_decision_ticks=5,
+            metadata={"native_command_age_ticks": 20},
+        )
+
+        observations, _, _, _, _ = env.step(
+            {0: play, 1: ActionV1.wait(1, ticks=5)}
+        )
+
+        self.assertEqual(len(native.queued), 1)
+        self.assertEqual(native.queued[0]["execute_tick"], decision_tick + 21)
+        self.assertEqual(observations[0].pending_actions[0].expected_execution_tick, decision_tick + 21)
 
     def test_five_tick_offset_executes_before_next_policy_observation(self) -> None:
         env, native = _make_env()

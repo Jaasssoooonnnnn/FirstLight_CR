@@ -2654,6 +2654,47 @@ def test_battle_env_waits_for_delayed_ability_apply_edge(catalog) -> None:
     assert infos[0]["pending_count"] == 0
 
 
+def test_native_ability_source_disappearing_does_not_end_match(catalog, monkeypatch) -> None:
+    before, before_rich, _after, _after_rich = _ability_transition_fixture()
+    after = deepcopy(before)
+    after["tick"] = int(before["tick"]) + 1
+    after_rich = deepcopy(before_rich)
+    after_rich["tick"] = after["tick"]
+    after_rich["combatEvents"]["observationTick"] = after["tick"]  # type: ignore[index]
+    native = _AbilityTransitionNativeStub(before, before_rich, after, after_rich)
+
+    def reject_stale_source(_action: AbilityAction, *, execute_in_ticks: int = 1) -> None:
+        raise RunnerError("could not resolve one ready native champion ability source")
+
+    monkeypatch.setattr(native, "queue_ability_action_at", reject_stale_source)
+    env = _environment(native, catalog)
+    observations, _ = _reset(env, match_config=_match_from_raw(before))
+    source = observations[0].action_mask.ability_sources[0]
+    action = ActionV1(
+        owner=0,
+        kind=ActionKind.ACTIVATE_ABILITY,
+        source_entity=source,
+        ability_id="ArcherQueenRapid",
+        target_kind=TargetKind.NONE,
+        next_decision_ticks=1,
+    )
+
+    next_observations, _rewards, terms, truncs, _infos = env.step(
+        {0: action, 1: ActionV1.wait(1, ticks=1)}
+    )
+
+    assert next_observations[0].tick == after["tick"]
+    assert not terms["__all__"] and not truncs["__all__"]
+    assert env.awaiting_ability_action_ids == ()
+    assert any(
+        event.event_type == "action_rejected"
+        and event.entity_id == source
+        and event.data.get("reason") == "native_ability_source_no_longer_ready"
+        for event in next_observations[0].events
+    )
+    assert all(event.event_type != "ability_command_queued" for event in next_observations[0].events)
+
+
 def test_battle_env_marks_ability_unattested_only_at_deadline(catalog) -> None:
     before, before_rich, _after, _after_rich = _ability_transition_fixture()
     waiting = deepcopy(before)
