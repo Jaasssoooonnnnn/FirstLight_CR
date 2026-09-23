@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .paths import REPOSITORY_ROOT, WORKSPACE_ROOT
 from .card_names import CARD_NAMES
+from .contracts import COMPETITIVE_TOWER_TROOP_IDS
 from .local_config import setting
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -50,6 +51,14 @@ FORM_EVOLUTION = "觉醒"
 FORM_HERO = "精英（英雄）"
 FORM_TO_MASK = {FORM_BASE: 0, FORM_EVOLUTION: 1, FORM_HERO: 2}
 MASK_TO_FORM = {value: key for key, value in FORM_TO_MASK.items()}
+TOWER_TROOP_OPTIONS = (
+    ("公主塔 / Tower Princess", 159_000_000),
+    ("加农炮手 / Cannoneer", 159_000_001),
+    ("飞刀女爵 / Dagger Duchess", 159_000_002),
+    ("皇家大厨 / Royal Chef", 159_000_004),
+)
+TOWER_TROOP_BY_NAME = dict(TOWER_TROOP_OPTIONS)
+TOWER_TROOP_BY_ID = {card_id: name for name, card_id in TOWER_TROOP_OPTIONS}
 
 
 def validate_model_deck_roles(forms: Sequence[int]) -> None:
@@ -612,6 +621,7 @@ class SavedDeck:
     name: str
     deck: tuple[int, ...]
     forms: tuple[int, ...]
+    tower_troop_id: int = 159_000_000
 
 
 def load_saved_decks(path: Path) -> dict[str, SavedDeck]:
@@ -635,7 +645,10 @@ def load_saved_decks(path: Path) -> dict[str, SavedDeck]:
                 or any(type(mask) is not int or mask not in MASK_TO_FORM for mask in forms)
             ):
                 raise ValueError(f"牌组“{name}”的卡牌或形态不正确")
-            decks[name] = SavedDeck(name, tuple(deck), tuple(forms))
+            tower_troop_id = item.get("tower_troop_id", 159_000_000)
+            if type(tower_troop_id) is not int or tower_troop_id not in COMPETITIVE_TOWER_TROOP_IDS:
+                raise ValueError(f"牌组“{name}”的塔楼兵种不正确")
+            decks[name] = SavedDeck(name, tuple(deck), tuple(forms), tower_troop_id)
         return decks
     except (OSError, ValueError) as error:
         raise ValueError(f"无法读取自定义牌组 {path}：{error}") from error
@@ -768,9 +781,18 @@ class DeckEditor:
         self.saved_deck_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
         for label, command in (("载入", on_load), ("保存", on_save), ("删除", on_delete)):
             ttk.Button(saved, text=label, command=lambda action=command: action(self)).pack(side="left", padx=(0, 4))
+        tower = ttk.Frame(self.frame)
+        tower.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        ttk.Label(tower, text="塔楼兵种").pack(side="left", padx=(0, 8))
+        self.tower_troop_var = tk.StringVar(value=TOWER_TROOP_OPTIONS[0][0])
+        ttk.Combobox(
+            tower, textvariable=self.tower_troop_var,
+            values=tuple(name for name, _card_id in TOWER_TROOP_OPTIONS),
+            state="readonly", width=27,
+        ).pack(side="left", fill="x", expand=True)
         for column, label in enumerate(("槽位", "卡牌", "形态")):
             ttk.Label(self.frame, text=label, style="Muted.TLabel").grid(
-                row=1, column=column, padx=(0, 8 if column < 2 else 0), sticky="w"
+                row=2, column=column, padx=(0, 8 if column < 2 else 0), sticky="w"
             )
         self.card_vars: list[Any] = []
         self.card_boxes: list[Any] = []
@@ -779,7 +801,7 @@ class DeckEditor:
         self.form_boxes: list[Any] = []
         values = tuple(item.display for item in self.options)
         for slot in range(8):
-            ttk.Label(self.frame, text=str(slot + 1)).grid(row=slot + 2, column=0, padx=(0, 8), pady=3, sticky="e")
+            ttk.Label(self.frame, text=str(slot + 1)).grid(row=slot + 3, column=0, padx=(0, 8), pady=3, sticky="e")
             for column, choices, width, variables in (
                 (1, values, 31, self.card_vars),
                 (2, (FORM_BASE,), 14, self.form_vars),
@@ -789,7 +811,7 @@ class DeckEditor:
                     self.frame, textvariable=variable, values=choices,
                     state="normal" if column == 1 else "readonly", width=width,
                 )
-                box.grid(row=slot + 2, column=column, padx=(0, 8 if column == 1 else 0), pady=3, sticky="ew")
+                box.grid(row=slot + 3, column=column, padx=(0, 8 if column == 1 else 0), pady=3, sticky="ew")
                 variables.append(variable)
                 if column == 1:
                     self.card_boxes.append(box)
@@ -833,9 +855,11 @@ class DeckEditor:
         if self.form_vars[index].get() not in forms:
             self.form_vars[index].set(FORM_BASE)
 
-    def set_deck(self, deck: Sequence[int], forms: Sequence[int]) -> None:
+    def set_deck(self, deck: Sequence[int], forms: Sequence[int], tower_troop_id: int | None = None) -> None:
         if len(deck) != 8 or len(forms) != 8:
             raise ValueError("牌组和形态必须各有八项")
+        if tower_troop_id is not None and tower_troop_id not in TOWER_TROOP_BY_ID:
+            raise ValueError(f"不支持塔楼兵种 {tower_troop_id}")
         for index, (card_id, mask) in enumerate(zip(deck, forms)):
             option = self.by_id.get(int(card_id))
             if option is None:
@@ -846,6 +870,14 @@ class DeckEditor:
             if form is None or form not in option.forms:
                 raise ValueError(f"{option.name} 不支持形态掩码 {mask}")
             self.form_vars[index].set(form)
+        if tower_troop_id is not None:
+            self.tower_troop_var.set(TOWER_TROOP_BY_ID[tower_troop_id])
+
+    def tower_troop_id(self) -> int:
+        try:
+            return TOWER_TROOP_BY_NAME[self.tower_troop_var.get()]
+        except KeyError as error:
+            raise ValueError("请选择塔楼兵种") from error
 
     def values(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         options: list[CardOption] = []
@@ -1388,6 +1420,8 @@ class CRHarnessInterface:
             config = MatchConfig(
                 deck0=deck0, deck1=deck1,
                 deck0_form_availability=forms0, deck1_form_availability=forms1,
+                tower_troop0_id=self.duel_deck0_editor.tower_troop_id(),
+                tower_troop1_id=self.duel_deck1_editor.tower_troop_id(),
                 seed=20260728, level_cap=11, minimum_card_level=11, king_tower_level=11,
                 owner0_name="AI-0", owner1_name="AI-1",
             )
@@ -1456,6 +1490,8 @@ class CRHarnessInterface:
                 deck1=deck1,
                 deck0_form_availability=forms0,
                 deck1_form_availability=forms1,
+                tower_troop0_id=self.model_deck0_editor.tower_troop_id(),
+                tower_troop1_id=self.model_deck1_editor.tower_troop_id(),
                 seed=20260728,
                 level_cap=level,
                 minimum_card_level=level,
@@ -1601,6 +1637,7 @@ class CRHarnessInterface:
             return
         try:
             deck, forms = editor.values()
+            tower_troop_id = editor.tower_troop_id()
         except ValueError as error:
             self._show_error(error)
             return
@@ -1617,7 +1654,7 @@ class CRHarnessInterface:
             "覆盖自定义牌组", f"“{name}”已存在，是否用当前牌组覆盖？", parent=self.root
         ):
             return
-        updated = {**self.saved_decks, name: SavedDeck(name, deck, forms)}
+        updated = {**self.saved_decks, name: SavedDeck(name, deck, forms, tower_troop_id)}
         try:
             write_saved_decks(self.saved_decks_path, updated)
         except OSError as error:
@@ -1637,7 +1674,7 @@ class CRHarnessInterface:
             self._show_error(ValueError("请先选择要载入的自定义牌组"))
             return
         try:
-            editor.set_deck(saved.deck, saved.forms)
+            editor.set_deck(saved.deck, saved.forms, saved.tower_troop_id)
         except ValueError as error:
             self._show_error(error)
             return
@@ -1675,6 +1712,8 @@ class CRHarnessInterface:
             deck1=deck1,
             deck0_form_availability=forms0,
             deck1_form_availability=forms1,
+            tower_troop0_id=self.deck0_editor.tower_troop_id(),
+            tower_troop1_id=self.deck1_editor.tower_troop_id(),
             seed=20260728,
             level_cap=level,
             minimum_card_level=level,

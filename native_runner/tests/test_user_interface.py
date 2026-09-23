@@ -42,11 +42,11 @@ class _EmptyTree:
         return None
 
 
-def test_manual_match_uses_previous_defaults_without_settings_controls() -> None:
+def test_manual_match_passes_selected_tower_troops_to_native_replay() -> None:
     app = object.__new__(interface.CRHarnessInterface)
     preset = interface.MATCH_PRESETS[0]
-    app.deck0_editor = SimpleNamespace(values=lambda: (preset.deck0, preset.forms0))
-    app.deck1_editor = SimpleNamespace(values=lambda: (preset.deck1, preset.forms1))
+    app.deck0_editor = SimpleNamespace(values=lambda: (preset.deck0, preset.forms0), tower_troop_id=lambda: 159_000_001)
+    app.deck1_editor = SimpleNamespace(values=lambda: (preset.deck1, preset.forms1), tower_troop_id=lambda: 159_000_002)
 
     config = app._match_config()
 
@@ -55,6 +55,10 @@ def test_manual_match_uses_previous_defaults_without_settings_controls() -> None
     assert config.seed == 20260728
     assert (config.level_cap, config.minimum_card_level, config.king_tower_level) == (11, 11, 11)
     assert (config.owner0_name, config.owner1_name) == ("PEKKA-11-A", "PEKKA-11-B")
+    assert (config.tower_troop0_id, config.tower_troop1_id) == (159_000_001, 159_000_002)
+    replay = config.to_replay_dict()
+    assert replay["battle"]["deck0"]["sc"][0]["d"] == 159_000_001
+    assert replay["battle"]["deck1"]["sc"][0]["d"] == 159_000_002
 
 
 def test_model_deck_role_check_blocks_three_evolutions_before_start(tmp_path: Path) -> None:
@@ -93,8 +97,8 @@ def test_model_match_launches_deterministic_argmax(monkeypatch, tmp_path: Path) 
     app.model_status_var = _FakeVar()
     app.model_deck0_editor = SimpleNamespace(values=lambda: (
         interface.PEKKA_BRIDGE_SPAM_DECK, interface.PEKKA_BRIDGE_SPAM_FORMS,
-    ))
-    app.model_deck1_editor = app.model_deck0_editor
+    ), tower_troop_id=lambda: 159_000_004)
+    app.model_deck1_editor = SimpleNamespace(values=app.model_deck0_editor.values, tower_troop_id=lambda: 159_000_001)
     app._confirm_replace_owned_session = lambda _kind: True
     app._check_operation_conflicts = lambda: True
     app.stop_replay = lambda: None
@@ -114,6 +118,8 @@ def test_model_match_launches_deterministic_argmax(monkeypatch, tmp_path: Path) 
     assert captured["module"] == "native_runner.training.v4.offline_agent"
     assert "deterministic" in captured and captured["deterministic"] is None
     assert app.model_status_var.get() == "正在准备离线 VM 和模型…"
+    config = json.loads((app.model_artifact_dir / "match.json").read_text(encoding="utf-8"))
+    assert (config["tower_troop0_id"], config["tower_troop1_id"]) == (159_000_004, 159_000_001)
 
 
 def test_ai_duel_launches_both_checkpoints_and_decks(monkeypatch, tmp_path: Path) -> None:
@@ -128,8 +134,8 @@ def test_ai_duel_launches_both_checkpoints_and_decks(monkeypatch, tmp_path: Path
     app.duel_checkpoint1_var = _FakeVar(str(checkpoints[1]))
     app.duel_deck0_editor = SimpleNamespace(values=lambda: (
         interface.PEKKA_BRIDGE_SPAM_DECK, interface.PEKKA_BRIDGE_SPAM_FORMS,
-    ))
-    app.duel_deck1_editor = app.duel_deck0_editor
+    ), tower_troop_id=lambda: 159_000_002)
+    app.duel_deck1_editor = SimpleNamespace(values=app.duel_deck0_editor.values, tower_troop_id=lambda: 159_000_004)
     app.duel_status_var = _FakeVar()
     app._confirm_replace_owned_session = lambda _kind: True
     app._check_operation_conflicts = lambda: True
@@ -152,6 +158,7 @@ def test_ai_duel_launches_both_checkpoints_and_decks(monkeypatch, tmp_path: Path
     config = json.loads((app.model_artifact_dir / "match.json").read_text(encoding="utf-8"))
     assert config["deck0"] == list(interface.PEKKA_BRIDGE_SPAM_DECK)
     assert config["deck1"] == list(interface.PEKKA_BRIDGE_SPAM_DECK)
+    assert (config["tower_troop0_id"], config["tower_troop1_id"]) == (159_000_002, 159_000_004)
     assert app.model_match_kind == "duel"
 
 
@@ -669,13 +676,23 @@ def test_every_selectable_card_has_game_chinese_and_english_labels() -> None:
 
 def test_saved_decks_round_trip_keeps_card_order_and_forms(tmp_path: Path) -> None:
     path = tmp_path / "custom_decks.json"
-    saved = interface.SavedDeck("我的皮卡牌组", interface.PEKKA_BRIDGE_SPAM_DECK, interface.PEKKA_BRIDGE_SPAM_FORMS)
+    saved = interface.SavedDeck("我的皮卡牌组", interface.PEKKA_BRIDGE_SPAM_DECK, interface.PEKKA_BRIDGE_SPAM_FORMS, 159_000_004)
 
     assert interface.load_saved_decks(path) == {}
     interface.write_saved_decks(path, {saved.name: saved})
 
     assert interface.load_saved_decks(path) == {saved.name: saved}
     assert "我的皮卡牌组" in path.read_text(encoding="utf-8")
+
+
+def test_saved_decks_without_tower_troop_still_use_princess_tower(tmp_path: Path) -> None:
+    path = tmp_path / "custom_decks.json"
+    path.write_text(json.dumps({"version": 1, "decks": [{
+        "name": "old deck", "deck": list(interface.PEKKA_BRIDGE_SPAM_DECK),
+        "forms": list(interface.PEKKA_BRIDGE_SPAM_FORMS),
+    }]}), encoding="utf-8")
+
+    assert interface.load_saved_decks(path)["old deck"].tower_troop_id == 159_000_000
 
 
 def test_saved_decks_reject_invalid_file_without_replacing_it(tmp_path: Path) -> None:
