@@ -88,6 +88,39 @@ def check_apk(apk):
             raise ValueError("APK must not bundle downloaded resources")
 
 
+def check_prepared_device(device):
+    """Check the stock installation and its downloaded content before replacement."""
+    info = device.shell(f"dumpsys package {APP}")
+    if not re.search(r"\bversionName=" + re.escape(supported_engine()["apk_version"]) + r"(?:\s|$)", info):
+        raise ValueError("Install and update the supported original APK yourself first")
+    users = re.findall(r"User (\d+):[^\n]*installed=true", info)
+    if users != ["0"]:
+        raise ValueError("Use a dedicated VM with this game installed only for Android user 0")
+    paths = device.shell(f"pm path {APP}").splitlines()
+    if len(paths) != 1 or not paths[0].startswith("package:/data/app/"):
+        raise ValueError("Expected the supported single-APK installation")
+    hashes = resource_hashes(device)
+    validate_resources(hashes)
+    return paths[0].removeprefix("package:"), hashes
+
+
+def check_original_game(device, apk):
+    """Verify the original APK and updated VM before building the probe APK."""
+    release = supported_engine()
+    if sha256(apk) != release["apk_sha256"]:
+        raise ValueError("Input APK SHA-256 differs from supported_engine.json")
+    installed_path, hashes = check_prepared_device(device)
+    installed_sha256 = device.shell(f"sha256sum {shlex.quote(installed_path)}").split()[0]
+    if installed_sha256 != release["apk_sha256"]:
+        raise ValueError("Installed game APK differs from the supported original APK")
+    return {
+        "original_apk_verified": True,
+        "apk_version": release["apk_version"],
+        "runtime_content_version": release["runtime_content_version"],
+        "resource_files_verified": len(hashes),
+    }
+
+
 def restore_data(device, backup, locations):
     uid = device.shell(f"stat -c %u {DATA}")
     if not uid.isdecimal() or int(uid) < 10000:
@@ -122,18 +155,8 @@ def restore(device, backup):
 
 def install(device, apk, receipt_path):
     check_apk(apk)
-    info = device.shell(f"dumpsys package {APP}")
-    if not re.search(r"\bversionName=" + re.escape(supported_engine()["apk_version"]) + r"(?:\s|$)", info):
-        raise ValueError("Install and update the supported original APK yourself first")
-    users = re.findall(r"User (\d+):[^\n]*installed=true", info)
-    if users != ["0"]:
-        raise ValueError("Use a dedicated VM with this game installed only for Android user 0")
-    paths = device.shell(f"pm path {APP}").splitlines()
-    if len(paths) != 1 or not paths[0].startswith("package:/data/app/"):
-        raise ValueError("Expected the supported single-APK installation")
-    old_apk = shlex.quote(paths[0].removeprefix("package:"))
-    before = resource_hashes(device)
-    validate_resources(before)
+    old_path, before = check_prepared_device(device)
+    old_apk = shlex.quote(old_path)
     device.shell(f"am force-stop {APP}")
     backup = BACKUP_PREFIX + uuid.uuid4().hex
     print(f"Preserving existing app data on the device: {backup}", file=sys.stderr, flush=True)
@@ -190,12 +213,15 @@ def main(argv=None):
     parser.add_argument("--serial", required=True)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--apk", type=Path)
+    group.add_argument("--check-original", type=Path)
     group.add_argument("--restore")
     parser.add_argument("--receipt", type=Path)
     args = parser.parse_args(argv)
     device = Device(args.adb, args.serial)
     device.require_offline()
-    if args.restore:
+    if args.check_original:
+        result = check_original_game(device, args.check_original)
+    elif args.restore:
         result = restore(device, args.restore)
         if args.receipt:
             state = json.loads(args.receipt.read_text(encoding="utf-8"))

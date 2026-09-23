@@ -113,3 +113,32 @@ def test_incomplete_original_update_stops_before_device_changes(setup_install, m
 def test_restore_rejects_arbitrary_device_path():
     with pytest.raises(ValueError, match="Invalid Firstlight backup"):
         install.restore(Device([]), "/data/user/0")
+
+
+def test_check_original_game_reads_apk_and_resources_without_replacing_app(monkeypatch, tmp_path):
+    release = install.supported_engine()
+    apk = tmp_path / "original.apk"
+    monkeypatch.setattr(install, "sha256", lambda path: release["apk_sha256"])
+    monkeypatch.setattr(install, "resource_hashes", lambda device: {"fingerprint.json": "verified"})
+    monkeypatch.setattr(install, "validate_resources", lambda hashes: None)
+
+    class OriginalDevice(Device):
+        def shell(self, command):
+            if command.startswith("sha256sum "):
+                self.calls.append(command)
+                return release["apk_sha256"] + "  base.apk"
+            return super().shell(command)
+
+    device = OriginalDevice([])
+    result = install.check_original_game(device, apk)
+    assert result["original_apk_verified"] is True
+    assert result["resource_files_verified"] == 1
+    assert not any(isinstance(c, str) and c.startswith(("am force-stop", "cp ", "mkdir", "pm uninstall", "install ")) for c in device.calls)
+
+
+def test_check_original_game_rejects_wrong_apk_before_device_access(monkeypatch, tmp_path):
+    monkeypatch.setattr(install, "sha256", lambda path: "0" * 64)
+    device = Device([])
+    with pytest.raises(ValueError, match="Input APK SHA-256"):
+        install.check_original_game(device, tmp_path / "wrong.apk")
+    assert device.calls == []

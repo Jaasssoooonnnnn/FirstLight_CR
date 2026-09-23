@@ -24,24 +24,26 @@
   <img src="docs/assets/battle-montage.gif" width="960" alt="18 battle clips in a six-column, three-row montage at 12 times speed">
 </p>
 
+> **Video: the model's Hall of Fame push and a walkthrough of the AI architecture**
+>
+> [Watch in English (YouTube)](https://www.youtube.com/watch?v=TpfhzVlXWqw&lc=UgyyW1z5iYdLX8BZ0xl4AaABAg) · [观看中文版（哔哩哔哩）](https://www.bilibili.com/video/BV17Zb46JE9h)
+
 ## Pretrained models
 
-**We have trained a strong general-purpose Clash Royale agent and a Hall of Fame–level 2.6 Hog Cycle specialist.**
+**General is a strong model across decks. The author used the Hog 2.6 specialist to reach Hall of Fame.**
 
-The author reached Hall of Fame on an account using the Hog specialist. Read the [training history](docs/training_history.md) for the five-model progression, the fixed-IL detour, and model evaluation results.
+The [training history](docs/training_history.md) covers how the models were trained and evaluated.
 
-Choose **General** to try different decks, or a **Hog 2.6 specialist** for Hog Cycle. The models are included in the repository; follow the [quick start](#quick-start) to play against them. The [model guide](checkpoints/README.md) explains each checkpoint and how to evaluate it.
+Choose **General** for different decks or a **Hog 2.6 specialist** for Hog Cycle. Both are included in the repository. See the [model guide](checkpoints/README.md) for checkpoint details and evaluation.
 
 ## Features
-
-The project provides an offline battle environment, replay reconstruction tools, training code, and pretrained models.
 
 - **Native battle environment.** Headless and rendered execution, structured observations, card deployment and abilities, with Python `reset` / `step` interfaces.
 - **Imitation learning.** Reconstruct Parquet replays in the engine and build observation/action sequences for IL training.
 - **Self-play reinforcement learning.** PPO with matchmaking, opponent pools, resident simulation, and distributed collection.
 - **Models and inputs.** The V4 actor-critic uses card features, entity relations, spatial features, and recurrent memory. Training, evaluation, and local inference use the same model and input format.
 - **Match and replay interface.** Play against a model, control both sides manually, or watch training and collected replays in one offline VM.
-- **Source-level access.** C/C++ probe, hooks, function addresses, layouts, APK build tools, Python environments, and learning code are included.
+- **Source code.** The probe, APK build tools, battle environment, and training code are included.
 
 **122 supported cards · 5 included checkpoints · 252,238 replays · 17,836,160 actions**
 
@@ -67,7 +69,9 @@ See the [architecture guide](docs/architecture.md) for source entry points and d
 
 ## Quick start
 
-**Desktop:** Windows, Python 3.12 with Tkinter, and a dedicated rooted MuMu instance with ARM64 application support. CPU inference is supported. Native builds require JDK 17, Android NDK, and SDK build-tools.
+For a fresh machine or coding-agent setup, follow the [installation guide](docs/getting_started.md). The steps below are a summary.
+
+**Desktop:** Windows, Python 3.12 with Tkinter, and an Android 12 instance of regular MuMu Player with root and ARM64 application support. CPU inference is supported. Building the offline APK from source requires JDK 17, Android NDK, and SDK build-tools; running an already built APK does not.
 
 Run from the repository root:
 
@@ -75,29 +79,21 @@ Run from the repository root:
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env
-.\.venv\Scripts\python.exe tools/check_install.py
 ```
 
 Fill the Python, VM, and build-tool settings in `.env` using the [installation guide](docs/getting_started.md). The supported engine is **Null’s Royale 15.535.13 / arm64-v8a with content update 15.535.86**.
 
-**First, install and open the original APK yourself in the dedicated VM, let the game finish downloading the matching update, then exit it.** Keep the original APK as `user-provided/nulls-royale.apk` and build the offline engine:
+**First, install and open the unmodified original APK in the selected MuMu instance. Let it update naturally until you can enter the normal game lobby, then exit.** Keep the original APK as `user-provided/nulls-royale.apk`. Check the original APK and downloaded resources before building or injecting the probe:
 
 ```powershell
+./check_original_game.ps1 -InputApk ./user-provided/nulls-royale.apk
 ./build_offline_engine.ps1 `
   -InputApk ./user-provided/nulls-royale.apk `
   -OutputApk ./build/cr-ai-offline.apk
 ./install_offline_engine.ps1 -Apk ./build/cr-ai-offline.apk
-.\launch_interface.cmd
 ```
 
-Select a checkpoint and both decks on **模型对局 / Model match**, then start. The model plays the top side; you control the bottom side through the overlay. Matches use level 11 and native deployment timing.
-
-| Console page | Explore |
-| --- | --- |
-| Model match | Play against an included or newly trained checkpoint |
-| Manual native match | Control both sides to examine interactions |
-| Training replay | Inspect exported native battle trajectories |
-| Collected replay | Reconstruct matches from a Parquet dataset |
+To open the interface after installation, run `Firstlight_CR\launch_interface.cmd` from its parent folder, or run `./launch_interface.cmd` from the repository root.
 
 ## Train and evaluate
 
@@ -113,15 +109,13 @@ To compare two included checkpoints, stop any console task and run:
   --games 2 --output ./evaluations/comparison
 ```
 
-The two-game example checks that the evaluator runs. For model comparisons, set the game count with `--games`, decks and levels with `--match-config`, and the starting seed with `--seed`. See [model evaluation](checkpoints/README.md#evaluation--模型评测) for output files and metrics. To integrate your own actor loop, use the [JSON-lines policy service](docs/policy_service.md).
+Use `--games` for the match count, `--match-config` for decks and levels, and `--seed` for the starting seed. See [model evaluation](checkpoints/README.md#evaluation--模型评测) for results and metrics. To integrate your own actor loop, use the [JSON-lines policy service](docs/policy_service.md).
 
 ## Documentation
 
-All guides include English and Chinese.
-
 | Guide | Contents |
 | --- | --- |
-| [Getting started](docs/getting_started.md) | Requirements, `.env`, local build, installation, and console |
+| [Getting started](docs/getting_started.md) | Requirements, `.env`, original game update, and offline installation |
 | [Training history](docs/training_history.md) | Five main models, experiments, results, and playstyle tradeoffs |
 | [Training](docs/training.md) | Replay cache, IL, batch simulation, Linux guests, and PPO |
 | [Architecture](docs/architecture.md) | Environment, policy, training, and replay source map |
@@ -132,4 +126,4 @@ All guides include English and Chinese.
 
 ## License
 
-FirstLight CR is independently developed and licensed under [Apache-2.0](LICENSE). It does not connect to Supercell official servers, operate official accounts, or represent or affiliate with Supercell. Third-party game binaries, resources, and modified clients are not distributed. Users provide the supported APK locally; rights to that software and its resources remain with their owners. See [NOTICE](NOTICE).
+FirstLight CR is an independent offline project under [Apache-2.0](LICENSE), unaffiliated with Supercell. The repository does not distribute the game APK or its resources; users supply the supported APK locally. See [NOTICE](NOTICE).
