@@ -2555,7 +2555,12 @@ class BattleEnvV1:
                 x, y = self._world_target(action)
                 execute_in = max(1, action.execute_offset_ticks or 1)
                 hand_action = HandAction(action.owner, action.hand_slot, x, y)
-                if action.metadata.get("native_command_age_ticks") is not None:
+                if (
+                    action.metadata.get("model_delay_ignored") is True
+                    and self.episode_config.render_mode == "native-render"
+                ):
+                    queued = self.native.queue_hand_action_next_tick(hand_action)
+                elif action.metadata.get("native_command_age_ticks") is not None:
                     # The renderer continues during inference.  Policy offsets
                     # describe time since the decision observation, so do not
                     # restart the clock when the native queue is reached.

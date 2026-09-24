@@ -762,6 +762,30 @@ class BattleEnvironmentTests(unittest.TestCase):
         self.assertEqual(native.queued[0]["execute_tick"], decision_tick + 21)
         self.assertEqual(observations[0].pending_actions[0].expected_execution_tick, decision_tick + 21)
 
+    def test_immediate_model_play_uses_next_current_native_tick(self) -> None:
+        from native_runner.training.v4.offline_agent import _rendered_action
+
+        env, native = _make_env()
+        _reset(env)
+        decision_tick = int(env.raw_observation["tick"])
+        native.state["tick"] = decision_tick + 4
+        play = _rendered_action(ActionV1.play(
+            owner=0,
+            hand_slot=0,
+            grid=(8, 10),
+            execute_offset_ticks=4,
+            next_decision_ticks=5,
+        ))
+
+        env.step({0: play, 1: ActionV1.wait(1, ticks=5)})
+
+        self.assertEqual(native.queued, [])
+        self.assertEqual(native.state["tick"], decision_tick + 9)
+        self.assertEqual(
+            [event.tick for event in env.observe(owner=0).events if event.event_type == "action_executed"],
+            [decision_tick + 5],
+        )
+
     def test_five_tick_offset_executes_before_next_policy_observation(self) -> None:
         env, native = _make_env()
         _reset(env)

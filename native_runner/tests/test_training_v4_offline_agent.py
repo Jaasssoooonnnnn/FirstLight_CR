@@ -82,7 +82,7 @@ def test_model_overlay_uses_manual_play_path_for_human_side(owner, hand_temporar
     assert len(queued) == 1
 
 
-def test_model_cards_preserve_native_command_age_and_policy_delay():
+def test_model_cards_play_on_next_native_tick_without_delaying_human_path():
     from native_runner.contracts import ActionKind, ActionV1, TargetKind
 
     action = ActionV1(
@@ -93,15 +93,18 @@ def test_model_cards_preserve_native_command_age_and_policy_delay():
         target_kind=TargetKind.GRID,
         target_grid=(3, 6),
         execute_offset_ticks=4,
+        metadata={"policy_delay_offset_ms": 150},
     )
     rendered = offline_agent._rendered_action(action)
-    assert rendered.execute_offset_ticks == 24
-    assert rendered.metadata["native_command_age_ticks"] == 20
+    assert rendered.execute_offset_ticks == 1
+    assert "native_command_age_ticks" not in rendered.metadata
+    assert rendered.metadata["model_delay_ignored"] is True
+    assert rendered.metadata["policy_delay_offset_ms"] == 150
     assert rendered.card_id == action.card_id
     assert rendered.target_grid == action.target_grid
     assert offline_agent._rendered_action(
         ActionV1.play(0, 0, (3, 6), execute_offset_ticks=1)
-    ).execute_offset_ticks == 21
+    ).execute_offset_ticks == 1
     wait = ActionV1.wait(0, ticks=5)
     assert offline_agent._rendered_action(wait) is wait
 

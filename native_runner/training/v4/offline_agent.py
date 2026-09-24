@@ -15,7 +15,6 @@ from ...contracts import ActionKind, ActionV1
 from ...cr_native_env import (
     DEFAULT_HOST,
     DEFAULT_PORT,
-    LIVE_COMMAND_AGE_TICKS,
     NATIVE_RENDER_SPEEDS,
     NativeClashEnv,
     RunnerError,
@@ -30,18 +29,15 @@ from .policy_session import build_policy_session_v4, load_policy_v4
 def _rendered_action(action: ActionV1) -> ActionV1:
     if action.kind != ActionKind.PLAY_CARD:
         return action
-    # A zero-delay policy play targets decision tick + 21: next-tick input
-    # followed by the native 20-tick command interval. BattleEnv anchors
-    # this target to the decision observation, even if inference finishes later.
-    offset = action.execute_offset_ticks + LIVE_COMMAND_AGE_TICKS
+    # The native queue backdates command-age fields to apply on the next tick.
+    # Preserve the model's predicted delay only for diagnosis.
+    metadata = dict(action.metadata)
+    metadata.pop("native_command_age_ticks", None)
+    metadata.update(execute_offset_ticks=1, model_delay_ignored=True)
     return replace(
         action,
-        execute_offset_ticks=offset,
-        metadata={
-            **action.metadata,
-            "execute_offset_ticks": offset,
-            "native_command_age_ticks": LIVE_COMMAND_AGE_TICKS,
-        },
+        execute_offset_ticks=1,
+        metadata=metadata,
     )
 
 

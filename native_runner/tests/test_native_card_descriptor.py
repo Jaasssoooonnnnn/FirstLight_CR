@@ -243,6 +243,51 @@ def test_absolute_hand_queue_rejects_a_late_native_injection(
         )
 
 
+def test_next_tick_model_queue_holds_renderer_until_command_is_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = NativeClashEnv()
+    clock = {"tick": 130, "paused": False}
+    events: list[str] = []
+    observation = {
+        "players": [{
+            "owner": 0,
+            "accountId": 123,
+            "hand": [{
+                "handIndex": 0, "deckSlot": 0,
+                "cardId": 26_000_001, "commandCardId": 26_000_001,
+                "cardParameter": _packed(form_code=0, deck_slot=0, cost=3),
+                "cost": 3,
+            }],
+        }],
+    }
+
+    def pause() -> None:
+        clock["paused"] = True
+        events.append("pause")
+
+    def resume() -> None:
+        clock["paused"] = False
+        events.append("resume")
+
+    def inject(command: dict[str, object]) -> dict[str, object]:
+        assert clock["paused"] is True
+        assert command["c"]["t2"] == 130  # type: ignore[index]
+        events.append("inject")
+        return {"ok": True, "tick": clock["tick"]}
+
+    monkeypatch.setattr(env, "pause", pause)
+    monkeypatch.setattr(env, "resume", resume)
+    monkeypatch.setattr(env, "observe", lambda: {"tick": clock["tick"], **observation})
+    monkeypatch.setattr(env, "inject_command", inject)
+
+    receipt = env.queue_hand_action_next_tick(HandAction(0, 0, 9_000, 10_000))
+
+    assert receipt["executeTick"] == 131
+    assert events == ["pause", "inject", "resume"]
+    assert clock["paused"] is False
+
+
 def test_observation_anchored_hand_queue_falls_back_after_missed_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

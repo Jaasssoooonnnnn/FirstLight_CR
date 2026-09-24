@@ -2870,6 +2870,16 @@ class NativeClashEnv:
             raise ValueError("native command exceeds the probe's 2 KiB limit")
         return self._request(f"inject {payload}")
 
+    def queue_hand_action_next_tick(self, action: HandAction) -> dict[str, Any]:
+        """Queue a model play for the next tick without a live-render clock race."""
+
+        with self._lock:
+            self.pause()
+            try:
+                return self.queue_hand_action_at(action, execute_in_ticks=1)
+            finally:
+                self.resume()
+
     def queue_hand_action_at(
         self,
         action: HandAction,
