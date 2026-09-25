@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 import sys
@@ -83,6 +84,12 @@ PEKKA_BRIDGE_SPAM_FORMS = (1, 1, 2, 0, 0, 0, 0, 0)
 
 
 LOGGER = logging.getLogger("firstlight_interface")
+
+
+def _new_match_seed() -> int:
+    """Choose a fresh positive seed within the native signed 32-bit range."""
+
+    return secrets.randbelow((1 << 31) - 1) + 1
 
 
 def _configure_logging() -> Path:
@@ -1422,7 +1429,7 @@ class CRHarnessInterface:
                 deck0_form_availability=forms0, deck1_form_availability=forms1,
                 tower_troop0_id=self.duel_deck0_editor.tower_troop_id(),
                 tower_troop1_id=self.duel_deck1_editor.tower_troop_id(),
-                seed=20260728, level_cap=11, minimum_card_level=11, king_tower_level=11,
+                seed=_new_match_seed(), level_cap=11, minimum_card_level=11, king_tower_level=11,
                 owner0_name="AI-0", owner1_name="AI-1",
             )
         except (ValueError, OSError) as error:
@@ -1492,7 +1499,7 @@ class CRHarnessInterface:
                 deck1_form_availability=forms1,
                 tower_troop0_id=self.model_deck0_editor.tower_troop_id(),
                 tower_troop1_id=self.model_deck1_editor.tower_troop_id(),
-                seed=20260728,
+                seed=_new_match_seed(),
                 level_cap=level,
                 minimum_card_level=level,
                 king_tower_level=level,
@@ -1714,7 +1721,7 @@ class CRHarnessInterface:
             deck1_form_availability=forms1,
             tower_troop0_id=self.deck0_editor.tower_troop_id(),
             tower_troop1_id=self.deck1_editor.tower_troop_id(),
-            seed=20260728,
+            seed=_new_match_seed(),
             level_cap=level,
             minimum_card_level=level,
             king_tower_level=level,

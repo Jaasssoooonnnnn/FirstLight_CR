@@ -42,7 +42,9 @@ class _EmptyTree:
         return None
 
 
-def test_manual_match_passes_selected_tower_troops_to_native_replay() -> None:
+def test_manual_match_passes_selected_tower_troops_to_native_replay(monkeypatch) -> None:
+    seeds = iter((12345, 67890))
+    monkeypatch.setattr(interface, "_new_match_seed", lambda: next(seeds))
     app = object.__new__(interface.CRHarnessInterface)
     preset = interface.MATCH_PRESETS[0]
     app.deck0_editor = SimpleNamespace(values=lambda: (preset.deck0, preset.forms0), tower_troop_id=lambda: 159_000_001)
@@ -52,7 +54,8 @@ def test_manual_match_passes_selected_tower_troops_to_native_replay() -> None:
 
     assert config.deck0 == preset.deck0
     assert config.deck1 == preset.deck1
-    assert config.seed == 20260728
+    assert config.seed == 12345
+    assert app._match_config().seed == 67890
     assert (config.level_cap, config.minimum_card_level, config.king_tower_level) == (11, 11, 11)
     assert (config.owner0_name, config.owner1_name) == ("PEKKA-11-A", "PEKKA-11-B")
     assert (config.tower_troop0_id, config.tower_troop1_id) == (159_000_001, 159_000_002)
@@ -90,6 +93,7 @@ def test_model_match_launches_deterministic_argmax(monkeypatch, tmp_path: Path) 
     checkpoint = tmp_path / "model.pt"
     checkpoint.write_bytes(b"checkpoint")
     monkeypatch.setattr(interface, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(interface, "_new_match_seed", lambda: 23456)
     app = object.__new__(interface.CRHarnessInterface)
     app.busy = False
     app.owns_native_session = True
@@ -119,6 +123,7 @@ def test_model_match_launches_deterministic_argmax(monkeypatch, tmp_path: Path) 
     assert "deterministic" in captured and captured["deterministic"] is None
     assert app.model_status_var.get() == "正在准备离线 VM 和模型…"
     config = json.loads((app.model_artifact_dir / "match.json").read_text(encoding="utf-8"))
+    assert config["seed"] == 23456
     assert (config["tower_troop0_id"], config["tower_troop1_id"]) == (159_000_004, 159_000_001)
 
 
@@ -127,6 +132,7 @@ def test_ai_duel_launches_both_checkpoints_and_decks(monkeypatch, tmp_path: Path
     for checkpoint in checkpoints:
         checkpoint.write_bytes(b"checkpoint")
     monkeypatch.setattr(interface, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(interface, "_new_match_seed", lambda: 34567)
     app = object.__new__(interface.CRHarnessInterface)
     app.busy = False
     app.owns_native_session = True
@@ -156,6 +162,7 @@ def test_ai_duel_launches_both_checkpoints_and_decks(monkeypatch, tmp_path: Path
     assert captured["module"] == "native_runner.training.v4.offline_duel"
     assert (captured["checkpoint_0"], captured["checkpoint_1"]) == checkpoints
     config = json.loads((app.model_artifact_dir / "match.json").read_text(encoding="utf-8"))
+    assert config["seed"] == 34567
     assert config["deck0"] == list(interface.PEKKA_BRIDGE_SPAM_DECK)
     assert config["deck1"] == list(interface.PEKKA_BRIDGE_SPAM_DECK)
     assert (config["tower_troop0_id"], config["tower_troop1_id"]) == (159_000_002, 159_000_004)
