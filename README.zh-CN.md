@@ -92,7 +92,7 @@ Copy-Item .env.example .env
 ./install_offline_engine.ps1 -Apk ./build/cr-ai-offline.apk
 ```
 
-安装后启动界面：在项目上级目录运行 `Firstlight_CR\launch_interface.cmd`，或在仓库根目录运行 `./launch_interface.cmd`。
+安装后启动界面：在项目上级目录运行 `FirstLight_CR\launch_interface.cmd`，或在仓库根目录运行 `./launch_interface.cmd`。
 
 ## 训练与评测
 

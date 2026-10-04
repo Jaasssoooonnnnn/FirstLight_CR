@@ -93,7 +93,7 @@ Fill the Python, VM, and build-tool settings in `.env` using the [installation g
 ./install_offline_engine.ps1 -Apk ./build/cr-ai-offline.apk
 ```
 
-To open the interface after installation, run `Firstlight_CR\launch_interface.cmd` from its parent folder, or run `./launch_interface.cmd` from the repository root.
+To open the interface after installation, run `FirstLight_CR\launch_interface.cmd` from its parent folder, or run `./launch_interface.cmd` from the repository root.
 
 ## Train and evaluate
 
