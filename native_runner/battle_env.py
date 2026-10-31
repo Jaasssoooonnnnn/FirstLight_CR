@@ -488,6 +488,9 @@ class BattleEnvV1:
         self._initial_tower_hp: dict[int, float] = {}
         self._tower_object_keys: dict[int, int] = {}
         self._activated_king_tower_ids: set[int] = set()
+        # Last native Tower Troop runtime record seen per fixed tower, keyed by
+        # tower entity ID -> (generation, state_epoch, native object ID, record).
+        self._tower_troop_runtime_carry: dict[int, tuple[int, int, int, Any]] = {}
         self._events: deque[EventV1] = deque(maxlen=event_limit)
         self._event_archive: dict[str, dict[str, int]] = {}
         self._pending: list[_PendingRecord] = []
@@ -909,6 +912,7 @@ class BattleEnvV1:
         self._last_advance_event = False
         self._tower_object_keys = self._bind_tower_object_keys(self._raw)
         self._activated_king_tower_ids.clear()
+        self._tower_troop_runtime_carry.clear()
         self._initial_tower_hp.clear()
         initial_towers = self._extract_towers(self._raw)
         self._initial_tower_hp = {tower.entity_id: tower.max_hitpoints for tower in initial_towers}
@@ -1205,6 +1209,34 @@ class BattleEnvV1:
             return ROYAL_CHEF_TOWER_TROOP_ID if tower_kind == "king" else PRINCESS_TOWER_TROOP_ID
         return None if tower_kind == "king" else configured_id
 
+    def _carried_tower_troop_runtime(
+        self, entity_id: int, rich_item: RichObjectTelemetry, snapshot: RichTelemetrySnapshot, *, relevant: bool
+    ) -> Any:
+        """Return this tower's Tower Troop runtime, carrying the last record forward.
+
+        The probe publishes a record only when the native Action init/tick runs
+        and keeps records in one 256-slot ring shared by every special tower.
+        An Action that stops ticking keeps its fields frozen, so its last record
+        stays exact -- but the other side's Dagger Duchess towers publish one
+        record per tower per tick and overwrite it after 128-256 ticks, after
+        which the object is emitted without ``towerTroopRuntime``.  Within one
+        (generation, state epoch, native object) the newest record we observed
+        is therefore still the current state; observations arrive every few
+        ticks, far below the ring's eviction horizon, so a record that ticked
+        again would still be present.
+        """
+        identity = (int(snapshot.generation), int(snapshot.state_epoch), int(rich_item.native_object_id))
+        record = rich_item.tower_troop_runtime
+        if record is not None:
+            self._tower_troop_runtime_carry[entity_id] = (*identity, record)
+            return record
+        if not relevant:
+            return None
+        carried = self._tower_troop_runtime_carry.get(entity_id)
+        if carried is None or carried[:3] != identity:
+            return None
+        return carried[3]
+
     def _extract_towers(
         self, raw: Mapping[str, Any], *, rich_context: _RichObservationContext | None = None
     ) -> tuple[TowerStateV1, ...]:
@@ -1268,7 +1300,9 @@ class BattleEnvV1:
                     phase_events=self._phase_events_by_entity.get(rich_item.entity_key, ()),
                     card_spec=self.card_specs.get(rich_item.card_id),
                 )
-                tower_runtime = rich_item.tower_troop_runtime
+                tower_runtime = self._carried_tower_troop_runtime(
+                    entity_id, rich_item, rich_context.snapshot, relevant=tower_runtime_relevant
+                )
                 if isinstance(tower_runtime, RichDaggerDuchessRuntimeTelemetry):
                     if kind == "king" or tower_troop_id != 159_000_002:
                         raise BattleEnvError("Dagger Duchess runtime is attached to the wrong tower")
