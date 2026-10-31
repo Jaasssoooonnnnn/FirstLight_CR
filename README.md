@@ -30,14 +30,11 @@
 
 ## Pretrained model
 
-This branch ships **Everlight**, trained after two changes to the environment:
+This branch ships **Everlight**. A card or ability now takes effect 20 ticks (1 second) after it is played, and the model can see its own cards that are still on the way. Replay reconstruction, IL, PPO and the match interface all use the delay; in the interface it applies to the player and the model alike.
 
-- A card or ability now takes effect 20 ticks (1 second) after it is played, as in the real game. Replay reconstruction, IL, PPO and the match interface all use this delay. In the interface it applies to both the player and the model.
-- The model sees its own cards that have been played but have not reached the arena yet.
+The network is larger than before: the spatial CNN has 128 channels and 5 residual blocks (was 64 and 3), and the LSTM has 768 units (was 512). Everlight was trained with IL and then PPO self-play. The included checkpoint is PPO update 80.
 
-Everlight also has a larger network. The spatial CNN has 128 channels and 5 residual blocks (previously 64 and 3), and the LSTM has 768 units (previously 512). It was trained with imitation learning and then with PPO self-play; the included checkpoint is PPO update 80.
-
-The five earlier models (General, IL, Active IL and the two Hog 2.6 specialists) are on the [`main`](https://github.com/Jaasssoooonnnnn/FirstLight_CR/tree/main) branch. They were trained without the delay and cannot be loaded on this branch.
+The five earlier models (General, IL, Active IL and the two Hog 2.6 specialists) are on the [`main`](https://github.com/Jaasssoooonnnnn/FirstLight_CR/tree/main) branch. They were trained without the delay and do not load here.
 
 See the [model guide](checkpoints/README.md) for loading and evaluation.
 

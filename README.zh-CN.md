@@ -29,14 +29,11 @@
 
 ## 预训练模型
 
-这个分支提供 **Everlight** 模型。训练前，对局环境改了两处：
+这个分支提供 **Everlight** 模型。下牌和放技能后要过 20 tick（1 秒）才生效，模型也能看到自己已经下出、还没到场的牌。回放重建、IL、PPO 和对战界面都按这个延迟执行，对战界面里玩家和模型一样。
 
-- 下牌和放技能后要过 20 tick（1 秒）才生效，与真实游戏一致。回放重建、IL、PPO 和对战界面都按这个延迟执行；在对战界面里，玩家和模型都有这个延迟。
-- 模型能看到自己已经下出、但还没到场的牌。
+网络也比之前大：空间 CNN 为 128 通道、5 个残差块（原为 64 通道、3 个），LSTM 为 768 维（原为 512）。Everlight 先做 IL，再做 PPO 自博弈，随附的是 PPO 第 80 次更新的 checkpoint。
 
-Everlight 的网络也更大：空间 CNN 为 128 通道、5 个残差块（原为 64 通道、3 个），LSTM 为 768 维（原为 512）。模型先经过模仿学习，再经过 PPO 自博弈训练，随附的是 PPO 第 80 次更新的 checkpoint。
-
-之前的五个模型（General、IL、Active IL 和两个 2.6 速猪专精模型）在 [`main`](https://github.com/Jaasssoooonnnnn/FirstLight_CR/tree/main) 分支。它们按旧时序训练，在这个分支上无法加载。
+之前的五个模型（General、IL、Active IL 和两个 2.6 速猪专精模型）在 [`main`](https://github.com/Jaasssoooonnnnn/FirstLight_CR/tree/main) 分支。它们按旧时序训练，在这个分支上加载不了。
 
 加载与评测方法见[模型说明](checkpoints/README.md)。
 

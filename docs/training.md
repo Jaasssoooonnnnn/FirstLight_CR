@@ -29,7 +29,7 @@ python -m native_runner.training.v4.cache_builder runs/demo/dataset runs/demo/ca
   --ports 26789 --source-count 1 --resident-slots 1 --verify-roundtrip
 ```
 
-RoyaleAPI action times are the moments a player touched a card. The builder keeps those times as the expert labels and schedules each command to take effect 20 ticks later, as the real game does; while a command is on the way it appears in the observation as pending. The cache contract is `v4-il-cache-contract.v3`. Caches built on `main` use the old timing and must be rebuilt.
+RoyaleAPI action times are the moments a player touched a card. The builder keeps those times as the expert labels and schedules each command to take effect 20 ticks later; while a command is on the way it appears in the observation as pending. The cache contract is `v4-il-cache-contract.v3`. Caches built on `main` use the old timing and must be rebuilt.
 
 Outputs include `index.json`, sequence shards, and shard manifests. Check completed/failed replay counts and expert/executed-action counts before training. For the full dataset, replace the two directories and use `--source-count 0`. Multiple engine ports are comma-separated; `--resident-slots` must fit the configured capacity. Linux partitioned conversion is available through `native_runner/training/v4/launch_cache_partition.sh`.
 
@@ -125,7 +125,7 @@ bash native_runner/training/v4/launch_ppo_multinode_training.sh runs/ppo-smoke r
 
 ### Reward
 
-Each match pays +1 for a win and -1 for a loss, plus potential-based shaping on towers scaled by `--shaping-beta` (default 0.05). The potential is the crown difference plus the tower HP the opponent has lost minus the HP the learner has lost, and it is zero once the match ends, so the shaping does not add a second objective. `--king-shaping-mode` chooses how King Tower damage counts:
+Each match pays +1 for a win and -1 for a loss, plus potential-based shaping on towers scaled by `--shaping-beta` (default 0.05). The potential is the crown difference plus the tower HP the opponent has lost minus the HP the learner has lost, and it is zero once the match ends. `--king-shaping-mode` chooses how King Tower damage counts:
 
 | Mode | King Tower damage |
 | --- | --- |
@@ -135,7 +135,7 @@ Each match pays +1 for a win and -1 for a loss, plus potential-based shaping on 
 
 `--king-activation-penalty` (default 0.1) charges the side that first wakes the enemy King and pays the same amount to the other side.
 
-When continuing from Everlight, also pass `--delay-policy earliest`, the setting it was trained with. A frozen IL checkpoint given by `--anchor-checkpoint` adds a KL penalty that keeps the policy near it; `--anchor-kl-coef` and `--anchor-target-kl` set its starting weight and target. Put these options in `CR_PPO_EXTRA_ARGS`; the launcher passes them to the trainer unchanged:
+When continuing from Everlight, also pass `--delay-policy earliest`, the setting it was trained with. A frozen IL checkpoint given by `--anchor-checkpoint` adds a KL penalty that keeps the policy near it; `--anchor-kl-coef` and `--anchor-target-kl` set its starting weight and target. Put these options in `CR_PPO_EXTRA_ARGS`:
 
 ```sh
 CR_PPO_EXTRA_ARGS=--delay-policy earliest --king-shaping-mode hp_point_weighted --king-potential-weight 1.0 --shaping-beta 0.8

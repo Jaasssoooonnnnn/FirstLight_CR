@@ -12,29 +12,20 @@ This branch includes one model, **Everlight**. The five earlier models (General,
 | --- | --- | --- |
 | [Everlight/v15-general-il100-kl5e-2-v80.pt](Everlight/v15-general-il100-kl5e-2-v80.pt) | IL, then PPO self-play; update 80 / 先 IL，再 PPO 自博弈；第 80 次更新 | 67.3 MB |
 
-Compared with the models on `main`:
+The README describes what changed for this model ([English](../README.md#pretrained-model) · [中文](../README.zh-CN.md#预训练模型)). Card tokens have 21 runtime features; the five added since `main` describe the model's own card on the way (pending flag, ticks left, target x/y, ability flag). The opponent's cards stay hidden until they land. The checkpoint also records the inference settings it was trained with, `delay_policy: earliest` and delay bins up to 200 ms, and `load_policy_v4` applies them.
 
-- **Timing.** A card or ability takes effect 20 ticks (1 second) after it is played. Training, replay reconstruction and the match interface all follow this, for the player and the model alike.
-- **Inputs.** Each card token has 21 runtime features instead of 16. The five new ones describe the model's own card that is on the way: whether it is pending, the ticks left, its target x/y, and whether it is an ability. The opponent's pending cards stay hidden until they land.
-- **Network.** Spatial CNN with 128 channels and 5 residual blocks (was 64 and 3); LSTM with 768 units (was 512). About 16.8M trainable parameters.
-- **Inference settings.** The checkpoint records `delay_policy: earliest` (each card is played at the earliest legal delay bin) and delay bins up to 200 ms. `load_policy_v4` reads both, so the console, evaluator and policy service use them without extra flags.
+模型的改动见 README（[English](../README.md#pretrained-model) · [中文](../README.zh-CN.md#预训练模型)）。每张卡牌有 21 维运行时特征，比 `main` 多出的 5 维描述模型自己在途的牌：是否在途、剩余 tick、目标坐标、是否为技能。对手的牌在落地前看不到。checkpoint 里还记录了训练时的推理设置：`delay_policy: earliest`，延迟档最大 200 ms，`load_policy_v4` 会直接使用。
 
-和 `main` 上的模型相比：
+The `main` checkpoints were trained with 16 card runtime features and no delay, so they do not load here. `native_runner/training/v4/migrate_checkpoint_card_runtime.py` can pad them to 21 features for a comparison, but they still play as if cards took effect at once.
 
-- **时序。** 下牌和放技能后过 20 tick（1 秒）才生效。训练、回放重建和对战界面都按这个规则执行，玩家和模型一样。
-- **输入。** 每张卡牌的运行时特征从 16 维增加到 21 维。新增的 5 维描述模型自己已下出、尚未到场的牌：是否在途、剩余 tick、目标坐标、是否为技能。对手在途的牌在落地前仍然不可见。
-- **网络。** 空间 CNN 为 128 通道、5 个残差块（原为 64 通道、3 个）；LSTM 为 768 维（原为 512）。可训练参数约 1680 万。
-- **推理设置。** checkpoint 里记录了 `delay_policy: earliest`（每张牌按最早的合法延迟档打出）和最大 200 ms 的延迟档。`load_policy_v4` 会读取这两项，对战界面、评测器和策略服务无需额外参数。
-
-The `main` checkpoints were trained with 16 card runtime features and without the delay, so they do not load here. `native_runner/training/v4/migrate_checkpoint_card_runtime.py` can pad them to 21 features for comparison, but they still play as if cards took effect at once.
-
-`main` 上的模型按 16 维特征、无延迟训练，在本分支无法直接加载。`native_runner/training/v4/migrate_checkpoint_card_runtime.py` 可以把它们补零到 21 维用于对比，但它们的打法仍然默认牌会立即生效。
+`main` 上的模型用 16 维特征、无延迟训练，在本分支加载不了。`native_runner/training/v4/migrate_checkpoint_card_runtime.py` 可以把它们补零到 21 维拿来对比，但它们仍按牌立即生效的方式出牌。
 
 ## Local inference · 本地推理
 
 ```sh
 python tools/check_install.py
-python -m native_runner.training.v4.serve_policy   --checkpoint ./checkpoints/Everlight/v15-general-il100-kl5e-2-v80.pt
+python -m native_runner.training.v4.serve_policy \
+  --checkpoint ./checkpoints/Everlight/v15-general-il100-kl5e-2-v80.pt
 ```
 
 The service waits for JSON-line requests. See the [policy protocol](../docs/policy_service.md) for episode initialization and action requests. For complete matches, follow the evaluator example in the [main README](../README.md).

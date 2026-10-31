@@ -59,9 +59,9 @@ identity = request({
 Send `observe` before `FIRST_POLICY_DECISION_TICK`, then `act` every
 `POLICY_DECISION_TICKS` (five native ticks). Both constants are exported by
 `training/v4/expert.py`. Deserialize returned actions with `ActionV1.from_mapping`
-and submit them to the offline environment; an empty list means WAIT. The
-environment adds the 20-tick delay between a touch and its effect, so submit
-actions as soon as they are returned, as `offline_agent` does. After terminal/truncation, send `end`, or start a new episode.
+and submit them to the offline environment as soon as they are returned; an
+empty list means WAIT. The environment adds the 20-tick delay between a touch
+and its effect. After terminal/truncation, send `end`, or start a new episode.
 
 Invalid contract/request input returns `{"ok": false, "error": "..."}` and
 discards the episode state. Start again before another inference. Unexpected
