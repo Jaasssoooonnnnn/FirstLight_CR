@@ -142,7 +142,7 @@ def test_matchmaker_emits_exact_deck_and_policy_mix() -> None:
     )
 
 
-def test_matchmaker_reassigns_empty_history_share_to_current_policy() -> None:
+def test_matchmaker_reassigns_empty_history_share_to_il_policy() -> None:
     matchmaker = DeckMatchmakerV4(
         _manifest(),
         seed=19,
@@ -158,8 +158,8 @@ def test_matchmaker_reassigns_empty_history_share_to_current_policy() -> None:
     ]
 
     assert Counter(item.policy_matchup for item in matches) == {
-        POLICY_CURRENT: 75,
-        POLICY_IL: 25,
+        POLICY_CURRENT: 35,
+        POLICY_IL: 65,
     }
 
 

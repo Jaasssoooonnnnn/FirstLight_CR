@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import struct
+from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Any, Sequence
 
+import orjson
+
+from .action_movement_runtime import ActionMovementRuntimeError, parse_action_movement_runtime
+from .character_state_runtime import CharacterStateRuntimeError, parse_character_state_runtime
 from .rich_telemetry_adapter import (
     RichAbilityRuntimeTelemetry,
     RichActiveEffect,
@@ -21,30 +27,61 @@ from .rich_telemetry_adapter import (
     RichPlayerRuntimeTelemetry,
     RichProjectileTelemetry,
     RichRoyalChefRuntimeTelemetry,
+    RichTelemetryMergeError,
     RichTelemetrySnapshot,
     RichTowerTroopRuntimeEnvelope,
+    _capture_runtime,
+    _combat_point,
+    _entity_resource_runtime,
+    _periodic_attack_modifier_runtime,
+    _phase_runtime_events,
+    _threshold_relocation_runtime,
+    _remaining_runtime_events,
+    _tower_troop_runtime_envelope,
+    _visibility_runtime_events,
 )
-from .phase_runtime import PhaseHookEvent, PhaseHookKind, PhaseRuntimeWindowV1
+from .phase_runtime import (
+    ATTACK_SEQUENCE_DECAY_DURATION_MS,
+    ATTACK_SEQUENCE_PROGRESS_LIMIT,
+    PhaseHookEvent,
+    PhaseHookKind,
+    PhaseRuntimeWindowV1,
+)
+from .special_movement_runtime import SpecialMovementRuntimeError, parse_special_movement_runtime
 
 
 _MAGIC = b"CRTF"
-_VERSION = 4
+_VERSION = 6
 _NONE_I32 = -(2**31)
 _HEADER = struct.Struct("<4sHHQQQiiiiiHH")
 _PLAYER = struct.Struct("<iiiIIH6Bi")
 _HAND_CARD = struct.Struct("<iiiiIi")
 _DECK_CARD = struct.Struct("<ii")
+_DECK_ENTRY = struct.Struct("<iiiIi")
+_DESTINATIONS = struct.Struct("<4i")
 _ABILITY = struct.Struct("<8iHH")
 _EVOLUTION = struct.Struct("<9i")
 _OBJECT = struct.Struct("<IiI15i")
 _UINT32 = struct.Struct("<I")
+_UINT16 = struct.Struct("<H")
+# Version-5 JSON families, in probe order (resident_multimatch.inc kResidentTrainingJsonFamilies).
+_JSON_FAMILIES = (
+    "phaseRuntime",
+    "specialMovementRuntime",
+    "actionMovementRuntime",
+    "characterStateRuntime",
+    "visibilityRuntime",
+    "remainingRuntime",
+    "towerTroopRuntime",
+)
 _PROJECTILE = struct.Struct("<I7i")
-_PHASE = struct.Struct("<I28i")
+_PHASE = struct.Struct("<I32i")
 _EFFECT = struct.Struct("<IiiBH")
 _COMBAT_ENVELOPE = struct.Struct("<IQQQQQH")
 _COMBAT_EVENT = struct.Struct("<QiBBBBHQQQ8i")
 _COMBAT_DEPLOYMENT = struct.Struct("<B3xQiIIIiii")
 _COMBAT_FACT = struct.Struct("<II8i")
+_COMBAT_EVENT_RECORD_SIZE = _COMBAT_EVENT.size + _COMBAT_DEPLOYMENT.size + 9 * _COMBAT_FACT.size + _DESTINATIONS.size
 _PHASE_ENVELOPE = struct.Struct("<IQQQQQH")
 _PHASE_EVENT = struct.Struct("<QiBBHQQiIiI10i")
 _TOWER_RUNTIME = struct.Struct("<B3x10iI")
@@ -70,6 +107,7 @@ _OBJECT_EFFECTS_VALID = 1 << 7
 _OBJECT_INVISIBLE_VALID = 1 << 8
 _OBJECT_DATA_GLOBAL_ID = 1 << 9
 _OBJECT_TOWER_RUNTIME = 1 << 10
+_OBJECT_MECHANIC_RUNTIMES = 1 << 11
 
 _ABILITY_BUTTON_LABELS = (
     "invalid/no match",
@@ -122,7 +160,7 @@ _COMBAT_TERMINAL_REASONS = ("none", "object_impact", "source_lost", "nonimpact_c
 _CARD_FORM_LABELS = ("BasicForm", "EvoForm", "HeroForm", "AutoChessForm", "FormEnd", "FlexSlot")
 _MIRROR_CARD_GLOBAL_ID = 28_000_006
 _COMBAT_CAPACITY = 1024
-_COMBAT_CONSUME_CARD_HOOK_OFFSET = 0xF38A68
+_COMBAT_CONSUME_CARD_HOOK_OFFSET = 0xF9EA68
 
 
 class TrainingCaptureError(ValueError):
@@ -166,6 +204,36 @@ def _phase_optional(value: int, *, tick: bool = False) -> int | None:
     return value
 
 
+def _attack_sequence_decay(values: Sequence[int], attack_validated: bool, label: str) -> dict[str, int | None]:
+    """Attack-sequence progress/decay fields with the JSON phase-object contract."""
+
+    progress, progress_limit, decay_remaining, decay_duration = (_optional(value) for value in values[28:32])
+    stage = None if values[0] in (_NONE_I32, -1) else values[0]
+    if (
+        (progress is not None and not 0 <= progress <= ATTACK_SEQUENCE_PROGRESS_LIMIT)
+        or (progress_limit is not None and progress_limit < 1)
+        or (decay_remaining is not None and not 0 <= decay_remaining <= ATTACK_SEQUENCE_DECAY_DURATION_MS)
+        or (decay_duration is not None and decay_duration < 1)
+        or (progress is None) != (progress_limit is None)
+        or (decay_remaining is None) != (decay_duration is None)
+        or progress_limit not in {None, ATTACK_SEQUENCE_PROGRESS_LIMIT}
+        or decay_duration not in {None, ATTACK_SEQUENCE_DECAY_DURATION_MS}
+        or (progress is not None and not attack_validated)
+        or (decay_remaining is not None and not attack_validated)
+    ):
+        raise TrainingCaptureError(f"compact {label} attack sequence decay contract is inconsistent")
+    if progress is not None:
+        expected_stage = 0 if progress < 4 else 1 if progress < 9 else 2 if progress < 49 else 3
+        if stage != expected_stage:
+            raise TrainingCaptureError(f"compact {label} attack sequence progress/stage disagree")
+    return {
+        "attack_sequence_progress_raw": progress,
+        "attack_sequence_progress_limit": progress_limit,
+        "attack_sequence_decay_remaining_ms": decay_remaining,
+        "attack_sequence_decay_duration_ms": decay_duration,
+    }
+
+
 def _key(objects: Sequence[RichObjectTelemetry | None], slot: int, label: str) -> tuple[int, int, int] | None:
     if slot == -1:
         return None
@@ -177,7 +245,7 @@ def _key(objects: Sequence[RichObjectTelemetry | None], slot: int, label: str) -
     return item.entity_key
 
 
-def _empty_combat_fact(*, validated: bool = False) -> RichCombatEntityFact:
+def _new_empty_combat_fact(validated: bool) -> RichCombatEntityFact:
     return RichCombatEntityFact(
         validated=validated,
         present=False,
@@ -192,6 +260,38 @@ def _empty_combat_fact(*, validated: bool = False) -> RichCombatEntityFact:
         visibility_validated=False,
         invisible_count=None,
     )
+
+
+# Facts and events are frozen dataclasses, so identical decodes can share one object.
+_ABSENT_COMBAT_FACTS = {False: _new_empty_combat_fact(False), True: _new_empty_combat_fact(True)}
+
+
+def _empty_combat_fact(*, validated: bool = False) -> RichCombatEntityFact:
+    return _ABSENT_COMBAT_FACTS[validated]
+
+
+# Every compact capture carries the whole retained combat ring, but a published ring
+# record never changes.  Decoded events are therefore reused when the record bytes
+# of the same (generation, stateEpoch, epoch-first, sequence) are identical; only
+# the window-dependent checks are repeated.
+_COMBAT_EVENT_CACHE: "OrderedDict[tuple[int, int, int], dict[int, tuple[bytes, RichCombatEventTelemetry]]]" = (
+    OrderedDict()
+)
+_COMBAT_EVENT_CACHE_MATCHES = 32
+
+
+def _combat_event_cache(
+    generation: int, state_epoch: int, epoch_first: int
+) -> dict[int, tuple[bytes, RichCombatEventTelemetry]]:
+    key = (generation, state_epoch, epoch_first)
+    cache = _COMBAT_EVENT_CACHE.get(key)
+    if cache is None:
+        cache = _COMBAT_EVENT_CACHE[key] = {}
+        while len(_COMBAT_EVENT_CACHE) > _COMBAT_EVENT_CACHE_MATCHES:
+            _COMBAT_EVENT_CACHE.popitem(last=False)
+    else:
+        _COMBAT_EVENT_CACHE.move_to_end(key)
+    return cache
 
 
 def _combat_fact(reader: _Reader, label: str) -> RichCombatEntityFact:
@@ -322,10 +422,20 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
 
         deck: list[dict[str, int]] = []
         for index in range(deck_count):
-            deck_slot, card_id = reader.unpack(_DECK_CARD, f"player[{owner}].deck[{index}]")
+            deck_slot, card_id, command_card_id, card_parameter, cost = reader.unpack(
+                _DECK_ENTRY, f"player[{owner}].deck[{index}]"
+            )
             if deck_slot != index or card_id <= 0:
                 raise TrainingCaptureError("compact deck card is invalid")
-            deck.append({"deckSlot": deck_slot, "cardId": card_id})
+            deck.append(
+                {
+                    "deckSlot": deck_slot,
+                    "cardId": card_id,
+                    "commandCardId": command_card_id,
+                    "cardParameter": card_parameter,
+                    "cost": cost,
+                }
+            )
 
         abilities: list[RichAbilityRuntimeTelemetry] = []
         for index in range(ability_count):
@@ -476,6 +586,7 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
             | _OBJECT_INVISIBLE_VALID
             | _OBJECT_DATA_GLOBAL_ID
             | _OBJECT_TOWER_RUNTIME
+            | _OBJECT_MECHANIC_RUNTIMES
         ):
             raise TrainingCaptureError(f"object[{expected_slot}] header is invalid")
         if object_flags & _OBJECT_NULL:
@@ -541,7 +652,8 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
             phase_flags = int(phase_values[0])
             if phase_flags & ~0x7:
                 raise TrainingCaptureError("compact phase flags are invalid")
-            values = tuple(int(value) for value in phase_values[1:])
+            # ``<I32i`` unpacks Python ints already; int() would return each unchanged.
+            values = phase_values[1:]
             phase = RichPhaseObjectTelemetry(
                 attack_validated=bool(phase_flags & 0x1),
                 movement_validated=bool(phase_flags & 0x2),
@@ -574,10 +686,7 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
                 effective_movement_speed_tick=_phase_optional(values[25], tick=True),
                 movement_delta=_optional(values[26]),
                 movement_delta_tick=_phase_optional(values[27], tick=True),
-                attack_sequence_progress_raw=None,
-                attack_sequence_progress_limit=None,
-                attack_sequence_decay_remaining_ms=None,
-                attack_sequence_decay_duration_ms=None,
+                **_attack_sequence_decay(values, bool(phase_flags & 0x1), f"object[{slot}].phase"),
             )
 
         tower_runtime = None
@@ -650,6 +759,22 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
             else:
                 raise TrainingCaptureError("compact tower-troop runtime kind is invalid")
 
+        mechanic_runtimes: Mapping[str, Any] = {}
+        if object_flags & _OBJECT_MECHANIC_RUNTIMES:
+            # The JSON observation's own encodings, parsed by the JSON path's parsers.
+            size = reader.unpack(_UINT32, f"object[{slot}].mechanic_runtimes")[0]
+            try:
+                mechanic_runtimes = orjson.loads(reader.bytes(size, f"object[{slot}].mechanic_runtimes"))
+            except orjson.JSONDecodeError as error:
+                raise TrainingCaptureError("compact mechanic runtimes are not JSON") from error
+            if not isinstance(mechanic_runtimes, Mapping) or set(mechanic_runtimes) != {
+                "entityResourceRuntime",
+                "periodicAttackModifierRuntime",
+                "captureRuntime",
+                "thresholdRelocationRuntime",
+            }:
+                raise TrainingCaptureError("compact mechanic runtimes contradict their contract")
+
         effect_count = reader.unpack(struct.Struct("<H"), f"object[{slot}].effect_count")[0]
         if effect_count > 64:
             raise TrainingCaptureError("compact effect count is invalid")
@@ -689,17 +814,27 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
                     else None
                 ),
                 projectile=None,
-                entity_resource_runtime=None,
-                periodic_attack_modifier_runtime=None,
-                capture_runtime=None,
-                threshold_relocation_runtime=None,
+                entity_resource_runtime=_entity_resource_runtime(
+                    mechanic_runtimes.get("entityResourceRuntime"), f"rich.objects[{slot}].entityResourceRuntime"
+                ),
+                periodic_attack_modifier_runtime=_periodic_attack_modifier_runtime(
+                    mechanic_runtimes.get("periodicAttackModifierRuntime"),
+                    f"rich.objects[{slot}].periodicAttackModifierRuntime",
+                ),
+                capture_runtime=_capture_runtime(
+                    mechanic_runtimes.get("captureRuntime"), f"rich.objects[{slot}].captureRuntime"
+                ),
+                threshold_relocation_runtime=_threshold_relocation_runtime(
+                    mechanic_runtimes.get("thresholdRelocationRuntime"),
+                    f"rich.objects[{slot}].thresholdRelocationRuntime",
+                ),
                 phase_runtime=phase,
                 tower_troop_runtime=tower_runtime,
             )
         )
         pending_targets.append(target_slot)
         pending_projectiles.append(projectile_pending)
-        pending_effects.append(tuple(effects_pending))
+        pending_effects.append(tuple(effects_pending) if object_flags & _OBJECT_EFFECTS_VALID else None)
 
     objects_by_key = {item.entity_key: item for item in objects if item is not None}
     if len(objects_by_key) != sum(item is not None for item in objects):
@@ -837,7 +972,35 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
     combat_events: list[RichCombatEventTelemetry] = []
     deployment_contexts: dict[int, RichCombatDeploymentContext] = {}
     card_play_deployments: set[int] = set()
+    event_cache = _combat_event_cache(generation, state_epoch, combat_epoch_first)
+    for stale in [sequence for sequence in event_cache if sequence < combat_oldest]:
+        del event_cache[stale]
+    # bytes.startswith compares a cached record in place, without slicing it out.
+    compare_in_place = type(payload) is bytes
     for event_index in range(combat_event_count):
+        record_start = reader.offset
+        cached = event_cache.get(combat_oldest + event_index)
+        if cached is not None and (
+            payload.startswith(cached[0], record_start)
+            if compare_in_place
+            else cached[0] == payload[record_start : record_start + _COMBAT_EVENT_RECORD_SIZE]
+        ):
+            event = cached[1]
+            if event.tick > tick:
+                raise TrainingCaptureError(f"compact combat event[{event_index}] is invalid")
+            deployment = event.deployment_context
+            if deployment is not None:
+                prior_deployment = deployment_contexts.setdefault(deployment.deployment_sequence, deployment)
+                # A frozen dataclass always equals itself; skip the field-wise __eq__.
+                if prior_deployment is not deployment and prior_deployment != deployment:
+                    raise TrainingCaptureError("compact combat deployment sequence changed identity")
+                if event.kind == "card_play":
+                    if deployment.deployment_sequence in card_play_deployments:
+                        raise TrainingCaptureError(f"compact combat event[{event_index}] card play is invalid")
+                    card_play_deployments.add(deployment.deployment_sequence)
+            combat_events.append(event)
+            reader.offset = record_start + _COMBAT_EVENT_RECORD_SIZE
+            continue
         (
             sequence,
             event_tick,
@@ -936,6 +1099,22 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
         immediate_source = _combat_fact(reader, f"combat_event[{event_index}].immediate_source")
         source = _combat_fact(reader, f"combat_event[{event_index}].source")
         projectile = _combat_fact(reader, f"combat_event[{event_index}].projectile")
+        related = _combat_fact(reader, f"combat_event[{event_index}].related")
+        route_source_before = _combat_fact(reader, f"combat_event[{event_index}].route_source_before")
+        route_target_before = _combat_fact(reader, f"combat_event[{event_index}].route_target_before")
+        route_source_after = _combat_fact(reader, f"combat_event[{event_index}].route_source_after")
+        route_target_after = _combat_fact(reader, f"combat_event[{event_index}].route_target_after")
+        before_x, before_y, after_x, after_y = reader.unpack(
+            _DESTINATIONS, f"combat_event[{event_index}].destinations"
+        )
+        destination_before = _combat_point(
+            None if _NONE_I32 in (before_x, before_y) else [before_x, before_y],
+            f"combat_event[{event_index}].destination_before",
+        )
+        destination_after = _combat_point(
+            None if _NONE_I32 in (after_x, after_y) else [after_x, after_y],
+            f"combat_event[{event_index}].destination_after",
+        )
         target_required = kind in {
             "damage",
             "death",
@@ -990,7 +1169,6 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
             requested_amount is None or actual_amount is None or actual_amount <= 0
         ):
             raise TrainingCaptureError(f"compact combat event[{event_index}] lacks exact amount")
-        absent = _empty_combat_fact()
         combat_events.append(
             RichCombatEventTelemetry(
                 sequence=sequence,
@@ -1009,11 +1187,11 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
                 immediate_source=immediate_source,
                 source=source,
                 projectile=projectile,
-                related=absent,
-                route_source_before=absent,
-                route_target_before=absent,
-                route_source_after=absent,
-                route_target_after=absent,
+                related=related,
+                route_source_before=route_source_before,
+                route_target_before=route_target_before,
+                route_source_after=route_source_after,
+                route_target_after=route_target_after,
                 requested_amount=requested_amount,
                 actual_amount=actual_amount,
                 pre_hp=pre_hp,
@@ -1022,10 +1200,13 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
                 post_builtin_shield=post_builtin_shield,
                 pre_buff_shield=pre_buff_shield,
                 post_buff_shield=post_buff_shield,
-                destination_before=None,
-                destination_after=None,
+                destination_before=destination_before,
+                destination_after=destination_after,
             )
         )
+        if reader.offset - record_start != _COMBAT_EVENT_RECORD_SIZE:
+            raise TrainingCaptureError(f"compact combat event[{event_index}] size is invalid")
+        event_cache[sequence] = (payload[record_start : reader.offset], combat_events[-1])
     combat_envelope = RichCombatEventEnvelope(
         generation=generation,
         state_epoch=state_epoch,
@@ -1159,6 +1340,36 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
         complete=True,
     )
 
+    # Families the binary layout does not carry completely follow as the exact rich
+    # JSON envelopes of the atomic JSON capture, parsed by the same functions, so the
+    # training data plane observes the same semantics as IL construction and inference.
+    (family_count,) = reader.unpack(_UINT16, "json_family_count")
+    if family_count != len(_JSON_FAMILIES):
+        raise TrainingCaptureError("compact capture JSON family count is invalid")
+    families: dict[str, Any] = {}
+    for name in _JSON_FAMILIES:
+        (size,) = reader.unpack(_UINT32, f"{name}.size")
+        try:
+            families[name] = orjson.loads(reader.bytes(size, name))
+        except orjson.JSONDecodeError as error:
+            raise TrainingCaptureError(f"compact capture {name} is not valid JSON") from error
+    identity = {"generation": generation, "state_epoch": state_epoch, "observation_tick": tick}
+    try:
+        phase_runtime = _phase_runtime_events(families["phaseRuntime"], **identity)
+        special_movement_runtime = parse_special_movement_runtime(families["specialMovementRuntime"], **identity)
+        action_movement_runtime = parse_action_movement_runtime(families["actionMovementRuntime"], **identity)
+        character_state_runtime = parse_character_state_runtime(families["characterStateRuntime"], **identity)
+        visibility_runtime = _visibility_runtime_events(families["visibilityRuntime"], **identity)
+        remaining_runtime = _remaining_runtime_events(families["remainingRuntime"], **identity)
+        tower_troop_runtime = _tower_troop_runtime_envelope(families["towerTroopRuntime"], **identity)
+    except (
+        RichTelemetryMergeError,
+        SpecialMovementRuntimeError,
+        ActionMovementRuntimeError,
+        CharacterStateRuntimeError,
+    ) as error:
+        raise TrainingCaptureError(f"compact capture runtime family contradicts its contract: {error}") from error
+
     if reader.offset != len(payload):
         raise TrainingCaptureError("compact capture contains trailing bytes")
 
@@ -1194,8 +1405,11 @@ def decode_training_capture(payload: bytes) -> TrainingAtomicCaptureV1:
         players=rich_players,
         combat_events=combat_envelope,
         phase_runtime=phase_runtime,
-        visibility_runtime=None,
-        remaining_runtime=None,
+        visibility_runtime=visibility_runtime,
+        remaining_runtime=remaining_runtime,
         tower_troop_runtime=tower_troop_runtime,
+        special_movement_runtime=special_movement_runtime,
+        action_movement_runtime=action_movement_runtime,
+        character_state_runtime=character_state_runtime,
     )
     return TrainingAtomicCaptureV1(ordinary=ordinary, snapshot=snapshot)

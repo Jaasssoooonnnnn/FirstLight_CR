@@ -323,6 +323,13 @@ bool g_native_worker_running = false;
 // while one serialized control-server thread is the only lane allowed to
 // enter libg.  The legacy worker exits cleanly before this mode is activated.
 bool g_resident_mode_requested = false;
+// Incremental telemetry cursors for resident training capture: when active, each
+// JSON family transmits only records newer than its cursor.
+bool g_live_capture_delta_active = false;
+std::uint64_t g_live_capture_combat_from_sequence = 0;
+std::uint64_t g_live_capture_phase_from_sequence = 0;
+std::uint64_t g_live_capture_visibility_from_sequence = 0;
+std::uint64_t g_live_capture_remaining_from_sequence = 0;
 bool g_resident_mode_active = false;
 std::uint64_t g_reset_request_sequence = 0;
 std::uint64_t g_reset_processed_sequence = 0;
@@ -4372,6 +4379,38 @@ bool read_shield(const void *object, std::int32_t *shield, std::int32_t *maximum
 #include "remaining_runtime_telemetry.inc"
 #include "tower_troop_runtime_telemetry.inc"
 
+// Everything the runtime hooks carry from one native step of a match to the
+// next: retained rings, sequence/epoch identities, causal markers, lifetime and
+// spawn tables, and per-object caches.  Observations are built from this
+// history, so it must belong to exactly one match.  Ordinary modes use the
+// process defaults; resident multi-match mode owns one instance per slot and
+// binds it on every slot switch, so each slot sees what a process running only
+// that match would.  Only the native step thread publishes, and binding happens
+// on that thread between steps.
+struct MatchTelemetry {
+  CombatMatchTelemetry combat;
+  VisibilityMatchTelemetry visibility;
+  PhaseMatchTelemetry phase;
+  SpecialMovementMatchTelemetry special_movement;
+  ActionMovementMatchTelemetry action_movement;
+  CharacterStateMatchTelemetry character_state;
+  RemainingMatchTelemetry remaining;
+  TowerTroopMatchTelemetry tower_troop;
+};
+
+// nullptr rebinds the process defaults.
+void bind_match_telemetry(MatchTelemetry *telemetry) {
+  g_combat_match = telemetry == nullptr ? &g_combat_default_match : &telemetry->combat;
+  g_visibility_match = telemetry == nullptr ? &g_visibility_default_match : &telemetry->visibility;
+  g_phase_match = telemetry == nullptr ? &g_phase_default_match : &telemetry->phase;
+  g_special_movement_match =
+      telemetry == nullptr ? &g_special_movement_default_match : &telemetry->special_movement;
+  g_action_movement_match = telemetry == nullptr ? &g_action_movement_default_match : &telemetry->action_movement;
+  g_character_state_match = telemetry == nullptr ? &g_character_state_default_match : &telemetry->character_state;
+  g_remaining_match = telemetry == nullptr ? &g_remaining_default_match : &telemetry->remaining;
+  g_tower_troop_match = telemetry == nullptr ? &g_tower_troop_default_match : &telemetry->tower_troop;
+}
+
 void begin_runtime_telemetry_epoch(void *game_manager, std::uint64_t generation, std::uint64_t state_epoch) {
   // Close the combat capture gate first so no new phase callback can obtain
   // an old context while the phase ring/cache identity is reset.
@@ -5867,9 +5906,9 @@ void remember_enqueued_mirror_descriptor(void *manager, const char *command_json
     proof.registered_tick = capture.tick;
     proof.descriptor = {reinterpret_cast<std::uintptr_t>(descriptor.card_data),
                         reinterpret_cast<std::uintptr_t>(descriptor.secondary_data), descriptor.packed};
-    if (!g_combat_queued_mirror_proofs.remember(proof)) {
+    if (!g_combat_match->queued_mirror_proofs.remember(proof)) {
       LOGE("combat capture rejected reason=queued-mirror-proof-capacity tick=%d owner=%d", capture.tick, owner);
-      g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+      g_combat_match->rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
     }
     return;
   }

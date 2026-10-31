@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Callable
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from .catalog import CardCatalogV1, PAD_CARD_VOCAB_ID
 from .config import ModelConfigV4
@@ -33,6 +35,65 @@ from .tensors import (
 )
 
 
+ACTIVATION_CHECKPOINT_SCOPES = ("pair-bias", "attention", "spatial")
+DEFAULT_ACTIVATION_CHECKPOINT_SCOPES = ("attention", "spatial")
+
+
+class ActivationCheckpointingV4:
+    """Runtime recompute switches shared by one model's components.
+
+    Not part of ``ModelConfigV4`` (or the checkpoint contract): it changes
+    which activations autograd keeps, never the math.  Scopes:
+
+    ``pair-bias``  each attention layer's spatial pair-bias MLP on the
+                   ``[B,N,N,8]`` pair features (its ``[B,N,N,32]`` hidden);
+    ``attention``  each whole ``SparseRelationAttentionBlock`` (scores,
+                   softmax, pair bias, FFN); subsumes ``pair-bias``;
+    ``spatial``    each ``ResidualSpatialBlock`` of the spatial ResNet.
+
+    Recompute applies only while autograd records a graph outside CUDA Graph
+    capture, so ``torch.no_grad``/inference and the live captured policy run
+    the plain forward.  ``use_reentrant=False`` keeps DDP and autocast exact
+    (the recompute replays the forward's autocast state).
+    """
+
+    __slots__ = ("pair_bias", "attention", "spatial")
+
+    def __init__(self) -> None:
+        self.pair_bias = False
+        self.attention = False
+        self.spatial = False
+
+    def set_scopes(self, scopes: tuple[str, ...] | list[str]) -> None:
+        unknown = set(scopes).difference(ACTIVATION_CHECKPOINT_SCOPES)
+        if unknown:
+            raise ValueError(
+                f"activation checkpoint scopes must be among {ACTIVATION_CHECKPOINT_SCOPES}, got {sorted(unknown)}"
+            )
+        self.pair_bias = "pair-bias" in scopes
+        self.attention = "attention" in scopes
+        self.spatial = "spatial" in scopes
+
+    @property
+    def scopes(self) -> tuple[str, ...]:
+        flags = (self.pair_bias, self.attention, self.spatial)
+        return tuple(scope for scope, enabled in zip(ACTIVATION_CHECKPOINT_SCOPES, flags, strict=True) if enabled)
+
+    @staticmethod
+    def recording(reference: Tensor) -> bool:
+        """True when a checkpoint would save memory: grad mode on, not capturing a CUDA Graph."""
+
+        if not torch.is_grad_enabled():
+            return False
+        return not (reference.is_cuda and torch.cuda.is_current_stream_capturing())
+
+
+def checkpointed(function: Callable[..., Tensor], *arguments: object) -> Tensor:
+    """Exact recompute-in-backward call (the model has no randomness to replay)."""
+
+    return _torch_checkpoint(function, *arguments, use_reentrant=False, preserve_rng_state=False)
+
+
 def mlp(*dimensions: int, layer_norm: bool = False) -> nn.Sequential:
     modules: list[nn.Module] = []
     for index, (source, target) in enumerate(zip(dimensions, dimensions[1:])):
@@ -42,6 +103,23 @@ def mlp(*dimensions: int, layer_norm: bool = False) -> nn.Sequential:
             if layer_norm:
                 modules.append(nn.LayerNorm(target))
     return nn.Sequential(*modules)
+
+
+# Additive categorical embeddings share a LayerNorm with Linear projections
+# whose outputs have RMS ~0.1 at initialization.  PyTorch's N(0, 1) default
+# would drown those semantic terms, so type/owner/form embeddings start small.
+SMALL_EMBEDDING_STD = 0.05
+
+
+def small_embedding(num_embeddings: int, embedding_dim: int, *, padding_idx: int | None = None) -> nn.Embedding:
+    """``nn.Embedding`` initialized N(0, 0.05) with a zero padding row."""
+
+    embedding = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
+    nn.init.normal_(embedding.weight, std=SMALL_EMBEDDING_STD)
+    if padding_idx is not None:
+        with torch.no_grad():
+            embedding.weight[padding_idx].zero_()
+    return embedding
 
 
 def masked_logits(logits: Tensor, mask: Tensor, *, validate: bool = True) -> Tensor:
@@ -291,7 +369,7 @@ class GlobalCardEncoder(nn.Module):
         self.id_embedding = nn.Embedding(catalog.vocab_size, config.card_semantic_dim)
         self.static_encoder = mlp(config.card_static_dim, config.card_semantic_dim, config.card_semantic_dim)
         self.mechanic_encoder = mlp(config.card_mechanic_dim, config.card_semantic_dim, config.card_semantic_dim)
-        self.form_embedding = nn.Embedding(config.form_type_count, config.card_semantic_dim)
+        self.form_embedding = small_embedding(config.form_type_count, config.card_semantic_dim)
         self.mechanic_profile = nn.Linear(config.mechanic_profile_dim, config.card_semantic_dim)
         self.id_gate = mlp(2 * config.card_semantic_dim, config.card_semantic_dim, 1)
         self.output_norm = nn.LayerNorm(config.card_semantic_dim)
@@ -315,6 +393,12 @@ class GlobalCardEncoder(nn.Module):
             )
         )
         gate = torch.sigmoid(self.id_gate(torch.cat((static_memory, mechanic_memory), dim=-1)))
+        # Fixed-gate ablations multiply the learned gate by zero so its
+        # parameters stay in the autograd graph for DDP.
+        if self.config.card_id_gate == "zero":
+            gate = gate * 0.0
+        elif self.config.card_id_gate == "one":
+            gate = gate * 0.0 + 1.0
         result = self.output_norm(generic + gate * self.id_embedding(card_vocab_id))
         return result * (card_vocab_id != PAD_CARD_VOCAB_ID).unsqueeze(-1)
 
@@ -329,9 +413,9 @@ class LocalChildSetEncoder(nn.Module):
         self.config = config
         self.card_encoder = card_encoder
         width = config.child_dim
-        self.archetype_embedding = nn.Embedding(config.child_archetype_count, width)
-        self.child_type_embedding = nn.Embedding(config.child_type_count, width)
-        self.owner_embedding = nn.Embedding(config.owner_type_count, width)
+        self.archetype_embedding = small_embedding(config.child_archetype_count, width)
+        self.child_type_embedding = small_embedding(config.child_type_count, width)
+        self.owner_embedding = small_embedding(config.owner_type_count, width)
         self.source_card = nn.Linear(config.card_semantic_dim, width)
         self.archetype_mechanics = nn.Linear(config.mechanic_profile_dim, width)
         self.id_gate = nn.Linear(2 * width, 1)
@@ -388,8 +472,8 @@ class BattleGroupEncoder(nn.Module):
         super().__init__()
         self.card_encoder = card_encoder
         self.features = mlp(config.group_feature_dim, 128, 128)
-        self.group_type = nn.Embedding(config.group_type_count, 128)
-        self.owner_type = nn.Embedding(config.owner_type_count, 128)
+        self.group_type = small_embedding(config.group_type_count, 128)
+        self.owner_type = small_embedding(config.owner_type_count, 128)
         input_width = config.card_semantic_dim + 128 + config.local_pool_slots * config.child_dim
         self.output = mlp(input_width, config.group_dim, config.group_dim)
         self.norm = nn.LayerNorm(config.group_dim)
@@ -419,7 +503,7 @@ class CardTokenEncoder(nn.Module):
         self.card_encoder = card_encoder
         self.runtime = mlp(config.card_runtime_feature_dim, 128, config.token_dim)
         self.role = nn.Linear(2, config.token_dim)
-        self.owner = nn.Embedding(config.owner_type_count, config.token_dim)
+        self.owner = small_embedding(config.owner_type_count, config.token_dim)
         self.card = nn.Linear(config.card_semantic_dim, config.token_dim)
         self.norm = nn.LayerNorm(config.token_dim)
 
@@ -438,10 +522,29 @@ class TowerEncoder(nn.Module):
     def __init__(self, config: ModelConfigV4, mechanic_catalog: MechanicProfileCatalogV1) -> None:
         super().__init__()
         self.feature = mlp(config.tower_feature_dim, 128, config.token_dim)
+        # Geometry is normalized to [0, 1] board units before this projection;
+        # a small zero-bias init keeps it on the scale of the feature term.
         self.position = nn.Linear(6, config.token_dim)
-        self.tower_type = nn.Embedding(config.tower_type_count, config.token_dim)
-        self.tower_troop_type = nn.Embedding(config.tower_troop_type_count, config.token_dim, padding_idx=0)
-        self.owner_type = nn.Embedding(config.owner_type_count, config.token_dim)
+        nn.init.normal_(self.position.weight, std=0.1)
+        nn.init.zeros_(self.position.bias)
+        self.register_buffer(
+            "geometry_scale",
+            torch.tensor(
+                (
+                    config.board_width,
+                    config.board_height,
+                    config.board_width,
+                    config.board_height,
+                    config.board_width,
+                    config.board_height,
+                ),
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.tower_type = small_embedding(config.tower_type_count, config.token_dim)
+        self.tower_troop_type = small_embedding(config.tower_troop_type_count, config.token_dim, padding_idx=0)
+        self.owner_type = small_embedding(config.owner_type_count, config.token_dim)
         self.mechanic_profile = nn.Linear(config.mechanic_profile_dim, config.token_dim)
         self.active_effects = nn.Linear(config.effect_dim, config.token_dim)
         self.register_buffer(
@@ -452,7 +555,7 @@ class TowerEncoder(nn.Module):
         self.norm = nn.LayerNorm(config.token_dim)
 
     def forward(self, towers: TowerSetV4, *, profile_memory: Tensor, active_effect_memory: Tensor) -> Tensor:
-        geometry = torch.cat((towers.position, towers.extent), dim=-1)
+        geometry = torch.cat((towers.position, towers.extent), dim=-1) / self.geometry_scale.to(towers.position.dtype)
         result = self.norm(
             self.feature(towers.features)
             + self.position(geometry)
@@ -582,6 +685,52 @@ def spatial_pair_features(position: Tensor, extent: Tensor, spatial_mask: Tensor
     return result.mul_(both.unsqueeze(-1))
 
 
+@dataclass(slots=True)
+class SpatialPairInputsV4:
+    """Pair features of the spatial-capable attention rows only.
+
+    Only towers and battle groups can carry ``spatial_mask``; the STATE token
+    and the own/opponent card rows never do (``assemble_global_tokens``), and
+    ``spatial_pair_features`` zeroes every pair that is not spatial x spatial.
+    All those pairs therefore see the pair-bias MLP of an all-zero feature
+    vector, a per-head constant.  ``features`` holds the ``[B,S,S,P]`` block of
+    the S = towers + groups rows (S x S instead of N x N MLP rows); ``index``
+    maps each of the N attention rows to its row in that block, or to ``S``
+    for a non-spatial row (the constant).
+    """
+
+    features: Tensor
+    index: Tensor
+
+
+def spatial_pair_inputs(
+    inputs: GlobalTokenInputs, config: ModelConfigV4, *, leading_rows: int = 1
+) -> SpatialPairInputsV4:
+    """``SpatialPairInputsV4`` for ``leading_rows`` non-spatial rows (STATE) followed by ``inputs``' tokens.
+
+    Uses shapes only (no data-dependent host work), so it is CUDA Graph safe.
+    """
+
+    tower_count = inputs.own_start
+    group_start = inputs.group_start
+    group_end = group_start + inputs.group_count
+    pair = spatial_pair_features(
+        torch.cat((inputs.position[:, :tower_count], inputs.position[:, group_start:group_end]), dim=1),
+        torch.cat((inputs.extent[:, :tower_count], inputs.extent[:, group_start:group_end]), dim=1),
+        torch.cat((inputs.spatial_mask[:, :tower_count], inputs.spatial_mask[:, group_start:group_end]), dim=1),
+        config,
+    )
+    spatial_count = tower_count + inputs.group_count
+    row_count = leading_rows + int(inputs.tokens.shape[1])
+    device = inputs.tokens.device
+    index = torch.full((row_count,), spatial_count, dtype=torch.long, device=device)
+    index[leading_rows : leading_rows + tower_count] = torch.arange(tower_count, device=device)
+    index[leading_rows + group_start : leading_rows + group_end] = torch.arange(
+        tower_count, spatial_count, device=device
+    )
+    return SpatialPairInputsV4(features=pair, index=index)
+
+
 class SparseRelationAttentionBlock(nn.Module):
     """Pre-norm attention with additive multi-relation and spatial bias."""
 
@@ -596,6 +745,28 @@ class SparseRelationAttentionBlock(nn.Module):
         self.spatial_bias = mlp(config.spatial_pair_dim, 32, config.attention_heads)
         self.norm2 = nn.LayerNorm(config.token_dim)
         self.ffn = mlp(config.token_dim, config.transformer_ffn_dim, config.token_dim)
+        self.ablate_relation_bias = config.ablate_relation_bias
+        self.ablate_spatial_pair_bias = config.ablate_spatial_pair_bias
+        # Replaced by the owning model's shared switches; a plain attribute,
+        # so it never enters the state dict.
+        self.checkpointing = ActivationCheckpointingV4()
+
+    def _spatial_pair_bias(self, pair_features: Tensor, pair_index: Tensor) -> Tensor:
+        """``[B,H,N,N]`` spatial bias from the ``[B,S,S,P]`` spatial block (see ``SpatialPairInputsV4``).
+
+        Equals the MLP over the full ``[B,N,N,P]`` pair grid: every pair
+        outside the block has all-zero features, whose output is the constant
+        ``MLP(0)``, gathered here from an extra row/column ``S``.
+        """
+
+        batch, spatial_count = int(pair_features.shape[0]), int(pair_features.shape[1])
+        block = self.spatial_bias(pair_features)
+        heads = int(block.shape[-1])
+        constant = self.spatial_bias(pair_features.new_zeros(1, int(pair_features.shape[-1]))).to(block.dtype)
+        constant = constant.view(1, 1, 1, heads)
+        extended = torch.cat((block, constant.expand(batch, spatial_count, 1, heads)), dim=2)
+        extended = torch.cat((extended, constant.expand(batch, 1, spatial_count + 1, heads)), dim=1)
+        return extended.index_select(1, pair_index).index_select(2, pair_index).permute(0, 3, 1, 2)
 
     def _sparse_bias(self, edges: RelationEdgesV4, *, token_count: int, dtype: torch.dtype) -> Tensor:
         batch, edge_count = edges.mask.shape
@@ -608,22 +779,35 @@ class SparseRelationAttentionBlock(nn.Module):
         flat_index = batch_index * token_count * token_count + source * token_count + target
         flat = torch.zeros(batch * token_count * token_count, self.heads, device=values.device, dtype=dtype)
         if edge_count:
-            if values.is_cuda and torch.cuda.is_current_stream_capturing():
-                # Boolean advanced indexing emits a data-dependent ``nonzero``
-                # allocation. During graph capture, add fixed masked rows;
-                # padded addresses are contractually zero and therefore neutral.
-                flat.index_add_(
-                    0,
-                    flat_index.reshape(-1),
-                    (values * edges.mask.unsqueeze(-1).to(values.dtype)).reshape(-1, self.heads),
-                )
-            else:
-                # Preserve the established eager/training kernel and numerical
-                # path outside the dedicated live CUDA Graph capture.
-                flat.index_add_(0, flat_index[edges.mask], values[edges.mask])
+            # Fixed masked rows instead of boolean indexing: no data-dependent
+            # ``nonzero`` (no host sync, CUDA Graph capture safe).  Padded
+            # edges carry canonical in-range addresses and add exact zeros.
+            flat.index_add_(
+                0,
+                flat_index.reshape(-1),
+                (values * edges.mask.unsqueeze(-1).to(values.dtype)).reshape(-1, self.heads),
+            )
         return flat.view(batch, token_count, token_count, self.heads).permute(0, 3, 1, 2)
 
-    def forward(self, tokens: Tensor, token_mask: Tensor, edges: RelationEdgesV4, pair_features: Tensor) -> Tensor:
+    def forward(
+        self, tokens: Tensor, token_mask: Tensor, edges: RelationEdgesV4, pair: SpatialPairInputsV4
+    ) -> Tensor:
+        flags = self.checkpointing
+        if (flags.attention or flags.pair_bias) and flags.recording(tokens):
+            if flags.attention:
+                return checkpointed(self._attend, tokens, token_mask, edges, pair.features, pair.index, False)
+            return self._attend(tokens, token_mask, edges, pair.features, pair.index, True)
+        return self._attend(tokens, token_mask, edges, pair.features, pair.index, False)
+
+    def _attend(
+        self,
+        tokens: Tensor,
+        token_mask: Tensor,
+        edges: RelationEdgesV4,
+        pair_features: Tensor,
+        pair_index: Tensor,
+        checkpoint_pair_bias: bool,
+    ) -> Tensor:
         batch, count, width = tokens.shape
         normalized = self.norm1(tokens)
         query, key, value = self.qkv(normalized).chunk(3, dim=-1)
@@ -634,12 +818,25 @@ class SparseRelationAttentionBlock(nn.Module):
         query = split_heads(query)
         key = split_heads(key)
         value = split_heads(value)
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        scores = scores + self._sparse_bias(edges, token_count=count, dtype=scores.dtype)
-        scores = scores + self.spatial_bias(pair_features).permute(0, 3, 1, 2)
-        scores = scores.masked_fill(~token_mask[:, None, None, :], torch.finfo(scores.dtype).min)
-        weights = torch.softmax(scores, dim=-1)
-        attended = torch.matmul(weights, value)
+        relation_bias = self._sparse_bias(edges, token_count=count, dtype=query.dtype)
+        if self.ablate_relation_bias:
+            # Multiply instead of skipping so the embedding stays in the graph.
+            relation_bias = relation_bias * 0.0
+        # The [B,S,S,32] hidden of this per-layer MLP is the largest saved
+        # activation of the model; under ``pair-bias`` only its input (the
+        # shared pair features) is kept and the MLP reruns in backward.
+        spatial_bias = (
+            checkpointed(self._spatial_pair_bias, pair_features, pair_index)
+            if checkpoint_pair_bias
+            else self._spatial_pair_bias(pair_features, pair_index)
+        )
+        if self.ablate_spatial_pair_bias:
+            spatial_bias = spatial_bias * 0.0
+        bias = (relation_bias + spatial_bias).to(query.dtype)
+        bias = bias.masked_fill(~token_mask[:, None, None, :], torch.finfo(bias.dtype).min)
+        # softmax(QK^T / sqrt(d) + bias) V in one fused kernel (CUDA: the
+        # memory-efficient kernel, fp32 softmax); gradients reach the bias.
+        attended = nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=bias)
         attended = attended.transpose(1, 2).contiguous().view(batch, count, width)
         tokens = tokens + self.output(attended) * token_mask.unsqueeze(-1)
         tokens = tokens + self.ffn(self.norm2(tokens)) * token_mask.unsqueeze(-1)
@@ -654,26 +851,28 @@ class RelationTransformerV4(nn.Module):
         nn.init.normal_(self.state_token, std=0.02)
         self.blocks = nn.ModuleList(SparseRelationAttentionBlock(config) for _ in range(config.transformer_layers))
         self.output_norm = nn.LayerNorm(config.token_dim)
+        # Zero-layer ablation: the STATE token cannot attend, so it becomes a
+        # projection of the masked mean input token.  Built only when used.
+        self.pool_projection = nn.Linear(config.token_dim, config.token_dim) if not config.transformer_layers else None
 
     def forward(
         self, inputs: GlobalTokenInputs, edges: RelationEdgesV4
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         batch = inputs.tokens.shape[0]
         state = self.state_token.expand(batch, -1, -1)
-        tokens = torch.cat((state, inputs.tokens), dim=1)
         token_mask = torch.cat((torch.ones(batch, 1, dtype=torch.bool, device=inputs.mask.device), inputs.mask), dim=1)
-        zero_position = torch.zeros(batch, 1, 2, dtype=inputs.position.dtype, device=inputs.position.device)
-        zero_extent = torch.zeros(batch, 1, 4, dtype=inputs.extent.dtype, device=inputs.extent.device)
-        zero_spatial = torch.zeros(batch, 1, dtype=torch.bool, device=inputs.spatial_mask.device)
-        pair = spatial_pair_features(
-            torch.cat((zero_position, inputs.position), dim=1),
-            torch.cat((zero_extent, inputs.extent), dim=1),
-            torch.cat((zero_spatial, inputs.spatial_mask), dim=1),
-            self.config,
-        )
-        for block in self.blocks:
-            tokens = block(tokens, token_mask, edges, pair)
-        tokens = self.output_norm(tokens)
+        if self.pool_projection is not None:
+            weights = inputs.mask.unsqueeze(-1).to(inputs.tokens.dtype)
+            pooled = (inputs.tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+            state = state + self.pool_projection(pooled).unsqueeze(1)
+            tokens = self.output_norm(torch.cat((state, inputs.tokens), dim=1))
+        else:
+            tokens = torch.cat((state, inputs.tokens), dim=1)
+            # The STATE row is non-spatial (zero position/extent, mask False).
+            pair = spatial_pair_inputs(inputs, self.config, leading_rows=1)
+            for block in self.blocks:
+                tokens = block(tokens, token_mask, edges, pair)
+            tokens = self.output_norm(tokens)
         own_start = 1 + inputs.own_start
         group_start = 1 + inputs.group_start
         return (
@@ -702,6 +901,31 @@ class ResidualSpatialBlock(nn.Module):
         return inputs + self.conv2(residual)
 
 
+class _CoverageScatter(torch.autograd.Function):
+    """``einsum("bcyx,bck->bkyx", coverage, values)`` as ``[B,K,H*W]``, saving the bool coverage.
+
+    Autograd of the plain einsum would keep a ``values.dtype`` copy of the
+    dense ``[B,C,H,W]`` coverage for backward; this keeps the 1-byte mask and
+    computes the same products (forward and backward in ``values.dtype``).
+    """
+
+    @staticmethod
+    def forward(ctx: object, coverage: Tensor, values: Tensor) -> Tensor:  # type: ignore[override]
+        with torch.autocast(device_type=values.device.type, enabled=False):
+            flat = coverage.flatten(2).to(values.dtype)
+            output = torch.bmm(values.transpose(1, 2), flat)
+        ctx.save_for_backward(coverage)  # type: ignore[attr-defined]
+        return output
+
+    @staticmethod
+    def backward(ctx: object, grad_output: Tensor) -> tuple[None, Tensor]:  # type: ignore[override]
+        (coverage,) = ctx.saved_tensors  # type: ignore[attr-defined]
+        with torch.autocast(device_type=grad_output.device.type, enabled=False):
+            flat = coverage.flatten(2).to(grad_output.dtype)
+            grad_values = torch.bmm(flat, grad_output.transpose(1, 2))
+        return None, grad_values
+
+
 class SpatialScatterEncoder(nn.Module):
     """Bilinear child scatter plus an exact-resolution spatial ResNet."""
 
@@ -715,23 +939,16 @@ class SpatialScatterEncoder(nn.Module):
             *(ResidualSpatialBlock(config.spatial_hidden_channels) for _ in range(config.spatial_res_blocks))
         )
         self.summary = mlp(2 * config.spatial_hidden_channels, config.spatial_summary_dim, config.spatial_summary_dim)
+        self.checkpointing = ActivationCheckpointingV4()
 
-    def scatter(
-        self,
-        child_memory: Tensor,
-        child_position: Tensor,
-        child_extent: Tensor,
-        child_radius: Tensor,
-        child_mask: Tensor,
-    ) -> Tensor:
+    def _point_scatter(self, values: Tensor, child_position: Tensor, point_mask: Tensor) -> Tensor:
         config = self.config
-        values = self.child_value(child_memory)
-        extent_width = child_extent[..., 2] - child_extent[..., 0]
-        extent_height = child_extent[..., 3] - child_extent[..., 1]
-        shaped = child_mask & ((child_radius > 0.0) | (extent_width > 0.0) | (extent_height > 0.0))
-        point_mask = child_mask & ~shaped
-        x = child_position[..., 0].clamp(0.0, config.board_width - 1.0)
-        y = child_position[..., 1].clamp(0.0, config.board_height - 1.0)
+        # Positions are tile units and cell i covers [i, i+1), so cell centres
+        # sit at i + 0.5.  Bilinear weights are relative to those centres; a
+        # unit at a cell centre lands entirely in that cell, and units within
+        # half a tile of the border keep all their weight on the board.
+        x = (child_position[..., 0] - 0.5).clamp(0.0, config.board_width - 1.0)
+        y = (child_position[..., 1] - 0.5).clamp(0.0, config.board_height - 1.0)
         x0 = torch.floor(x).to(torch.long)
         y0 = torch.floor(y).to(torch.long)
         x1 = (x0 + 1).clamp_max(config.board_width - 1)
@@ -752,59 +969,47 @@ class SpatialScatterEncoder(nn.Module):
                 values * weight.to(values.dtype).unsqueeze(-1) * point_mask.unsqueeze(-1).to(values.dtype)
             ).transpose(1, 2)
             output.scatter_add_(2, flat_index[:, None, :].expand(-1, config.learned_scatter_channels, -1), source)
-        result = output.view(values.shape[0], config.learned_scatter_channels, config.board_height, config.board_width)
+        return output.view(values.shape[0], config.learned_scatter_channels, config.board_height, config.board_width)
+
+    def scatter(
+        self,
+        child_memory: Tensor,
+        child_position: Tensor,
+        child_extent: Tensor,
+        child_radius: Tensor,
+        child_mask: Tensor,
+    ) -> Tensor:
+        config = self.config
+        values = self.child_value(child_memory)
+        extent_width = child_extent[..., 2] - child_extent[..., 0]
+        extent_height = child_extent[..., 3] - child_extent[..., 1]
+        shaped = child_mask & ((child_radius > 0.0) | (extent_width > 0.0) | (extent_height > 0.0))
         cell_x = torch.arange(config.board_width, device=values.device, dtype=values.dtype) + 0.5
         cell_y = torch.arange(config.board_height, device=values.device, dtype=values.dtype) + 0.5
-        grid_y, grid_x = torch.meshgrid(cell_y, cell_x, indexing="ij")
-        if not (values.is_cuda and torch.cuda.is_current_stream_capturing()):
-            shaped_entries = shaped.nonzero(as_tuple=False)
-            shaped_batch = shaped_entries[:, 0]
-            shaped_child = shaped_entries[:, 1]
-            shaped_position = child_position[shaped_batch, shaped_child]
-            shaped_extent = child_extent[shaped_batch, shaped_child]
-            shaped_radius = child_radius[shaped_batch, shaped_child]
-            circle = (grid_x[None] - shaped_position[:, 0, None, None]).square() + (
-                grid_y[None] - shaped_position[:, 1, None, None]
-            ).square() <= shaped_radius[:, None, None].square() + 1e-6
-            rectangle = (
-                (grid_x[None] >= shaped_extent[:, 0, None, None])
-                & (grid_x[None] < shaped_extent[:, 2, None, None])
-                & (grid_y[None] >= shaped_extent[:, 1, None, None])
-                & (grid_y[None] < shaped_extent[:, 3, None, None])
-            )
-            coverage = torch.where((shaped_radius > 0.0)[:, None, None], circle, rectangle)
-            covered_cells = coverage.nonzero(as_tuple=False)
-            shaped_row = covered_cells[:, 0]
-            covered_batch = shaped_batch[shaped_row]
-            covered_child = shaped_child[shaped_row]
-            flat_cell = (
-                covered_batch * config.board_height * config.board_width
-                + covered_cells[:, 1] * config.board_width
-                + covered_cells[:, 2]
-            )
-            coverage_output = values.new_zeros(
-                values.shape[0] * config.board_height * config.board_width, config.learned_scatter_channels
-            )
-            coverage_output.index_add_(0, flat_cell, values[covered_batch, covered_child])
-            coverage_output = coverage_output.view(
-                values.shape[0], config.board_height, config.board_width, config.learned_scatter_channels
-            ).permute(0, 3, 1, 2)
-            return result + coverage_output
-
-        # CUDA Graph capture needs a fixed [B,C,H,W] coverage tensor instead
-        # of the established data-dependent sparse eager path above.
-        circle = (grid_x[None, None] - child_position[..., 0, None, None]).square() + (
-            grid_y[None, None] - child_position[..., 1, None, None]
-        ).square() <= child_radius[..., None, None].square() + 1e-6
+        # Fixed [B,C,H,W] coverage (no data-dependent ``nonzero``: no host
+        # sync, CUDA Graph capture safe).  The circle and rectangle tests are
+        # evaluated separably per axis and broadcast once; every cell sees the
+        # same arithmetic as the dense ``(gx-px)^2 + (gy-py)^2 <= r^2 + 1e-6``.
+        dx2 = (cell_x[None, None, None, :] - child_position[..., 0, None, None]).square()
+        dy2 = (cell_y[None, None, :, None] - child_position[..., 1, None, None]).square()
+        circle = dx2 + dy2 <= child_radius[..., None, None].square() + 1e-6
         rectangle = (
-            (grid_x[None, None] >= child_extent[..., 0, None, None])
-            & (grid_x[None, None] < child_extent[..., 2, None, None])
-            & (grid_y[None, None] >= child_extent[..., 1, None, None])
-            & (grid_y[None, None] < child_extent[..., 3, None, None])
+            (cell_x[None, None, None, :] >= child_extent[..., 0, None, None])
+            & (cell_x[None, None, None, :] < child_extent[..., 2, None, None])
+        ) & (
+            (cell_y[None, None, :, None] >= child_extent[..., 1, None, None])
+            & (cell_y[None, None, :, None] < child_extent[..., 3, None, None])
         )
         coverage = torch.where((child_radius > 0.0)[..., None, None], circle, rectangle) & shaped[..., None, None]
-        coverage_output = torch.einsum("bcyx,bck->bkyx", coverage.to(values.dtype), values)
-        return result + coverage_output
+        del dx2, dy2, circle, rectangle
+        coverage_output = _CoverageScatter.apply(coverage, values).view(
+            values.shape[0], config.learned_scatter_channels, config.board_height, config.board_width
+        )
+        # A small shape can cover no cell centre (e.g. r <= 0.707); such an
+        # entity falls back to the point scatter instead of vanishing.
+        uncovered = shaped & ~coverage.flatten(2).any(dim=-1)
+        point_mask = child_mask & (~shaped | uncovered)
+        return self._point_scatter(values, child_position, point_mask) + coverage_output
 
     def coordinate_planes(self, reference: Tensor) -> Tensor:
         config = self.config
@@ -825,7 +1030,14 @@ class SpatialScatterEncoder(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         learned = self.scatter(child_memory, child_position, child_extent, child_radius, child_mask)
         coordinates = self.coordinate_planes(explicit_planes).unsqueeze(0).expand(explicit_planes.shape[0], -1, -1, -1)
-        spatial = self.blocks(self.input(torch.cat((explicit_planes, learned, coordinates), dim=1)))
+        spatial = self.input(torch.cat((explicit_planes, learned, coordinates), dim=1))
+        if self.checkpointing.spatial and self.checkpointing.recording(spatial):
+            # Same blocks in the same order as ``self.blocks(spatial)``; each
+            # keeps only its [B,C,H,W] input and reruns in backward.
+            for block in self.blocks:
+                spatial = checkpointed(block, spatial)
+        else:
+            spatial = self.blocks(spatial)
         average = spatial.mean(dim=(2, 3))
         maximum = spatial.amax(dim=(2, 3))
         return spatial, self.summary(torch.cat((average, maximum), dim=-1))
@@ -835,8 +1047,8 @@ class EventSetEncoder(nn.Module):
     def __init__(self, config: ModelConfigV4, card_encoder: GlobalCardEncoder) -> None:
         super().__init__()
         self.card_encoder = card_encoder
-        self.event_type = nn.Embedding(config.event_type_count, 128)
-        self.owner_type = nn.Embedding(config.owner_type_count, 128)
+        self.event_type = small_embedding(config.event_type_count, 128)
+        self.owner_type = small_embedding(config.owner_type_count, 128)
         self.card = nn.Linear(config.card_semantic_dim, 128)
         self.source_group = nn.Linear(config.group_dim, 128)
         self.target_token = nn.Linear(config.token_dim, 128)

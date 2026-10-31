@@ -104,6 +104,8 @@ bool install_inline_hook(
 }
 
 bool read_combat_object_vector(void*, void***, std::int32_t*) { return false; }
+bool g_live_capture_delta_active = false;
+std::uint64_t g_live_capture_visibility_from_sequence = 1;
 
 #include "visibility_runtime_telemetry.inc"
 

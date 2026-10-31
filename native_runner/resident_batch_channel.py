@@ -18,6 +18,7 @@ from .cr_native_env import (
     RunnerError,
     _validate_atomic_observation,
 )
+from . import training_capture_audit
 from .training_capture import TrainingAtomicCaptureV1, TrainingCaptureError, decode_training_capture
 
 
@@ -124,6 +125,9 @@ class ResidentBatchChannelV1:
         self._sequence = 0
         self._phase_validation_identity: dict[int, tuple[int, int]] = {}
         self._phase_validation_next_sequence: dict[int, int] = {}
+        # Compact captures may carry only the events since the previous capture of the
+        # same match (CRTF v5 ring deltas); per env and ring: identity, epoch and next.
+        self._compact_ring_cursors: dict[int, dict[str, tuple[int, int, int, int]]] = {}
         self._profile: dict[str, int] = {
             "connect_ns": 0,
             "batches": 0,
@@ -349,7 +353,14 @@ class ResidentBatchChannelV1:
                         raise RunnerError("resident batch decompressed entry exceeds 16 MiB")
                 self._profile["decoded_response_bytes"] += len(payload)
                 if self.training_capture and payload.startswith(b"CRTF"):
+                    audit = training_capture_audit.auditor()
+                    audit_json = None
+                    if audit is not None:
+                        payload, audit_json = training_capture_audit.split_audit_payload(payload)
                     capture: dict[str, Any] | TrainingAtomicCaptureV1 = decode_training_capture(payload)
+                    if audit is not None and audit_json is not None:
+                        audit.record(env_id, capture.ordinary, capture.snapshot, audit_json)
+                    self._check_compact_ring_continuity(env_id, capture)
                     raw: object = capture.ordinary
                 else:
                     raw = orjson.loads(payload)
@@ -390,6 +401,7 @@ class ResidentBatchChannelV1:
             except (RunnerError, TrainingCaptureError, orjson.JSONDecodeError, zlib.error) as error:
                 self._phase_validation_identity.pop(env_id, None)
                 self._phase_validation_next_sequence.pop(env_id, None)
+                self._compact_ring_cursors.pop(env_id, None)
                 failure = (
                     error
                     if isinstance(error, RunnerError)
@@ -422,6 +434,42 @@ class ResidentBatchChannelV1:
                 raise outcome.error
             results[env_id] = outcome
         return results
+
+    def _check_compact_ring_continuity(self, env_id: int, capture: TrainingAtomicCaptureV1) -> None:
+        """Fail closed if a delta capture skipped events after the previous capture."""
+
+        snapshot = capture.snapshot
+        rings = {}
+        for name, envelope in (
+            ("phase", snapshot.phase_runtime),
+            ("visibility", snapshot.visibility_runtime),
+            ("remaining", snapshot.remaining_runtime),
+        ):
+            if envelope is None:
+                continue
+            window = envelope.window if name == "phase" else envelope
+            rings[name] = (
+                envelope.generation,
+                envelope.state_epoch,
+                window.epoch_first_sequence,
+                window.next_sequence,
+                envelope.events[0].sequence if envelope.events else window.next_sequence,
+            )
+        previous = self._compact_ring_cursors.get(env_id, {})
+        for name, (generation, state_epoch, epoch_first, next_sequence, covered_from) in rings.items():
+            prior = previous.get(name)
+            if prior is None or prior[:3] != (generation, state_epoch, epoch_first):
+                continue
+            prior_next = prior[3]
+            if next_sequence < prior_next or covered_from > prior_next:
+                self._compact_ring_cursors.pop(env_id, None)
+                raise TrainingCaptureError(
+                    f"compact {name} ring delta skipped events: covered from {covered_from}, "
+                    f"previous capture ended at {prior_next}"
+                )
+        self._compact_ring_cursors[env_id] = {
+            name: values[:4] for name, values in rings.items()
+        }
 
     @property
     def last_request_ack_ns(self) -> int:

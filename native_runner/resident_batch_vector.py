@@ -8,6 +8,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 from .cr_native_env import (
+    COMMAND_EXECUTION_DELAY_TICKS,
     FIRST_PLAYABLE_TICK,
     AbilityAction,
     HandAction,
@@ -221,6 +222,7 @@ class ResidentBatchNativeProxyV1:
     """NativeClashEnv-compatible facade backed by a batch coordinator."""
 
     resident_event_rings_rebind_on_switch = True
+    simulated_command_delay_ticks = COMMAND_EXECUTION_DELAY_TICKS
 
     def __init__(self, native: ResidentNativeClashEnv, coordinator: ResidentBatchCoordinatorV1) -> None:
         if native not in coordinator.natives:

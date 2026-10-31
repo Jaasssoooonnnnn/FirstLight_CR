@@ -2,7 +2,7 @@
 
 [English home](../README.md) · [Models](../checkpoints/README.md) · [Training commands](training.md)
 
-FirstLight CR developed through five main models: **IL, Active IL, General, Hog 2.6 specialist 1, and Hog 2.6 specialist 2**. The work involved learning to start a battle, finding useful opponents, and balancing a recognizable Hog Cycle playstyle with winning. Early high win rates against a passive IL opponent initially obscured those problems.
+FirstLight CR developed through five main models: **IL, Active IL, General, Hog 2.6 specialist 1, and Hog 2.6 specialist 2**. They are kept on the `main` branch; this page records how they were made. Everlight, the model on this branch, is described in the [model guide](../checkpoints/README.md). The work involved learning to start a battle, finding useful opponents, and balancing a recognizable Hog Cycle playstyle with winning. Early high win rates against a passive IL opponent initially obscured those problems.
 
 ## Five main models
 
@@ -13,8 +13,8 @@ The descriptions below summarize the author's hands-on observations across decks
 | **IL** | Human-like play across decks, but modest overall strength | Imitation-learning foundation |
 | **Active IL** | More proactive; better with expensive decks, but cheap-deck play regressed | A more active opponent for subsequent PPO |
 | **General** | Stronger with cheap decks; expensive-deck play is more ordinary | General-purpose RL model and the specialist's starting point |
-| **[Hog 2.6 specialist 1](../checkpoints/2_6hog_expert/hog26-specialist1.pt)** | The more proactive Hog specialist | Specialist developed with demonstrations and Hog-specific shaping |
-| **[Hog 2.6 specialist 2](../checkpoints/2_6hog_expert/hog26-specialist2.pt)** | The more passive Hog specialist, with stronger measured match results | Final main specialist after removing Hog-specific shaping |
+| **[Hog 2.6 specialist 1](https://github.com/Jaasssoooonnnnn/FirstLight_CR/blob/main/checkpoints/2_6hog_expert/hog26-specialist1.pt)** | The more proactive Hog specialist | Specialist developed with demonstrations and Hog-specific shaping |
+| **[Hog 2.6 specialist 2](https://github.com/Jaasssoooonnnnn/FirstLight_CR/blob/main/checkpoints/2_6hog_expert/hog26-specialist2.pt)** | The more passive Hog specialist, with stronger measured match results | Final main specialist after removing Hog-specific shaping |
 
 “More proactive” is a comparison between these specialists. Hog 2.6 specialist 1 can still wait for the opponent under argmax decoding; it did not eliminate passive openings in every matchup.
 

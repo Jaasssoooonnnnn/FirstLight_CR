@@ -375,12 +375,12 @@ def test_renderer_schedule_rejection_masks_only_its_owner() -> None:
         11: {
             "state": "succeeded",
             "error": "none",
-            "queuedAtTick": 132,
+            "queuedAtTick": 152,
         },
         12: {
             "state": "failed",
             "error": "card-unavailable",
-            "queuedAtTick": 132,
+            "queuedAtTick": 152,
         },
     }
     status_calls: list[int] = []
@@ -393,11 +393,13 @@ def test_renderer_schedule_rejection_masks_only_its_owner() -> None:
         replay_schedule_index=0,
         replay_schedule_reconciled_index=0,
         replay_commands=(
+            # Touched at 132 inside the 130 decision row; the battle
+            # executes it 20 ticks later, observable at 153.
             SimpleNamespace(
-                kind="play_card", owner=0, request_tick=130, target_tick=133
+                kind="play_card", owner=0, request_tick=130, target_tick=153
             ),
             SimpleNamespace(
-                kind="play_card", owner=1, request_tick=130, target_tick=133
+                kind="play_card", owner=1, request_tick=130, target_tick=153
             ),
         ),
         replay_schedule_sequences=(11, 12),
@@ -410,7 +412,7 @@ def test_renderer_schedule_rejection_masks_only_its_owner() -> None:
         ),
     )
 
-    producer_module._consume_renderer_schedule(lane, through_tick=135)
+    producer_module._consume_renderer_schedule(lane, through_tick=155)
 
     assert lane.replay_schedule_index == 2
     assert status_calls == []
@@ -597,3 +599,99 @@ def test_partial_replay_gate_loss_is_limited_to_trusted_frames() -> None:
     assert result.sequences[0].valid_mask[:, 0].tolist() == [True, True, False]
     assert result.sequences[0].gate_loss_mask[:, 0].tolist() == [True, True, False]
     assert result.sequences[1].gate_loss_mask[:, 0].tolist() == [True, False, False]
+
+
+def _terminal_lane(commands: tuple[object, ...]) -> SimpleNamespace:
+    class _Frame:
+        def to_storage(self, *_args: object, **_kwargs: object) -> "_Frame":
+            return self
+
+    return SimpleNamespace(
+        current_tick=130,
+        source_end_tick=300,
+        replay_schedule_index=0,
+        replay_commands=commands,
+        replay_schedule_sequences=tuple(range(11, 11 + len(commands))),
+        executed_expert_action_count=0,
+        pending_frame_batches=(_Frame(), _Frame()),
+        pending_frame_sequences=(object(), object()),
+        pending_gate_loss=(True, True),
+        observations_by_owner=[[], []],
+        actions_by_owner=[[], []],
+        rewards_by_owner=[[], []],
+        gate_loss_rows=[[], []],
+        terminated_rows=[],
+        truncated_rows=[],
+        decision_ticks=[],
+        observations=None,
+        active=True,
+        completed=False,
+        terminal_observed=False,
+        failure_reason=None,
+        first_untrusted_tick=None,
+        winner_matches=None,
+        crowns_match=None,
+        environment=SimpleNamespace(native=object()),
+    )
+
+
+@pytest.mark.parametrize(("touch_tick", "completed"), ((133, True), (135, False)))
+def test_terminal_tolerates_only_touches_still_executing(
+    monkeypatch: object, touch_tick: int, completed: bool
+) -> None:
+    # A touch before the end executes 20 ticks later; the source battle ended
+    # before running it as well.  A touch after the end means divergence.
+    monkeypatch.setattr(producer_module, "_terminal_fidelity", lambda _lane: None)
+    target_tick = touch_tick + producer_module.ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS
+    lane = _terminal_lane((SimpleNamespace(kind="play_card", owner=0, target_tick=target_tick),))
+    observations = {0: SimpleNamespace(tick=135), 1: SimpleNamespace(tick=135)}
+
+    producer_module._accept_il_step(
+        lane,
+        (observations, {0: 0.0, 1: 0.0}, {0: True, 1: True}, {0: False, 1: False}, {}),
+        max_frames=None,
+    )
+
+    assert lane.terminal_observed is True
+    assert lane.completed is completed
+    assert lane.replay_schedule_index == 0
+
+
+def test_expert_window_is_tracked_as_pending_until_execution() -> None:
+    import torch
+
+    from native_runner.contracts import ActionV1
+    from native_runner.training.v4.expert import TimedExpertActionV4
+
+    tracked: list[tuple[ActionV1, int]] = []
+
+    def track(action: ActionV1, *, execute_native_tick: int) -> bool:
+        tracked.append((action, execute_native_tick))
+        return True
+
+    card = ActionV1.play(owner=0, hand_slot=2, grid=(8, 10), card_id=26_000_021, action_id="card")
+    ability = ActionV1(
+        owner=0,
+        kind=ActionKind.ACTIVATE_ABILITY,
+        source_entity=0,
+        action_id="ability",
+        metadata={"source_entity_inferred_at_render": True},
+    )
+    window = (
+        TimedExpertActionV4(source_tick=133, action=ability, source_index=2),
+        TimedExpertActionV4(source_tick=131, action=card, source_index=1),
+    )
+    frame = SimpleNamespace(candidates=SimpleNamespace(native_source_entity=torch.tensor([[-1, 77, -1]])))
+    sequence = SimpleNamespace(candidate_index=torch.tensor([[0, 1]]))
+    lane = SimpleNamespace(environment=SimpleNamespace(track_external_command=track))
+    offset = producer_module.ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS
+
+    producer_module._track_expert_window(lane, window, frame, sequence, label_is_usable=True)
+
+    assert [(action.action_id, tick) for action, tick in tracked] == [("card", 131 + offset), ("ability", 133 + offset)]
+    assert tracked[1][0].source_entity == 77
+
+    tracked.clear()
+    producer_module._track_expert_window(lane, window, frame, sequence, label_is_usable=False)
+    # Without an aligned label the ability source is unknown; cards still track.
+    assert [action.action_id for action, _tick in tracked] == ["card"]

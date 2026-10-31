@@ -35,6 +35,10 @@ DEFAULT_PORT = int(setting("CR_CONTROL_PORT", "26789"))
 MAX_TRANSITION_ACTIONS = 8
 FIRST_PLAYABLE_TICK = 90
 LIVE_COMMAND_AGE_TICKS = 20
+# A stock client touch at tick t is executed by the battle at t + 20: the hand
+# cycles, elixir is spent, and the unit appears only then. Online play gets
+# this delay from the server; simulated matches must add it explicitly.
+COMMAND_EXECUTION_DELAY_TICKS = LIVE_COMMAND_AGE_TICKS
 LIVE_TOUCH_MAX_FUTURE_TICKS = 100
 LIVE_TOUCH_MAX_STALE_TICKS = 20
 LIVE_TOUCH_RETRY_LEAD_TICKS = 10
@@ -162,6 +166,10 @@ CARD_FORM_LABELS = ("BasicForm", "EvoForm", "HeroForm", "AutoChessForm", "FormEn
 
 class RunnerError(RuntimeError):
     """Raised when the native runner rejects a request or is unavailable."""
+
+
+class RunnerTransportError(RunnerError):
+    """The native control connection failed; the command may not have completed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2479,6 +2487,9 @@ class AbilityAction:
 class NativeClashEnv:
     """Synchronous two-sided environment backed by the native battle engine."""
 
+    # Ticks BattleEnv adds between a policy touch and native execution.
+    simulated_command_delay_ticks = COMMAND_EXECUTION_DELAY_TICKS
+
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 10.0) -> None:
         self.host = host
         self.port = port
@@ -2559,8 +2570,9 @@ class NativeClashEnv:
 
     def _request(self, command: str, *, _read_retry_count: int = 2) -> dict[str, Any]:
         with self._lock:
+            using_persistent = self._persistent_transport_requested and self._persistent_transport_supported is not False
             try:
-                if self._persistent_transport_requested and self._persistent_transport_supported is not False:
+                if using_persistent:
                     self._ensure_persistent_transport_locked()
                     connection = self._persistent_connection
                     reader = self._persistent_reader
@@ -2590,14 +2602,17 @@ class NativeClashEnv:
                     payload = b"".join(chunks)
             except (OSError, TimeoutError, RunnerError) as error:
                 self._close_persistent_transport_locked()
-                if self._persistent_transport_supported is False:
+                if using_persistent and self._persistent_transport_supported is False:
                     return self._request(command, _read_retry_count=_read_retry_count)
                 if self._read_only_request(command) and _read_retry_count > 0:
                     time.sleep(0.002)
                     return self._request(command, _read_retry_count=_read_retry_count - 1)
                 if isinstance(error, RunnerError):
                     raise
-                raise RunnerError(f"native runner transport failed for {command!r}") from error
+                command_name = command.split(maxsplit=1)[0]
+                raise RunnerTransportError(
+                    f"native runner transport failed for {command_name!r}: {type(error).__name__}: {error}"
+                ) from error
         try:
             result = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -2870,13 +2885,13 @@ class NativeClashEnv:
             raise ValueError("native command exceeds the probe's 2 KiB limit")
         return self._request(f"inject {payload}")
 
-    def queue_hand_action_next_tick(self, action: HandAction) -> dict[str, Any]:
-        """Queue a model play for the next tick without a live-render clock race."""
+    def queue_hand_action_next_tick(self, action: HandAction, *, execute_in_ticks: int = 1) -> dict[str, Any]:
+        """Queue a model play ``execute_in_ticks`` ahead without a live-render clock race."""
 
         with self._lock:
             self.pause()
             try:
-                return self.queue_hand_action_at(action, execute_in_ticks=1)
+                return self.queue_hand_action_at(action, execute_in_ticks=execute_in_ticks)
             finally:
                 self.resume()
 

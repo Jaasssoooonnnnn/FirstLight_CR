@@ -94,24 +94,26 @@ void emit(Encoder encoder) {
     }
 }
 int main() {
-    g_combat_game_manager = reinterpret_cast<void*>(1);
-    g_combat_epoch_active = true;
-    g_combat_generation = g_phase_runtime_generation = 7;
-    g_combat_state_epoch = g_phase_runtime_state_epoch = UINT64_MAX;
+    g_combat_match->game_manager = reinterpret_cast<void*>(1);
+    g_combat_match->epoch_active = true;
+    g_combat_match->generation = g_phase_match->generation = 7;
+    g_combat_match->state_epoch = g_phase_match->state_epoch = UINT64_MAX;
     g_combat_hooks_installed = g_phase_runtime_hooks_installed = true;
     g_combat_hooks_attested = g_phase_runtime_hooks_attested = true;
     for (unsigned count = 0; count < 40; ++count) {
         for (unsigned n = 0; n < count; ++n) {
-            fill_combat(g_combat_event_ring[n].record, n);
-            g_combat_event_ring[n].published_sequence = n + 1;
-            fill_phase(g_phase_runtime_ring[n].record, n);
-            g_phase_runtime_ring[n].published_sequence = n + 1;
+            fill_combat(g_combat_match->event_ring[n].record, n);
+            g_combat_match->event_ring[n].published_sequence = n + 1;
+            fill_phase(g_phase_match->ring[n].record, n);
+            g_phase_match->ring[n].published_sequence = n + 1;
         }
-        g_combat_next_sequence = g_phase_runtime_next_sequence = count + 1;
+        g_combat_match->next_sequence = g_phase_match->next_sequence = count + 1;
+        g_live_capture_delta_active = count % 2;
+        g_live_capture_combat_from_sequence = g_live_capture_phase_from_sequence = count / 2 + 1;
         g_combat_hooks_installed = count % 3 != 0;
         g_phase_runtime_hooks_installed = count % 4 != 0;
         g_combat_hooks_attested = g_phase_runtime_hooks_attested = count % 5 != 0;
-        g_combat_rejected_capture_count = g_phase_runtime_rejected_count = count % 7 == 0;
+        g_combat_match->rejected_capture_count = g_phase_match->rejected_count = count % 7 == 0;
         emit([&](char* p, std::size_t cap, std::size_t* used) {
             return append_combat_events_json(reinterpret_cast<void*>(1), 7, UINT64_MAX, 200, p, cap, used);
         });
@@ -133,20 +135,21 @@ int main() {
     // Wrong identity, future event, slot overwrite and invalid entity remain fail-closed.
     for (unsigned fault=0;fault<5;++fault) {
         g_combat_hooks_installed = g_phase_runtime_hooks_installed = true;
-        g_combat_next_sequence = g_phase_runtime_next_sequence = 2;
-        fill_combat(g_combat_event_ring[0].record, 0);
-        fill_phase(g_phase_runtime_ring[0].record, 0);
-        g_combat_event_ring[0].published_sequence = g_phase_runtime_ring[0].published_sequence = 1;
-        if (fault==0) g_combat_event_ring[0].record.generation = g_phase_runtime_ring[0].record.generation = 999;
-        if (fault==1) g_combat_event_ring[0].record.tick = g_phase_runtime_ring[0].record.tick = 999;
-        if (fault==2) g_combat_event_ring[0].published_sequence = g_phase_runtime_ring[0].published_sequence = 999;
+        g_combat_match->next_sequence = g_phase_match->next_sequence = 2;
+        g_live_capture_delta_active = false;
+        fill_combat(g_combat_match->event_ring[0].record, 0);
+        fill_phase(g_phase_match->ring[0].record, 0);
+        g_combat_match->event_ring[0].published_sequence = g_phase_match->ring[0].published_sequence = 1;
+        if (fault==0) g_combat_match->event_ring[0].record.generation = g_phase_match->ring[0].record.generation = 999;
+        if (fault==1) g_combat_match->event_ring[0].record.tick = g_phase_match->ring[0].record.tick = 999;
+        if (fault==2) g_combat_match->event_ring[0].published_sequence = g_phase_match->ring[0].published_sequence = 999;
         if (fault==3) {
-            g_combat_event_ring[0].record.source.present = g_phase_runtime_ring[0].record.entity.present = true;
-            g_combat_event_ring[0].record.source.native_object_id = g_phase_runtime_ring[0].record.entity.native_object_id = 0;
+            g_combat_match->event_ring[0].record.source.present = g_phase_match->ring[0].record.entity.present = true;
+            g_combat_match->event_ring[0].record.source.native_object_id = g_phase_match->ring[0].record.entity.native_object_id = 0;
         }
         if (fault==4) {
-            g_combat_event_ring[0].record.spawn_provenance.kind = CombatSpawnProvenanceKind::ActionSpawnToLocation;
-            g_combat_event_ring[0].record.spawn_provenance.hook_offset = 0;
+            g_combat_match->event_ring[0].record.spawn_provenance.kind = CombatSpawnProvenanceKind::ActionSpawnToLocation;
+            g_combat_match->event_ring[0].record.spawn_provenance.hook_offset = 0;
         }
         char bytes[256000] = {};
         std::size_t used = 0;

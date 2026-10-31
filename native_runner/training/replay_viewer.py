@@ -23,7 +23,12 @@ from ..cr_native_env import (
     ResidentNativeClashEnv,
     RunnerError,
 )
-from ..match_factory import MatchConfig, NATIVE_FINALIZATION_DEADLINE_TICK, PRINCESS_TOWER_TROOP_ID
+from ..match_factory import (
+    MatchConfig,
+    NATIVE_FINALIZATION_DEADLINE_TICK,
+    PRINCESS_TOWER_TROOP_ID,
+    match_level_kwargs,
+)
 from ..resident_batch_vector import ResidentBatchCoordinatorV1, ResidentBatchNativeProxyV1
 from .replay_archive import TrainingReplayError, TrainingReplayV1
 
@@ -320,13 +325,13 @@ def _match_config_from_replay(replay: TrainingReplayV1) -> MatchConfig:
         game_mode=config.game_mode,
         arena=config.arena,
         location=int(tags.get("location", 15000199)),
-        level_cap=int(tags.get("level_cap", 0)),
-        minimum_card_level=int(tags.get("minimum_card_level", 0)),
+        # Per-card / tower-troop / King Tower levels when the episode carries
+        # them (collected replays), else the legacy uniform level tags.
+        **match_level_kwargs(config.deck0, config.deck1, tags),
         deck0_form_availability=tuple(int(value) for value in tags.get("deck0_form_availability", (0,) * 8)),
         deck1_form_availability=tuple(int(value) for value in tags.get("deck1_form_availability", (0,) * 8)),
         tower_troop0_id=int(tags.get("tower_troop0_id", PRINCESS_TOWER_TROOP_ID)),
         tower_troop1_id=int(tags.get("tower_troop1_id", PRINCESS_TOWER_TROOP_ID)),
-        king_tower_level=(int(tags["king_tower_level"]) if tags.get("king_tower_level") is not None else None),
         owner0_name=str(tags.get("owner0_name", "Policy-0")),
         owner1_name=str(tags.get("owner1_name", "Policy-1")),
         end_tick=int(tags.get("end_tick", 7200)),

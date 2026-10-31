@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+import os
+from dataclasses import dataclass, fields
 from functools import lru_cache
+import typing
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 import torch
@@ -21,6 +24,7 @@ from ...semantic_subset import SemanticSupportedSubsetV1, build_semantic_support
 from ..card_features import HERO_FORM_TO_BASE_CARD
 from ..tracking import DeterministicPublicTracker
 from .catalog import AbilityCatalogV1, CardCatalogV1, EntityArchetypeCatalogV1, normal_mode_card_specs
+from .config import ModelConfigV4
 from .mechanics import EffectSemanticCatalogV1, MechanicProfileCatalogV1
 from .model import UniversalCardPolicyV4
 from .tensorizer import UniversalObservationTensorizerV4
@@ -75,7 +79,9 @@ def production_semantic_bundle() -> ProductionSemanticBundleV4:
     )
 
 
-def build_production_model_v4(*, device: torch.device | str | None = None) -> UniversalCardPolicyV4:
+def build_production_model_v4(
+    *, device: torch.device | str | None = None, config: ModelConfigV4 | None = None
+) -> UniversalCardPolicyV4:
     bundle = production_semantic_bundle()
     model = UniversalCardPolicyV4(
         bundle.card_catalog,
@@ -83,8 +89,63 @@ def build_production_model_v4(*, device: torch.device | str | None = None) -> Un
         entity_archetype_catalog=bundle.entity_archetype_catalog,
         effect_catalog=bundle.effect_catalog,
         mechanic_profile_catalog=bundle.mechanic_profile_catalog,
+        config=config,
     )
     return model if device is None else model.to(device)
+
+
+def _model_config_value(name: str, annotation: object, value: object) -> object:
+    """Check one JSON override against its declared ModelConfigV4 type."""
+
+    origin = typing.get_origin(annotation)
+    if annotation is bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"model config override {name} must be a bool, got {value!r}")
+        return value
+    if annotation is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"model config override {name} must be an int, got {value!r}")
+        return value
+    if annotation is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError(f"model config override {name} must be a finite float, got {value!r}")
+        return float(value)
+    if annotation is str:
+        if not isinstance(value, str):
+            raise ValueError(f"model config override {name} must be a str, got {value!r}")
+        return value
+    if origin is tuple:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"model config override {name} must be a list, got {value!r}")
+        arguments = typing.get_args(annotation)
+        if len(arguments) == 2 and arguments[1] is Ellipsis:
+            item_types = (arguments[0],) * len(value)
+        elif len(arguments) == len(value):
+            item_types = arguments
+        else:
+            raise ValueError(f"model config override {name} must have {len(arguments)} items, got {value!r}")
+        return tuple(
+            _model_config_value(f"{name}[{index}]", item_type, item)
+            for index, (item_type, item) in enumerate(zip(item_types, value, strict=True))
+        )
+    raise ValueError(f"model config field {name} has an unsupported override type {annotation!r}")
+
+
+def model_config_from_overrides(overrides: Mapping[str, object]) -> ModelConfigV4:
+    """Return ``ModelConfigV4`` defaults with type-checked overrides applied."""
+
+    if not isinstance(overrides, Mapping):
+        raise ValueError("model config overrides must be a mapping")
+    annotations = typing.get_type_hints(ModelConfigV4)
+    known = {item.name for item in fields(ModelConfigV4) if item.init}
+    unknown = sorted(str(key) for key in set(overrides).difference(known))
+    if unknown:
+        raise ValueError(f"unknown ModelConfigV4 override fields: {unknown}")
+    defaults = ModelConfigV4()
+    merged: dict[str, object] = {name: getattr(defaults, name) for name in known}
+    for name, value in overrides.items():
+        merged[name] = _model_config_value(name, annotations[name], value)
+    return ModelConfigV4(**merged)  # type: ignore[arg-type]
 
 
 def deck_roles_from_form_availability(
@@ -105,22 +166,24 @@ def _public_tracker_v4(
     decks: tuple[tuple[int, ...], tuple[int, ...]],
     roles: tuple[dict[int, tuple[bool, bool]], dict[int, tuple[bool, bool]]],
 ) -> DeterministicPublicTracker:
+    unknown_owners = frozenset(owner for owner in (0, 1) if not decks[owner])
+    resolver_decks = tuple(tuple(bundle.card_specs) if owner in unknown_owners else decks[owner] for owner in (0, 1))
     card_costs = {
         card_id: float(bundle.card_specs[card_id].elixir_cost)
-        for deck in decks
+        for deck in resolver_decks
         for card_id in deck
         if bundle.card_specs[card_id].elixir_cost is not None
     }
-    if set(card_costs) != set(decks[0]).union(decks[1]):
+    if set(card_costs) != set(resolver_decks[0]).union(resolver_decks[1]):
         raise ValueError("every tracked deck card needs an exact elixir cost")
     ability_costs: dict[int, dict[int, float]] = {0: {}, 1: {}}
     ability_cooldowns: dict[int, dict[int, int]] = {0: {}, 1: {}}
     ability_charges: dict[int, dict[int, int]] = {0: {}, 1: {}}
     evolution_cycles: dict[int, dict[int, int]] = {0: {}, 1: {}}
     for owner in (0, 1):
-        for card_id in decks[owner]:
-            elite, evolution = roles[owner][card_id]
+        for card_id in resolver_decks[owner]:
             spec = bundle.card_specs[card_id]
+            elite, evolution = (bool(spec.ability_ids), spec.evolution is not None) if owner in unknown_owners else roles[owner][card_id]
             if elite:
                 if len(spec.ability_ids) != 1:
                     raise ValueError("an enabled hero card needs exactly one ability contract")
@@ -158,6 +221,7 @@ def _public_tracker_v4(
         ability_cooldown_ms_by_owner_card=ability_cooldowns,
         ability_max_charges_by_owner_card=ability_charges,
         ability_form_to_base_card=HERO_FORM_TO_BASE_CARD,
+        unknown_deck_owners=unknown_owners,
     )
 
 
@@ -187,9 +251,11 @@ def build_episode_tensorizer_v4(
     bundle = production_semantic_bundle()
     decks = (episode.deck0, episode.deck1)
     forms = tuple(
-        tuple(int(value) for value in episode.tags.get(f"deck{owner}_form_availability", (0,) * 8)) for owner in (0, 1)
+        tuple(int(value) for value in episode.tags.get(f"deck{owner}_form_availability", (0,) * len(decks[owner]))) for owner in (0, 1)
     )
-    roles = tuple(deck_roles_from_form_availability(decks[owner], forms[owner]) for owner in (0, 1))
+    if not decks[actor_owner]:
+        raise ValueError("the acting owner's deck must be known")
+    roles = tuple(deck_roles_from_form_availability(decks[owner], forms[owner]) if decks[owner] else {} for owner in (0, 1))
     return UniversalObservationTensorizerV4(
         actor_owner=actor_owner,
         card_catalog=bundle.card_catalog,
@@ -254,7 +320,10 @@ def build_resident_training_proxies_v4(
         natives,
         timeout=timeout,
         training_capture=capture_mode == "compact",
-        compressed_json=capture_mode in {"compact", "zlib-json"},
+        # CR_COMPACT_ZLIB=0 sends compact captures uncompressed (loopback transport,
+        # and lets a conversation recorder compress the whole stream far better).
+        compressed_json=capture_mode == "zlib-json"
+        or (capture_mode == "compact" and os.environ.get("CR_COMPACT_ZLIB", "1") != "0"),
         # BattleEnv still performs its typed fail-closed binding.  Avoid only
         # the duplicate transport-layer JSON validation in the hot loop.
         validate_json_capture=False,

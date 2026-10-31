@@ -12,6 +12,9 @@
 
 std::uintptr_t g_libg_base = 0;
 const char* g_libg_path = "";
+bool g_live_capture_delta_active = false;
+std::uint64_t g_live_capture_visibility_from_sequence = 1;
+std::uint64_t g_live_capture_phase_from_sequence = 1;
 
 #define LOGE(...) ((void)0)
 #define LOGI(...) ((void)0)
@@ -163,8 +166,8 @@ int main() {
         phase_base_record(context, PhaseRawKind::AttackStart, 0xf23110, 0);
     assert(publish_phase_record(record) == 1);
     assert(encode_phase(7, 11).find("\"sequence\":1") != std::string::npos);
-    g_phase_runtime_overflow_count.store(9, std::memory_order_release);
-    g_phase_runtime_rejected_count.store(3, std::memory_order_release);
+    g_phase_match->overflow_count.store(9, std::memory_order_release);
+    g_phase_match->rejected_count.store(3, std::memory_order_release);
     begin_phase_runtime_epoch(8, 12);
     const std::string reset = encode_phase(8, 12);
     assert(reset.find("\"complete\":true") != std::string::npos);

@@ -124,14 +124,21 @@ struct NativePhaseSnapshot {
   std::int32_t attack_sequence_decay_duration_ms = kPhaseRuntimeUnset;
 };
 
-PhaseRingSlot g_phase_runtime_ring[kPhaseRuntimeRingCapacity];
-PhaseRuntimeCache g_phase_runtime_cache[kPhaseRuntimeCacheCapacity];
-std::atomic<std::uint64_t> g_phase_runtime_next_sequence{1};
-std::atomic<std::uint64_t> g_phase_runtime_epoch_first_sequence{1};
-std::atomic<std::uint64_t> g_phase_runtime_generation{0};
-std::atomic<std::uint64_t> g_phase_runtime_state_epoch{0};
-std::atomic<std::uint64_t> g_phase_runtime_overflow_count{0};
-std::atomic<std::uint64_t> g_phase_runtime_rejected_count{0};
+// One match's retained phase ring and per-object phase cache.  Hooks publish
+// into the bound instance (see MatchTelemetry in cr_replay_probe.cpp).
+struct PhaseMatchTelemetry {
+  PhaseRingSlot ring[kPhaseRuntimeRingCapacity];
+  PhaseRuntimeCache cache[kPhaseRuntimeCacheCapacity];
+  std::atomic<std::uint64_t> next_sequence{1};
+  std::atomic<std::uint64_t> epoch_first_sequence{1};
+  std::atomic<std::uint64_t> generation{0};
+  std::atomic<std::uint64_t> state_epoch{0};
+  std::atomic<std::uint64_t> overflow_count{0};
+  std::atomic<std::uint64_t> rejected_count{0};
+};
+
+PhaseMatchTelemetry g_phase_default_match;
+PhaseMatchTelemetry *g_phase_match = &g_phase_default_match;
 std::atomic<bool> g_phase_runtime_hooks_attested{false};
 std::atomic<bool> g_phase_runtime_hooks_installed{false};
 std::atomic<bool> g_phase_buff_added_hook_installed{false};
@@ -204,14 +211,14 @@ void reset_phase_runtime_cache_payload(PhaseRuntimeCache *slot) {
 void commit_phase_runtime_epoch_locked(std::uint64_t generation, std::uint64_t state_epoch, bool clear_cache) {
   // Publish an invalid identity while first-sequence/counters/cache change,
   // so an observation can only see the complete old or complete new epoch.
-  g_phase_runtime_generation.store(0, std::memory_order_release);
-  g_phase_runtime_state_epoch.store(0, std::memory_order_release);
-  const std::uint64_t first = g_phase_runtime_next_sequence.load(std::memory_order_acquire);
-  g_phase_runtime_epoch_first_sequence.store(first, std::memory_order_release);
-  g_phase_runtime_overflow_count.store(0, std::memory_order_release);
-  g_phase_runtime_rejected_count.store(0, std::memory_order_release);
+  g_phase_match->generation.store(0, std::memory_order_release);
+  g_phase_match->state_epoch.store(0, std::memory_order_release);
+  const std::uint64_t first = g_phase_match->next_sequence.load(std::memory_order_acquire);
+  g_phase_match->epoch_first_sequence.store(first, std::memory_order_release);
+  g_phase_match->overflow_count.store(0, std::memory_order_release);
+  g_phase_match->rejected_count.store(0, std::memory_order_release);
   if (clear_cache) {
-    for (PhaseRuntimeCache &slot : g_phase_runtime_cache) {
+    for (PhaseRuntimeCache &slot : g_phase_match->cache) {
       while (slot.lock.test_and_set(std::memory_order_acquire)) {
         // Lifecycle begin runs while combat capture is inactive.  A
         // pre-existing callback may finish, but no new callback can
@@ -223,8 +230,8 @@ void commit_phase_runtime_epoch_locked(std::uint64_t generation, std::uint64_t s
   }
   // Ring storage is reset logically by epochFirstSequence; published slots
   // remain immutable until their globally monotonic sequence is reused.
-  g_phase_runtime_state_epoch.store(state_epoch, std::memory_order_release);
-  g_phase_runtime_generation.store(generation, std::memory_order_release);
+  g_phase_match->state_epoch.store(state_epoch, std::memory_order_release);
+  g_phase_match->generation.store(generation, std::memory_order_release);
 }
 
 void begin_phase_runtime_epoch(std::uint64_t generation, std::uint64_t state_epoch) {
@@ -260,19 +267,19 @@ std::uint64_t publish_phase_record(PhaseRawRecord record) {
   }
   g_phase_runtime_publishers.fetch_add(1, std::memory_order_acq_rel);
   const bool accepted = !g_phase_runtime_resetting.load(std::memory_order_acquire) &&
-                        g_phase_runtime_generation.load(std::memory_order_acquire) == record.generation &&
-                        g_phase_runtime_state_epoch.load(std::memory_order_acquire) == record.state_epoch;
+                        g_phase_match->generation.load(std::memory_order_acquire) == record.generation &&
+                        g_phase_match->state_epoch.load(std::memory_order_acquire) == record.state_epoch;
   if (!accepted) {
     g_phase_runtime_publishers.fetch_sub(1, std::memory_order_acq_rel);
     return 0;
   }
-  const std::uint64_t sequence = g_phase_runtime_next_sequence.fetch_add(1, std::memory_order_acq_rel);
+  const std::uint64_t sequence = g_phase_match->next_sequence.fetch_add(1, std::memory_order_acq_rel);
   record.sequence = sequence;
-  const std::uint64_t first = g_phase_runtime_epoch_first_sequence.load(std::memory_order_acquire);
+  const std::uint64_t first = g_phase_match->epoch_first_sequence.load(std::memory_order_acquire);
   if (sequence >= first + kPhaseRuntimeRingCapacity) {
-    g_phase_runtime_overflow_count.fetch_add(1, std::memory_order_relaxed);
+    g_phase_match->overflow_count.fetch_add(1, std::memory_order_relaxed);
   }
-  PhaseRingSlot &slot = g_phase_runtime_ring[(sequence - 1) % kPhaseRuntimeRingCapacity];
+  PhaseRingSlot &slot = g_phase_match->ring[(sequence - 1) % kPhaseRuntimeRingCapacity];
   slot.published_sequence.store(0, std::memory_order_relaxed);
   slot.record = record;
   slot.published_sequence.store(sequence, std::memory_order_release);
@@ -294,7 +301,7 @@ bool update_phase_cache(const CombatCaptureContext &context, const void *object,
   }
   const std::size_t start = phase_cache_hash(object);
   for (std::size_t probe = 0; probe < kPhaseRuntimeCacheCapacity; ++probe) {
-    PhaseRuntimeCache &slot = g_phase_runtime_cache[(start + probe) % kPhaseRuntimeCacheCapacity];
+    PhaseRuntimeCache &slot = g_phase_match->cache[(start + probe) % kPhaseRuntimeCacheCapacity];
     if (slot.lock.test_and_set(std::memory_order_acquire)) {
       continue;
     }
@@ -317,7 +324,7 @@ bool update_phase_cache(const CombatCaptureContext &context, const void *object,
     slot.lock.clear(std::memory_order_release);
     return true;
   }
-  g_phase_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+  g_phase_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
   return false;
 }
 
@@ -334,7 +341,7 @@ bool copy_phase_cache(std::uint64_t generation, std::uint64_t state_epoch, const
   }
   const std::size_t start = phase_cache_hash(object);
   for (std::size_t probe = 0; probe < kPhaseRuntimeCacheCapacity; ++probe) {
-    PhaseRuntimeCache &slot = g_phase_runtime_cache[(start + probe) % kPhaseRuntimeCacheCapacity];
+    PhaseRuntimeCache &slot = g_phase_match->cache[(start + probe) % kPhaseRuntimeCacheCapacity];
     if (slot.lock.test_and_set(std::memory_order_acquire)) {
       continue;
     }
@@ -958,16 +965,20 @@ bool append_phase_runtime_events_json(std::uint64_t generation, std::uint64_t st
     return false;
   }
   const bool installed = g_phase_runtime_hooks_installed.load(std::memory_order_acquire);
-  const bool identity = g_phase_runtime_generation.load(std::memory_order_acquire) == generation &&
-                        g_phase_runtime_state_epoch.load(std::memory_order_acquire) == state_epoch;
-  const std::uint64_t next = g_phase_runtime_next_sequence.load(std::memory_order_acquire);
+  const bool identity = g_phase_match->generation.load(std::memory_order_acquire) == generation &&
+                        g_phase_match->state_epoch.load(std::memory_order_acquire) == state_epoch;
+  const std::uint64_t next = g_phase_match->next_sequence.load(std::memory_order_acquire);
   const std::uint64_t epoch_first =
-      identity ? g_phase_runtime_epoch_first_sequence.load(std::memory_order_acquire) : next;
+      identity ? g_phase_match->epoch_first_sequence.load(std::memory_order_acquire) : next;
   const std::uint64_t retained_oldest =
       next > epoch_first + kPhaseRuntimeRingCapacity ? next - kPhaseRuntimeRingCapacity : epoch_first;
-  const std::uint64_t transmit_from = retained_oldest;
-  const std::uint64_t overflow = identity ? g_phase_runtime_overflow_count.load(std::memory_order_acquire) : 0;
-  const std::uint64_t rejected = identity ? g_phase_runtime_rejected_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t requested_transmit_from =
+      g_live_capture_delta_active ? g_live_capture_phase_from_sequence : retained_oldest;
+  const std::uint64_t transmit_from = requested_transmit_from < retained_oldest ? retained_oldest
+                                      : requested_transmit_from > next          ? next
+                                                                                : requested_transmit_from;
+  const std::uint64_t overflow = identity ? g_phase_match->overflow_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t rejected = identity ? g_phase_match->rejected_count.load(std::memory_order_acquire) : 0;
   const bool complete = installed && identity && rejected == 0;
   JsonWriter json(response, response_size, used);
   json.begin_object();
@@ -1001,7 +1012,7 @@ bool append_phase_runtime_events_json(std::uint64_t generation, std::uint64_t st
   bool first = true;
   if (identity) {
     for (std::uint64_t sequence = transmit_from; sequence < next; ++sequence) {
-      PhaseRingSlot &slot = g_phase_runtime_ring[(sequence - 1) % kPhaseRuntimeRingCapacity];
+      PhaseRingSlot &slot = g_phase_match->ring[(sequence - 1) % kPhaseRuntimeRingCapacity];
       if (slot.published_sequence.load(std::memory_order_acquire) != sequence) {
         return false;
       }

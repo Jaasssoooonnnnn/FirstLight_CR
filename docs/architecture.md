@@ -25,7 +25,7 @@ The native engine executes battles, the Python environment builds observations a
 3. The V4 model encodes entity relations and spatial features, updates recurrent memory, and produces action distributions and a value estimate.
 4. Decoding resolves the policy output into `ActionV1` requests. The environment submits them to the native engine and records execution outcomes.
 
-Interactive play uses a continuously rendered battle and applies native deployment timing. Headless/resident execution supports replay reconstruction and training collection. The model decision interval is five native ticks; episode warmup and recurrent state belong to the policy session.
+Interactive play uses a continuously rendered battle and applies native deployment timing. Headless/resident execution supports replay reconstruction and training collection. A card or ability takes effect 20 native ticks after it is played, in every mode; until then the acting side sees it as pending. The model decision interval is five native ticks; episode warmup and recurrent state belong to the policy session.
 
 ## Research artifacts
 

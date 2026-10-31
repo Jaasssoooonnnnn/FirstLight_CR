@@ -334,21 +334,22 @@ def test_prepare_replay_maps_source_command_ticks_to_native_observable_ticks() -
         if action.kind is ActionKind.PLAY_CARD
     }
 
-    assert ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS == 1
+    # data-t is the touch tick; the battle executes the card 20 ticks later.
+    assert ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS == 21
     for event in payload["events"]:
         operation, action = actions[int(event["source_index"])]
         source_tick = int(event["replay_tick_20hz"])
         native_tick = operation.start_native_tick + action.execute_offset_ticks
-        assert native_tick == source_tick + 1
+        assert native_tick == source_tick + 21
         assert operation.end_native_tick == native_tick
         assert action.metadata["source_command_tick"] == source_tick
         assert action.metadata["native_observable_tick"] == native_tick
 
     tags = prepared.replay.episode_config.tags
     assert prepared.replay.ruleset_id == "royaleapi-native-render-adapter.v3"
-    assert tags["reconstruction_mode"] == "royaleapi-public-actions.v3"
-    assert tags["source_tick_semantics"] == "royaleapi-command-boundary.v1"
-    assert tags["native_observable_tick_offset"] == 1
+    assert tags["reconstruction_mode"] == "royaleapi-public-actions.v4"
+    assert tags["source_tick_semantics"] == "royaleapi-touch-tick.v2"
+    assert tags["native_observable_tick_offset"] == 21
 
 
 @pytest.mark.parametrize("card_key", ("elixir-collector", "mirror"))
@@ -692,7 +693,7 @@ def test_prepare_replay_binds_hero_events_and_keeps_source_duration() -> None:
 
     assert prepared.replay.end_native_tick == 800
     assert prepared.replay.terminal["last_source_event_tick"] == 700
-    assert prepared.replay.terminal["last_native_event_tick"] == 701
+    assert prepared.replay.terminal["last_native_event_tick"] == 721
     assert prepared.replay.terminal["source_end_tick"] == 800
     assert len(abilities) == 1
     ability_operation = next(
@@ -701,10 +702,10 @@ def test_prepare_replay_binds_hero_events_and_keeps_source_duration() -> None:
         if abilities[0] in operation.actions
     )
     assert (
-        ability_operation.start_native_tick + abilities[0].execute_offset_ticks == 701
+        ability_operation.start_native_tick + abilities[0].execute_offset_ticks == 721
     )
     assert abilities[0].metadata["source_command_tick"] == 700
-    assert abilities[0].metadata["native_observable_tick"] == 701
+    assert abilities[0].metadata["native_observable_tick"] == 721
     assert abilities[0].metadata["ability_source_keys"] == ("giant-hero",)
     assert "giant" in abilities[0].metadata["ability_runtime_hints"]
     assert any("已按牌组唯一绑定" in warning for warning in prepared.warnings)

@@ -119,16 +119,23 @@ class TensorRecordV4:
         if float_dtype not in {None, torch.float16, torch.bfloat16, torch.float32}:
             raise ValueError("V4 storage float dtype must be fp16, bf16, fp32, or None")
 
+        target_device = torch.device(device)
+
         def move(item: Tensor) -> Tensor:
             dtype = float_dtype if item.is_floating_point() else None
-            with torch.inference_mode(False):
-                stored = item.detach().to(device=device, dtype=dtype)
-                # ``Tensor.to`` may return the original tensor when dtype and
-                # device already match.  Rollouts collected under
-                # inference_mode must become ordinary tensors before PPO.
-                return stored.clone() if torch.is_inference(stored) else stored
+            stored = item.detach()
+            # ``Tensor.to`` returns its input unchanged when device and dtype
+            # already match; skip the call for the common integer/bool fields.
+            if stored.device != target_device or (dtype is not None and stored.dtype != dtype):
+                stored = stored.to(device=device, dtype=dtype)
+            # ``Tensor.to`` may return the original tensor when dtype and
+            # device already match.  Rollouts collected under
+            # inference_mode must become ordinary tensors before PPO.
+            return stored.clone() if torch.is_inference(stored) else stored
 
-        return _map_tensors(self, move)  # type: ignore[return-value]
+        # One mode switch per record rather than per tensor (hot in cache building).
+        with torch.inference_mode(False):
+            return _map_tensors(self, move)  # type: ignore[return-value]
 
     def to_model_input(self, device: torch.device | str, *, float_dtype: torch.dtype = torch.float32) -> Self:
         """Restore packed floating inputs to the model's compute dtype."""
@@ -978,6 +985,21 @@ class PolicyContextV4(TensorRecordV4):
 
 
 @dataclass(slots=True)
+class ActionArgmaxV4(TensorRecordV4):
+    """Unmasked per-head argmax choices under the decoded (or forced) prefix.
+
+    Rows and micro-action steps are not masked: callers apply the same
+    gate/micro/grid/ACT masks they use for the matching log-probabilities.
+    """
+
+    gate_argmax: Tensor
+    candidate_argmax: Tensor
+    target_argmax: Tensor
+    delay_argmax: Tensor
+    continue_argmax: Tensor
+
+
+@dataclass(slots=True)
 class PolicyOutputV4(TensorRecordV4):
     actions: ActionSequenceV4
     log_prob: Tensor
@@ -985,6 +1007,7 @@ class PolicyOutputV4(TensorRecordV4):
     value: Tensor
     next_state: RecurrentPolicyStateV4
     action_components: ActionEvaluationComponentsV4 | None = None
+    argmax: ActionArgmaxV4 | None = None
 
 
 _PADDING_VALUES = {

@@ -174,7 +174,7 @@ int main() {
         record.source_before, record.source_after));
     assert(publish_action_movement_record(record) == 1);
     assert(
-        g_action_movement_ring.next_sequence.load(
+        g_action_movement_match->ring.next_sequence.load(
             std::memory_order_acquire) == 2);
     return 0;
 }

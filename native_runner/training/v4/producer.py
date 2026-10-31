@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+import gc
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
 from ...battle_env import BattleEnvV1
-from ...contracts import ActionV1
+from ...contracts import ActionKind, ActionV1
+from ...royaleapi_replay import ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS
 from ..replay_viewer import _direct_render_commands, _schedule_direct_render_commands
 from .expert import (
     FIRST_POLICY_DECISION_TICK,
@@ -201,12 +203,39 @@ def _prepare_il_lane(lane: _ILReplayLaneV4, *, validate_tensors: bool) -> dict[i
             label_is_usable = False
         frame_sequences.append(sequence)
         gate_loss.append(label_is_usable)
+        _track_expert_window(lane, window, frame_batches[owner], sequence, label_is_usable=label_is_usable)
     for owner in (0, 1):
         lane.tensorizers[owner].record_action(frame_sequences[owner], frame_batches[owner], row=0, validate=False)
     lane.pending_frame_batches = (frame_batches[0], frame_batches[1])
     lane.pending_frame_sequences = (frame_sequences[0], frame_sequences[1])
     lane.pending_gate_loss = (gate_loss[0], gate_loss[1])
     return _wait_group(POLICY_DECISION_TICKS)
+
+
+def _track_expert_window(
+    lane: _ILReplayLaneV4, window: Sequence[Any], frame_batch: Any, sequence: Any, *, label_is_usable: bool
+) -> None:
+    """Expose each expert command as pending until the probe executes it.
+
+    The renderer schedule executes a RoyaleAPI touch 20 ticks after it, just
+    like the online battle.  Policy commands are visible as pending for that
+    second (slot mask, reserved elixir, building footprint); record expert
+    commands the same way so IL and PPO observations agree.
+    """
+
+    ordered = sorted(window, key=lambda item: (item.source_tick, item.source_index))
+    for step, timed in enumerate(ordered):
+        action = timed.action
+        if action.kind is ActionKind.ACTIVATE_ABILITY:
+            # RoyaleAPI does not name the source; the aligned label does.
+            if not label_is_usable:
+                continue
+            index = int(sequence.candidate_index[0, step].item())
+            source_entity = int(frame_batch.candidates.native_source_entity[0, index].item())
+            action = replace(action, source_entity=source_entity)
+        lane.environment.track_external_command(
+            action, execute_native_tick=timed.source_tick + ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS
+        )
 
 
 def _consume_renderer_schedule(lane: _ILReplayLaneV4, *, through_tick: int) -> None:
@@ -251,11 +280,12 @@ def _reconcile_renderer_schedule(lane: _ILReplayLaneV4) -> None:
             # User-facing replay rendering keeps advancing after an exact
             # boundary-time semantic rejection.  Headless uses that same
             # scheduler contract; do not train a rejected source label.
+            touch_tick = int(command.target_tick) - ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS
             row = next(
                 (
                     row_index
                     for row_index, decision_tick in enumerate(lane.decision_ticks)
-                    if int(decision_tick) < int(command.target_tick) <= int(decision_tick) + POLICY_DECISION_TICKS
+                    if int(decision_tick) <= touch_tick < int(decision_tick) + POLICY_DECISION_TICKS
                 ),
                 None,
             )
@@ -328,7 +358,14 @@ def _accept_il_step(
         lane.terminal_observed = True
         lane.completed = True
         _terminal_fidelity(lane)
-        if lane.replay_schedule_index < len(lane.replay_commands):
+        # Commands touched before the end execute up to 20 ticks later; the
+        # source battle ended before running them too.  Only a touch at or
+        # after the simulated terminal tick means the timelines diverged.
+        unexecuted_touch_ticks = [
+            int(command.target_tick) - ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS
+            for command in lane.replay_commands[lane.replay_schedule_index :]
+        ]
+        if any(touch_tick >= next_tick for touch_tick in unexecuted_touch_ticks):
             lane.completed = False
             lane.failure_reason = "battle ended before all expert actions executed"
             lane.first_untrusted_tick = lane.current_tick
@@ -541,6 +578,12 @@ def produce_il_replay_batch(
             batch_coordinator.start_session()
             session_started = True
 
+    # Every frame's tensors stay referenced until the shard is written, so each
+    # automatic full collection rescans an ever-growing heap (~6% of conversion
+    # time) while a shard yields only a few hundred cyclic garbage objects.
+    # Pause automatic collection for the batch; it is restored below.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
     try:
         for lane in lane_slots:
             assert lane is not None
@@ -556,12 +599,16 @@ def produce_il_replay_batch(
             active_lanes = tuple(lane for lane in lane_slots if lane is not None and lane.active)
             if not active_lanes:
                 break
-            # Advance the native batch while the CPU tensorizes the preceding
-            # captured frame. Each lane remains private until its future settles.
+            # Each lane is prepared (tensorized, and its expert commands tracked
+            # as pending in its environment) before its own native step starts:
+            # preparing mutates the environment that step reads, so running the
+            # two concurrently raced and made pending state nondeterministic.
+            # A lane's step still overlaps the preparation of later lanes; the
+            # native batch executes once every lane in the round has submitted.
             round_lanes = active_lanes
             batch_coordinator.begin_round(tuple(lane.env_id for lane in round_lanes))
             round_actions = {lane.env_id: _wait_group(POLICY_DECISION_TICKS) for lane in round_lanes}
-            futures = {executor.submit(step_lane, lane, round_actions[lane.env_id]): lane for lane in round_lanes}
+            futures = {}
             results: dict[int, tuple[Any, Any, Any, Any, Any]] = {}
             lane_errors: dict[int, BaseException] = {}
             for lane in round_lanes:
@@ -571,6 +618,7 @@ def produce_il_replay_batch(
                         raise RuntimeError("IL observation pass must submit WAIT only")
                 except Exception as error:
                     _fail_il_lane(lane, error)
+                futures[executor.submit(step_lane, lane, round_actions[lane.env_id])] = lane
             for future, lane in futures.items():
                 try:
                     results[lane.env_id] = future.result()
@@ -607,6 +655,8 @@ def produce_il_replay_batch(
                 except Exception as error:
                     _fail_il_lane(lane, error)
     finally:
+        if gc_was_enabled:
+            gc.enable()
         if executor is not None:
             executor.shutdown(wait=True)
         if session_started:

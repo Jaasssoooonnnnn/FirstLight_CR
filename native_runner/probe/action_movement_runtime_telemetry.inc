@@ -53,7 +53,14 @@ struct ActionMovementRawRecord {
   bool complete_context = false;
 };
 
-EpochRing<ActionMovementRawRecord, kActionMovementRingCapacity> g_action_movement_ring;
+// One match's retained action-movement ring.  Hooks publish into the bound instance
+// (see MatchTelemetry in cr_replay_probe.cpp).
+struct ActionMovementMatchTelemetry {
+  EpochRing<ActionMovementRawRecord, kActionMovementRingCapacity> ring;
+};
+
+ActionMovementMatchTelemetry g_action_movement_default_match;
+ActionMovementMatchTelemetry *g_action_movement_match = &g_action_movement_default_match;
 std::atomic<bool> g_action_movement_hooks_attested{false};
 std::atomic<bool> g_action_movement_hooks_installed{false};
 
@@ -69,15 +76,15 @@ std::uintptr_t action_movement_caller_offset(const void *address) {
 }
 
 void begin_action_movement_runtime_epoch(std::uint64_t generation, std::uint64_t state_epoch) {
-  g_action_movement_ring.begin(generation, state_epoch);
+  g_action_movement_match->ring.begin(generation, state_epoch);
 }
 
 void reject_action_movement_record(const CombatCaptureContext &context) {
-  g_action_movement_ring.reject(context.generation, context.state_epoch);
+  g_action_movement_match->ring.reject(context.generation, context.state_epoch);
 }
 
 std::uint64_t publish_action_movement_record(ActionMovementRawRecord record) {
-  return g_action_movement_ring.publish(record);
+  return g_action_movement_match->ring.publish(record);
 }
 
 bool same_action_movement_entity(const CombatEntityFact &before, const CombatEntityFact &after) {
@@ -323,7 +330,7 @@ bool append_action_movement_runtime_events_json(std::uint64_t generation, std::u
                                                 std::int32_t observation_tick, char *response,
                                                 std::size_t response_size, std::size_t *used) {
   return append_epoch_ring_events(
-      g_action_movement_ring,
+      g_action_movement_match->ring,
       {cr_action_movement_runtime::kSchema, "allowlisted-native-action-movement-hook-ring",
        "sha-build-id-prologue-abi-action-name-global-id-class-vtable-source-identity"},
       generation, state_epoch, observation_tick, g_action_movement_hooks_attested.load(std::memory_order_acquire),

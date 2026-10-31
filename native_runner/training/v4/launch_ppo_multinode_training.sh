@@ -57,6 +57,9 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export MALLOC_ARENA_MAX=2
 
+# Extra trainer options (reward, IL anchor, delay policy), split on whitespace.
+read -r -a extra_args <<< "${CR_PPO_EXTRA_ARGS:-}"
+
 cd "$repository_root"
 exec "$python" -m torch.distributed.run \
   --standalone \
@@ -74,4 +77,5 @@ exec "$python" -m torch.distributed.run \
   --lane-minibatch-size "${CR_PPO_LANE_MINIBATCH_SIZE:-384}" \
   --lane-microbatch-size "${CR_PPO_LANE_MICROBATCH_SIZE:-256}" \
   --sequence-chunk-steps "${CR_PPO_SEQUENCE_CHUNK_STEPS:-16}" \
-  --seed "${CR_PPO_SEED:-0}"
+  --seed "${CR_PPO_SEED:-0}" \
+  "${extra_args[@]}"

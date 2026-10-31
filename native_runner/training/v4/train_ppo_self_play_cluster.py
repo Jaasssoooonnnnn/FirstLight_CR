@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 import gc
+import hashlib
 import json
 import math
 import os
@@ -20,16 +21,39 @@ from queue import Empty, Queue
 import torch
 import torch.distributed as dist
 
+from ...battle_env import DEFAULT_KING_POTENTIAL_WEIGHT, KING_SHAPING_MODES
 from ...match_factory import NATIVE_GAMEPLAY_END_TICK
 from .async_cluster_self_play import AsyncResidentEngineSpecV4, collect_async_cluster_wave_v4
-from .checkpoint import CHECKPOINT_SCHEMA_V4, load_actor_critic_checkpoint, save_actor_critic_checkpoint
+from .checkpoint import (
+    CHECKPOINT_SCHEMA_V4,
+    checkpoint_contract,
+    model_config_from_contract,
+    read_actor_critic_checkpoint,
+    restore_actor_critic_checkpoint,
+    save_actor_critic_checkpoint,
+)
 from .cluster_self_play import ClusterCollectionV4, ClusterMatchAssignmentV4
 from .deck_pool import DeckIdentityV4, DeckPoolManifestV4
-from .decoding import ShadowCandidateLegality
+from .decoding import DELAY_POLICIES, DELAY_POLICY_EARLIEST, DELAY_POLICY_SAMPLE, ShadowCandidateLegality
 from .distributed_ppo import distributed_ppo_update_v4
+from .imitation import ILLossWeightsV4
+from .king_activation_reward import (
+    DEFAULT_KING_ACTIVATION_PENALTY,
+    DEFAULT_KING_ACTIVATION_SCOPE,
+    KING_ACTIVATION_SCOPES,
+    validate_king_reward_parameters_v4,
+)
+from .ppo_anchor import (
+    ANCHOR_CONTINUE_MODES,
+    GATE_LOGIT_OFFSET_EXTRA_KEY,
+    AdaptiveKLControllerV4,
+    AnchorKLConfigV4,
+    apply_gate_logit_offset_once,
+)
 from .ppo_expert_bc import HogExpertSamplerV4, distributed_expert_bc_update_v4, expert_bc_contract_v4
 from .factory import build_production_model_v4
-from .league import PolicyLeagueV4
+from .league import LeagueEntryV4, PolicyLeagueV4
+from .policy_session import LoadedPolicyV4, load_policy_v4
 from .matchmaking import (
     BATTLE_LEVELS,
     MATCH_LEARNER_FOCUS,
@@ -43,6 +67,7 @@ from .matchmaking import (
 )
 from .model import UniversalCardPolicyV4
 from .ppo import PPOConfigV4, StoredRolloutV4
+from .ppo_reference_state import ReferenceStateCacheV4
 from .ppo_runtime import ppo_environment_config_v4, ppo_ruleset_id_v4, validate_reward_parameters_v4
 from .tensors import GATE_ACT, GATE_WAIT
 
@@ -52,6 +77,12 @@ DEFAULT_GATE_TEMPERATURE_END = 0.20
 DEFAULT_GATE_TEMPERATURE_ANNEAL_UPDATES = 1
 DEFAULT_ACTION_TEMPERATURE = 1.0
 DEFAULT_CONTINUE_TEMPERATURE = 2.0
+ANCHOR_TEMPERATURE = 1.0
+# Training uses the EnvironmentConfigV1 warmup; evaluation has separate knobs.
+DEFAULT_ENVIRONMENT_WARMUP_TICKS = 130
+DEFAULT_CRITIC_WARMUP_ITERS = 10
+DEFAULT_OPENING_FORCE_AFTER_SECONDS = 15
+RESUME_CONTRACT_SCHEMA = "v4-ppo-strict-resume.v2"
 HISTORY_CANDIDATES_PER_BATCH = 8
 SPECIAL_TOWER_RUNTIME_IDS = frozenset((159_000_002, 159_000_004))
 WANDB_PROJECT = "cr-ai-ppo"
@@ -84,13 +115,19 @@ def _set_temperatures(
 def _rollout_behavior_counts(rollout: StoredRolloutV4, model: UniversalCardPolicyV4) -> torch.Tensor:
     """Count gate eligibility and sampled downstream choices on CPU."""
 
+    from .decoding import elixir_multiplier_from_match_scalars
+
     delay_bins = len(model.config.delay_offset_ms)
     counts = torch.zeros(10 + delay_bins, dtype=torch.long)
     forced_gate_mask = rollout.forced_gate_mask
     for step, (observation, action) in enumerate(zip(rollout.observations, rollout.actions, strict=True)):
         valid = rollout.valid_mask[step].cpu()
         forced_gate = torch.zeros_like(valid) if forced_gate_mask is None else forced_gate_mask[step].cpu()
-        shadow = ShadowCandidateLegality(observation.candidates, model.config)
+        shadow = ShadowCandidateLegality(
+            observation.candidates,
+            model.config,
+            elixir_multiplier=elixir_multiplier_from_match_scalars(observation.match_scalars),
+        )
         legal_act = shadow.candidate_mask().any(dim=-1).cpu()
         eligible = valid & legal_act
         actual_act = valid & (action.gate.cpu() == GATE_ACT)
@@ -177,17 +214,195 @@ def _rollout_behavior_metrics(counts: torch.Tensor, *, delay_offset_ms: Sequence
     return result
 
 
+def _model_for_payload(payload: Mapping[str, Any], *, device: torch.device) -> UniversalCardPolicyV4:
+    """Build the architecture the checkpoint was trained with (``contract.model_config``).
+
+    Same construction as ``policy_session.load_policy_v4``: strong-v1 uses CNN
+    128x5 / LSTM 768; keys absent from older checkpoints fall back to defaults.
+    """
+
+    contract = payload.get("contract")
+    if not isinstance(contract, Mapping):
+        raise ValueError("checkpoint has no model/catalog contract")
+    return build_production_model_v4(device=device, config=model_config_from_contract(contract))
+
+
+def _load_contract_model(
+    path: str | Path,
+    *,
+    device: torch.device,
+    delay_policy: str,
+    gate_logit_offset: str | float,
+    optimizer_factory: Any | None = None,
+) -> tuple[UniversalCardPolicyV4, dict[str, Any], torch.optim.Optimizer | None]:
+    """read -> build from contract -> restore -> delay policy -> gate correction (all before capture)."""
+
+    if delay_policy not in DELAY_POLICIES:
+        raise ValueError(f"delay policy must be one of {DELAY_POLICIES}")
+    payload = read_actor_critic_checkpoint(path, map_location=device)
+    model = _model_for_payload(payload, device=device)
+    optimizer = None if optimizer_factory is None else optimizer_factory(model)
+    payload = restore_actor_critic_checkpoint(payload, model, optimizer=optimizer)
+    model.set_delay_policy(delay_policy)
+    applied = apply_gate_logit_offset_once(model, payload, gate_logit_offset)
+    model.__dict__["_ppo_gate_logit_offset_v4"] = applied
+    return model, payload, optimizer
+
+
+def _gate_logit_offset_of(model: UniversalCardPolicyV4) -> float:
+    return float(model.__dict__.get("_ppo_gate_logit_offset_v4", 0.0))
+
+
 def _load_frozen_model(
-    path: str | Path, *, device: torch.device, gate_temperature: float = DEFAULT_GATE_TEMPERATURE_START
+    path: str | Path,
+    *,
+    device: torch.device,
+    delay_policy: str = DELAY_POLICY_SAMPLE,
+    gate_logit_offset: str | float = 0.0,
+    gate_temperature: float = DEFAULT_GATE_TEMPERATURE_START,
+    continue_temperature: float = DEFAULT_CONTINUE_TEMPERATURE,
+    sampling: bool = False,
 ) -> tuple[UniversalCardPolicyV4, dict[str, Any]]:
-    model = build_production_model_v4(device=device)
-    payload = load_actor_critic_checkpoint(path, model, map_location=device)
-    _set_temperatures(model, gate_temperature=gate_temperature)
-    model.set_ppo_rollout_sampling(False)
+    """Frozen KL reference, calibrated to the learner's training distribution.
+
+    Battle opponents use _load_interface_opponent_model instead: training gate
+    corrections and temperatures must not leak into deployed argmax inference.
+    """
+
+    model, payload, _optimizer = _load_contract_model(
+        path, device=device, delay_policy=delay_policy, gate_logit_offset=gate_logit_offset
+    )
+    _set_temperatures(model, gate_temperature=gate_temperature, continue_temperature=continue_temperature)
+    model.set_ppo_rollout_sampling(bool(sampling))
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     return model, payload
+
+
+def _load_interface_opponent_model(path: str | Path, *, device: torch.device) -> LoadedPolicyV4:
+    """Use the launch_interface.cmd default loader and deterministic decoding.
+
+    Keep checkpoint gate weights and temperatures exactly as live inference
+    loads them, including any correction already baked into a PPO snapshot.
+    The launcher's default delay policy is earliest; learner settings are not
+    opponent inference settings.
+    """
+
+    loaded = load_policy_v4(path, device=device, delay_policy=DELAY_POLICY_EARLIEST)
+    loaded.model.set_ppo_rollout_sampling(False)
+    for parameter in loaded.model.parameters():
+        parameter.requires_grad_(False)
+    return loaded
+
+
+def _training_opening_force_options(args: argparse.Namespace) -> dict[str, int | None]:
+    if args.opening_force_after_seconds <= 0:
+        raise ValueError("training opening timeout must be positive")
+    if args.il_opening_force_after_seconds is not None and args.il_opening_force_after_seconds <= 0:
+        raise ValueError("IL opening timeout must be positive")
+    if args.il_opening_force_after_seconds not in (None, args.opening_force_after_seconds):
+        raise ValueError("all training owners share --opening-force-after-seconds; IL timeout must match")
+    return {"force_all_owners_opening_after_seconds": args.opening_force_after_seconds}
+
+
+def _resolve_temperatures(args: argparse.Namespace, *, anchor_enabled: bool) -> tuple[float, float, float]:
+    """Use positive behavior temperatures; KL scores both models at these temperatures."""
+    defaults = ((ANCHOR_TEMPERATURE,) * 3 if anchor_enabled else
+                (DEFAULT_GATE_TEMPERATURE_START, DEFAULT_GATE_TEMPERATURE_END, DEFAULT_CONTINUE_TEMPERATURE))
+    values = tuple(default if value is None else float(value) for default, value in zip(defaults, (
+        args.gate_temperature_start, args.gate_temperature_end, args.continue_temperature,
+    ), strict=True))
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("behavior temperatures must be finite and positive")
+    return values
+
+
+def _anchor_kl_config(args: argparse.Namespace) -> AnchorKLConfigV4 | None:
+    if args.anchor_checkpoint is None:
+        return None
+    coefficient = float(args.anchor_kl_coef)
+    continue_coefficient = (
+        5.0 * coefficient if args.anchor_continue_kl_coef is None else float(args.anchor_continue_kl_coef)
+    )
+    return AnchorKLConfigV4(
+        initial_coefficient=coefficient,
+        target_kl=float(args.anchor_target_kl),
+        initial_continue_coefficient=continue_coefficient,
+        continue_mode=str(args.anchor_continue_kl_mode),
+        horizon_updates=float(args.anchor_kl_horizon),
+        minimum_coefficient=float(args.anchor_kl_coef_min),
+        maximum_coefficient=float(args.anchor_kl_coef_max),
+        adaptive=not bool(args.anchor_kl_fixed),
+        no_decrease_updates=int(args.anchor_kl_no_decrease_updates),
+    )
+
+
+def _king_reward_parameters(args: argparse.Namespace) -> dict[str, object]:
+    """The collector/worker defaults are neutral, so always pass all four."""
+
+    return {
+        "king_activation_penalty": float(args.king_activation_penalty),
+        "king_activation_scope": str(args.king_activation_scope),
+        "king_shaping_mode": str(args.king_shaping_mode),
+        "king_potential_weight": float(args.king_potential_weight),
+    }
+
+
+# Keys of the strict part of the resume contract: architecture / observation /
+# action contract and the data contract that the restored matchmaker, sampler,
+# league and rank RNG states depend on.  Everything else (reward, IL anchor,
+# opponent mix, PPO hyperparameters, critic warmup) may change on resume and is
+# only recorded.
+STRICT_RESUME_KEYS = (
+    "schema",
+    "learner_contract",
+    "delay_policy",
+    "gate_logit_offset",
+    "behavior_temperatures",
+    "gate_temperature_schedule",
+    "deck_pool",
+    # engine_count is recorded only: CPU nodes may join or leave between resumes.
+    "resident_slots_per_engine",
+    "world_size",
+    "environment_warmup_ticks",
+    "decision_ticks",
+    "battle_levels",
+    "battle_level_split",
+    "seed",
+    "learner_deck_id",
+    "fixed_learner_opponent_mix",
+    "focus_tail_current_focus_percent",
+    "expert_bc",
+)
+
+
+def _split_resume_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    strict = {key: contract.get(key) for key in STRICT_RESUME_KEYS}
+    loose = {key: value for key, value in contract.items() if key not in STRICT_RESUME_KEYS}
+    return strict, loose
+
+
+def _check_resume_contract(stored: object, current: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Strictly compare architecture/observation/action and data keys; return loose changes."""
+
+    if not isinstance(stored, Mapping):
+        raise ValueError("resume checkpoint has no training contract")
+    if stored.get("schema") != current.get("schema"):
+        raise ValueError(
+            f"resume checkpoint contract schema {stored.get('schema')!r} != {current.get('schema')!r} "
+            "(pre-v2 strict resumes are intentionally incompatible)"
+        )
+    stored_strict, stored_loose = _split_resume_contract(stored)
+    current_strict, current_loose = _split_resume_contract(current)
+    differences = sorted(key for key in STRICT_RESUME_KEYS if stored_strict[key] != current_strict[key])
+    if differences:
+        raise ValueError(f"resume checkpoint architecture/data contract changed: {differences}")
+    return {
+        key: {"checkpoint": stored_loose.get(key), "current": current_loose.get(key)}
+        for key in sorted(set(stored_loose).union(current_loose))
+        if stored_loose.get(key) != current_loose.get(key)
+    }
 
 
 def _checkpoint_identity(path: str | Path) -> tuple[str, int]:
@@ -225,6 +440,54 @@ def _combined_mean_std(
     mean = total / total_weight
     variance = max(0.0, square_total / total_weight - mean * mean)
     return mean, math.sqrt(variance)
+
+
+KING_ACTIVATION_SOURCE_FAMILIES = ("spell", "troop", "building", "other", "unknown")
+
+
+def _king_activation_batch_metrics(reports: Sequence[Mapping[str, object]]) -> dict[str, int | float]:
+    """Generalized king-activation statistics, indexed by the learner owner."""
+
+    owners = [
+        (report, int(owner)) for report in reports if "king_activations" in report for owner in report["current_owners"]
+    ]
+    if not owners:
+        return {}
+    count = len(owners)
+    result: dict[str, int | float] = {
+        "batch_performance/king_activation_rate": sum(
+            int(report["king_activations"][owner]) for report, owner in owners  # type: ignore[index]
+        )
+        / count,
+        "batch_performance/king_activated_against_rate": sum(
+            int(report["king_activations"][1 - owner]) for report, owner in owners  # type: ignore[index]
+        )
+        / count,
+        "batch_performance/king_activation_reward_mean": sum(
+            float(report["king_activation_reward_total"][owner]) for report, owner in owners  # type: ignore[index]
+        )
+        / count,
+        "batch_performance/king_activation_unattributed_rate": sum(
+            int(report["king_activation_source_unattributed"][owner]) for report, owner in owners  # type: ignore[index]
+        )
+        / count,
+    }
+    ticks = [
+        report["king_activation_tick"][owner]  # type: ignore[index]
+        for report, owner in owners
+        if int(report["king_activations"][owner]) and report["king_activation_tick"][owner] is not None  # type: ignore[index]
+    ]
+    if ticks:
+        result["batch_performance/king_activation_tick_mean"] = sum(float(tick) for tick in ticks) / len(ticks)
+    families = {family: 0 for family in KING_ACTIVATION_SOURCE_FAMILIES}
+    for report, owner in owners:
+        for detail in report.get("king_activation_details", ()) or ():  # type: ignore[union-attr]
+            if isinstance(detail, Mapping) and int(detail.get("owner", -1)) == owner:
+                family = str(detail.get("source_family", "unknown"))
+                families[family if family in families else "unknown"] += 1
+    for family, value in families.items():
+        result[f"batch_performance/king_activation_source/{family}"] = value
+    return result
 
 
 def _batch_wandb_metrics(
@@ -326,6 +589,26 @@ def _batch_wandb_metrics(
     for milliseconds, count in delay_counts.items():
         result[f"batch_exploration/delay_{milliseconds}ms_count"] = count
         result[f"batch_exploration/delay_{milliseconds}ms_fraction"] = count / max(delay_total, 1)
+    if "episode_failure_rate" in segments[-1]:
+        result["batch_data_quality/episode_failure_rate"] = float(segments[-1]["episode_failure_rate"])  # type: ignore[arg-type]
+        result["batch_data_quality/episode_failures"] = int(segments[-1]["wave_episode_failures"])  # type: ignore[call-overload]
+    continue_eligible = sum(int(row.get("continue_eligible_ticks", 0)) for row in segments)
+    if continue_eligible:
+        result["batch_exploration/continue_eligible_second_rate"] = continue_second / continue_eligible
+    if all("anchor_kl" in row for row in segments):
+        for key in (
+            "anchor_kl",
+            "anchor_kl_gate",
+            "anchor_kl_candidate",
+            "anchor_kl_target",
+            "anchor_kl_continue",
+            "anchor_loss",
+            "anchor_learner_second_prob",
+            "anchor_reference_second_prob",
+        ):
+            result[f"batch_anchor/{key.removeprefix('anchor_')}"] = weighted(key)
+        result["batch_anchor/kl_coefficient"] = float(segments[-1]["anchor_kl_coefficient_next"])
+        result["batch_anchor/continue_kl_coefficient"] = float(segments[-1]["anchor_continue_kl_coefficient_next"])
 
     report_metrics = _wandb_report_metrics(reports)
     for key, value in report_metrics.items():
@@ -354,6 +637,7 @@ def _batch_wandb_metrics(
             result[f"batch_performance/{field_name}_mean"] = sum(
                 report[field_name][owner] for report, owner in king_owners
             ) / len(king_owners)
+    result.update(_king_activation_batch_metrics(reports))
     hog_owners = [
         (report, int(owner)) for report in reports if "hog_deployments" in report for owner in report["current_owners"]
     ]
@@ -411,6 +695,7 @@ def _init_offline_wandb(output_dir: Path, config: Mapping[str, object]) -> Any:
     run.define_metric("*", step_metric="update")
     run.define_metric("batch/index")
     for namespace in (
+        "batch_anchor/*",
         "batch_critic/*",
         "batch_data_quality/*",
         "batch_exploration/*",
@@ -447,6 +732,52 @@ def _restore_rank_rng_state(payload: Mapping[str, object], *, rank: int, world_s
     if not isinstance(state, Mapping):
         raise ValueError("resume checkpoint rank RNG state is invalid")
     _set_rank_rng_state(state, device=device)
+
+
+PPO_PHASES = ("rollout", "update", "critic_warmup", "idle")
+DEFAULT_MAX_EPISODE_FAILURE_RATE = 0.02
+
+
+def _episode_failures_from_shards(shards: Sequence[Mapping[str, object]]) -> tuple[dict[str, object], ...]:
+    """Failure records the rank collectors attached to their segment timing."""
+
+    rows: list[dict[str, object]] = []
+    for rank, shard in enumerate(shards):
+        timing = shard.get("timing")
+        if not isinstance(timing, Mapping):
+            continue
+        for row in timing.get("episode_failures", ()) or ():
+            if isinstance(row, Mapping):
+                rows.append({**row, "rank": rank})
+    return tuple(rows)
+
+
+def _episode_failure_rate(wave_failures: int, wave_matches: int, *, max_rate: float) -> tuple[float, bool]:
+    """Failure rate of the current wave and whether it is within ``max_rate``."""
+
+    if wave_matches <= 0:
+        raise ValueError("episode failure rate needs a positive wave size")
+    rate = float(wave_failures) / float(wave_matches)
+    return rate, rate <= max_rate + 1e-12
+
+
+def _write_phase(path: Path, phase: str, iteration: int) -> None:
+    """Atomically publish the trainer phase for the GPU filler (``<run_dir>/phase.json``).
+
+    ``rollout`` while the collector runs (GPU mostly idle), ``update`` /
+    ``critic_warmup`` while optimizing, ``idle`` on exit.  Written to a
+    temporary file in the same directory, then ``os.replace``d.
+    """
+
+    if phase not in PPO_PHASES:
+        raise ValueError(f"PPO phase must be one of {PPO_PHASES}")
+    payload = {"phase": phase, "iteration": int(iteration), "ts": time.time()}
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _publish_strict_checkpoint(output_dir: Path, checkpoint_path: Path) -> None:
@@ -527,10 +858,32 @@ def _wandb_update_metrics(metric: Mapping[str, object]) -> dict[str, int | float
         "update": int(metric["update"]),
         "safety/all_training_frames_used": float(metric["learner_owner_frame_fraction"]),
         "safety/rejected_actions": int(metric["native_rejected_actions"]),
+        **(
+            {
+                "safety/episode_failure_rate": float(metric["episode_failure_rate"]),  # type: ignore[arg-type]
+                "safety/wave_episode_failures": int(metric["wave_episode_failures"]),  # type: ignore[call-overload]
+            }
+            if "episode_failure_rate" in metric
+            else {}
+        ),
         "safety/boundary_bootstrap_coverage": (
             float(metric["collection_boundary_bootstrap_count"]) / truncated if truncated else 1.0
         ),
         "league/history_snapshots": int(metric["league_history_snapshots"]),
+        **{
+            f"anchor/{key.removeprefix('anchor_')}": float(metric[key])  # type: ignore[arg-type]
+            for key in (
+                "anchor_kl",
+                "anchor_kl_gate",
+                "anchor_kl_candidate",
+                "anchor_kl_target",
+                "anchor_kl_continue",
+                "anchor_kl_coefficient_next",
+                "anchor_continue_kl_coefficient_next",
+            )
+            if key in metric
+        },
+        **({"anchor/second_rate": float(metric["second_rate"])} if "second_rate" in metric else {}),  # type: ignore[arg-type]
     }
 
 
@@ -659,7 +1012,29 @@ def _balanced_assignments(
     deck_average_elixir_by_id: Mapping[str, float] | None = None,
     learner_deck: DeckIdentityV4 | None = None,
     learner_opponent_sampler: FixedLearnerOpponentDeckSamplerV4 | None = None,
+    fixed_league: PolicyLeagueV4 | None = None,
+    fixed_opponent_percent: int = 0,
+    history_percent: int = 0,
 ) -> tuple[tuple[ClusterMatchAssignmentV4, ...], ...]:
+    """Schedule one wave.
+
+    With ``fixed_league`` (split mode) the matchmaker's history share is
+    ``fixed_opponent_percent + history_percent``: each history match goes to a
+    fixed opponent (uniform cycle) with probability fixed / (fixed + history)
+    and otherwise to the PFSP snapshot pool in ``league``.  Before the first
+    snapshot exists the snapshot share falls back to the frozen IL anchor,
+    preserving the configured self-play share. The matchmaker uses the same
+    IL fallback when no historical or fixed opponents exist.
+    """
+
+    split_mode = fixed_league is not None
+    if split_mode:
+        if uniform_history_sampling:
+            raise ValueError("split fixed/snapshot mode samples snapshots by PFSP")
+        if min(fixed_opponent_percent, history_percent) < 0 or fixed_opponent_percent + history_percent <= 0:
+            raise ValueError("split fixed/snapshot shares must be nonnegative with a positive sum")
+        if fixed_opponent_percent and not fixed_league.has_history:
+            raise ValueError("fixed opponent share requires fixed opponent checkpoints")
     if not match_capacities or len(match_capacities) != len(rich_capacities):
         raise ValueError("distributed resident capacities are invalid")
     if any(not 0 <= rich <= matches for matches, rich in zip(match_capacities, rich_capacities, strict=True)):
@@ -676,10 +1051,12 @@ def _balanced_assignments(
         if uniform_history_sampling
         else league.sample_history_candidates(rng, limit=HISTORY_CANDIDATES_PER_BATCH)
     )
-    uniform_history_cycle = []
+    uniform_history_cycle: list[LeagueEntryV4] = []
+    fixed_cycle: list[LeagueEntryV4] = []
     candidates: list[ClusterMatchAssignmentV4] = []
+    has_history = league.has_history or (split_mode and fixed_league.has_history)  # type: ignore[union-attr]
     matchups = tuple(
-        matchmaker.next_match(has_history=league.has_history, battle_level=battle_level)
+        matchmaker.next_match(has_history=has_history, battle_level=battle_level)
         for battle_level in matchmaker.battle_levels(total)
     )
     learner_opponents = (
@@ -706,7 +1083,32 @@ def _balanced_assignments(
                 deck1=(opponent_deck if current_owner == 0 else matchup.deck1),
             )
         opponent = None
-        if matchup.policy_matchup == POLICY_HISTORY:
+        if matchup.policy_matchup == POLICY_HISTORY and split_mode:
+            assert fixed_league is not None
+            use_fixed = bool(fixed_opponent_percent) and (
+                not history_percent or rng.randrange(fixed_opponent_percent + history_percent) < fixed_opponent_percent
+            )
+            use_anchor_il = False
+            if use_fixed and fixed_opponent_il_max_average_elixir is not None:
+                opponent_owner = 1 - matchup.current_owners[0]
+                opponent_deck = (matchup.deck0, matchup.deck1)[opponent_owner]
+                assert deck_average_elixir_by_id is not None
+                try:
+                    opponent_average_elixir = float(deck_average_elixir_by_id[opponent_deck.deck_id])
+                except KeyError as error:
+                    raise ValueError("fixed-opponent deck has no average-elixir value") from error
+                use_anchor_il = opponent_average_elixir <= fixed_opponent_il_max_average_elixir + 1e-12
+            if use_fixed and not use_anchor_il:
+                if not fixed_cycle:
+                    fixed_cycle = list(fixed_league.entries)
+                    rng.shuffle(fixed_cycle)
+                opponent = fixed_cycle.pop()
+            elif not use_fixed and history_candidates:
+                opponent = league.sample_history_from(rng, history_candidates)
+            else:
+                # An empty snapshot pool adds IL games, never self-play games.
+                matchup = replace(matchup, policy_matchup=POLICY_IL)
+        elif matchup.policy_matchup == POLICY_HISTORY:
             use_anchor_il = False
             if fixed_opponent_il_max_average_elixir is not None:
                 if len(matchup.current_owners) != 1:
@@ -823,7 +1225,6 @@ def _load_history_models(
     cache: dict[str, UniversalCardPolicyV4],
     *,
     device: torch.device,
-    gate_temperature: float,
 ) -> dict[str, UniversalCardPolicyV4]:
     required = {
         assignment.opponent.checkpoint_id: assignment.opponent
@@ -833,10 +1234,10 @@ def _load_history_models(
     for checkpoint_id, entry in required.items():
         if checkpoint_id in cache:
             continue
-        model, payload = _load_frozen_model(entry.checkpoint_path, device=device, gate_temperature=gate_temperature)
-        if str(payload["checkpoint_id"]) != checkpoint_id:
+        loaded = _load_interface_opponent_model(entry.checkpoint_path, device=device)
+        if loaded.checkpoint_id != checkpoint_id:
             raise ValueError("historical checkpoint file identity changed")
-        cache[checkpoint_id] = model
+        cache[checkpoint_id] = loaded.model
     # Historical models not selected in this wave need not consume GPU memory.
     for checkpoint_id in tuple(cache):
         if checkpoint_id not in required:
@@ -844,8 +1245,50 @@ def _load_history_models(
     return {checkpoint_id: cache[checkpoint_id] for checkpoint_id in required}
 
 
-def _validate_topology(ready: Mapping[str, object], *, world_size: int) -> tuple[int, int]:
-    """Validate the one supported production topology and return its dimensions."""
+DDP_BACKENDS = ("nccl", "gloo")
+
+
+def _rank_cuda_device_index(
+    local_rank: int, *, backend: str, device_count: int,
+    rank_cuda_device: Sequence[int] | None = None,
+) -> int:
+    """GPU of one rank: NCCL needs one GPU per rank; gloo may stack ranks on a GPU (round robin).
+
+    NCCL rejects two ranks on one GPU ("Duplicate GPU"); the 16.8M-parameter
+    policy's gradient all-reduce is cheap enough for gloo, which then lets
+    several single-threaded collector loops share one GPU.  Each rank is its
+    own process, so its CUDA context, CUDA Graph pools and static buffers are
+    separate by construction.
+    """
+
+    if backend not in DDP_BACKENDS:
+        raise ValueError(f"DDP backend must be one of {DDP_BACKENDS}")
+    if device_count <= 0 or local_rank < 0:
+        raise ValueError("rank device mapping needs visible GPUs and a nonnegative local rank")
+    if rank_cuda_device is not None:
+        mapping = tuple(int(value) for value in rank_cuda_device)
+        if local_rank >= len(mapping) or any(value < 0 or value >= device_count for value in mapping):
+            raise ValueError("rank_cuda_device contains an unavailable GPU or rank")
+        if backend == "nccl" and len(set(mapping)) != len(mapping):
+            raise ValueError("NCCL needs one visible GPU per rank; use --ddp-backend gloo to share GPUs")
+        return mapping[local_rank]
+    if backend == "nccl":
+        if local_rank >= device_count:
+            raise ValueError("NCCL needs one visible GPU per rank; use --ddp-backend gloo to share GPUs")
+        return local_rank
+    return local_rank % device_count
+
+
+def _validate_topology(
+    ready: Mapping[str, object], *, world_size: int, backend: str = "nccl"
+) -> tuple[int, int]:
+    """Validate the production topology and return ``(engine_count, slots_per_engine)``.
+
+    The slot count comes from the topology file (``resident_slots_per_engine``):
+    production runs one slot per native standalone engine with
+    any engine count over any number of nodes; the legacy 8-slot emulator
+    topology (same schema) stays accepted.
+    """
 
     if ready.get("schema") != "v4-ppo-multinode-topology.v1":
         raise ValueError("unsupported PPO topology schema")
@@ -853,13 +1296,28 @@ def _validate_topology(ready: Mapping[str, object], *, world_size: int) -> tuple
     expected_host = str(ready.get("trainer_host", "")).split(".", 1)[0]
     engine_count = int(ready.get("engine_count", -1))
     lanes = int(ready.get("resident_slots_per_engine", -1))
+    visible_devices = torch.cuda.device_count()
+    declared_devices = int(ready.get("cuda_devices", visible_devices))
+    rank_devices = ready.get("rank_cuda_device")
     checks = {
         "slurm_job_id": bool(expected_job) and os.environ.get("SLURM_JOB_ID") == expected_job,
         "host": bool(expected_host) and socket.gethostname().split(".", 1)[0] == expected_host,
         "world_size": world_size == int(ready.get("gpus", -1)),
-        "visible_gpu_count": torch.cuda.device_count() == world_size,
+        # NCCL: one GPU per rank.  gloo: ranks stacked evenly on the visible GPUs.
+        "visible_gpu_count": (
+            visible_devices == declared_devices and (visible_devices == world_size
+            if backend == "nccl"
+            else visible_devices > 0 and world_size % visible_devices == 0)
+        ),
+        "rank_cuda_device": rank_devices is None or (
+            isinstance(rank_devices, (list, tuple))
+            and len(rank_devices) == world_size
+            and declared_devices > 0
+            and all(isinstance(value, int) and 0 <= value < declared_devices for value in rank_devices)
+            and all(rank_devices.count(index) == world_size // declared_devices for index in range(declared_devices))
+        ),
         "engine_count": engine_count > 0,
-        "lanes": lanes == 8,
+        "lanes": lanes >= 1,
         "decision_ticks": int(ready.get("decision_ticks", -1)) == 5,
     }
     failed = [name for name, passed in checks.items() if not passed]
@@ -868,19 +1326,100 @@ def _validate_topology(ready: Mapping[str, object], *, world_size: int) -> tuple
     return engine_count, lanes
 
 
-def main() -> int:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deck-pool", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True, help="fresh learner initialization checkpoint")
     parser.add_argument(
-        "--il-anchor-checkpoint", type=Path, help="frozen IL opponent checkpoint; defaults to --checkpoint"
+        "--il-anchor-checkpoint",
+        type=Path,
+        help="frozen IL opponent checkpoint (argmax, the current-il share); defaults to --checkpoint",
+    )
+    parser.add_argument(
+        "--delay-policy",
+        choices=DELAY_POLICIES,
+        default=DELAY_POLICY_SAMPLE,
+        help=(
+            "delay-bin decoding for the learner, rollout and KL reference; frozen battle opponents "
+            "always use the interface default earliest. Set before CUDA Graph capture; with earliest, "
+            "delay never enters log-prob, entropy, ratio or KL"
+        ),
+    )
+    parser.add_argument(
+        "--gate-logit-offset",
+        default="0",
+        help=(
+            "ACT-logit correction added once to the learner and KL reference only; "
+            "'auto' = -ln(extra.gate_act_weight). Frozen battle opponents use the "
+            "interface's argmax loader without an added correction. PPO snapshots already carry it"
+        ),
+    )
+    parser.add_argument(
+        "--anchor-checkpoint",
+        type=Path,
+        help="frozen IL reference for the KL anchor (strong-v1); enables loss += beta*KL(pi||pi_ref)",
+    )
+    parser.add_argument("--anchor-kl-coef", type=float, default=0.05, help="initial adaptive beta")
+    parser.add_argument(
+        "--anchor-target-kl",
+        type=float,
+        default=0.02,
+        help="adaptive-controller target for gate+candidate+target KL in nats per valid frame",
+    )
+    parser.add_argument(
+        "--anchor-continue-kl-coef",
+        type=float,
+        help="initial continue-head coefficient beta_c (default 5 * --anchor-kl-coef)",
+    )
+    parser.add_argument(
+        "--anchor-continue-kl-mode",
+        choices=ANCHOR_CONTINUE_MODES,
+        default="tied",
+        help="tied: beta_c keeps its initial ratio to the adaptive beta; fixed: beta_c is constant",
+    )
+    parser.add_argument("--anchor-kl-horizon", type=float, default=4.0, help="controller horizon in updates")
+    parser.add_argument("--anchor-kl-coef-min", type=float, default=0.005)
+    parser.add_argument("--anchor-kl-coef-max", type=float, default=1.0)
+    parser.add_argument("--anchor-kl-fixed", action="store_true", help="disable beta adaptation")
+    parser.add_argument(
+        "--anchor-kl-no-decrease-updates",
+        type=int,
+        default=20,
+        help="first N controller updates after the critic warmup may only raise beta",
+    )
+    parser.add_argument(
+        "--critic-warmup-iters",
+        type=int,
+        default=DEFAULT_CRITIC_WARMUP_ITERS,
+        help="first N updates train only value-only modules; the actor (and expert BC) is frozen",
+    )
+    parser.add_argument(
+        "--environment-warmup-ticks",
+        type=int,
+        default=DEFAULT_ENVIRONMENT_WARMUP_TICKS,
+        help="native warmup ticks before the first training decision (default 130)",
+    )
+    parser.add_argument(
+        "--history-percent",
+        type=int,
+        default=0,
+        help="percent of games against the PFSP snapshot pool (separate from --fixed-opponent-percent)",
+    )
+    parser.add_argument(
+        "--opening-force-after-seconds",
+        type=int,
+        default=DEFAULT_OPENING_FORCE_AFTER_SECONDS,
+        help=(
+            "force the first legal ACT independently for each still-idle owner after this battle time; "
+            "applies to both learner and opponent in every matchup, including both self-play owners"
+        ),
     )
     parser.add_argument(
         "--il-opening-force-after-seconds",
         type=int,
         help=(
-            "force the IL anchor's first legal ACT after this battle time if "
-            "it has not acted; never force the learner or fixed opponents"
+            "legacy compatibility option; must equal --opening-force-after-seconds because "
+            "all training owners now share the same opening deadline"
         ),
     )
     parser.add_argument(
@@ -930,12 +1469,30 @@ def main() -> int:
     parser.add_argument("--engine-ready", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--updates", type=int, default=2)
+    parser.add_argument(
+        "--retain-rollout-cuda-graphs", action="store_true",
+        help="keep captured rollout graphs across in-place PPO updates (requires GPU memory headroom)",
+    )
+    parser.add_argument(
+        "--rollout-device-cache-gib", type=float, default=0.0,
+        help="per-rank GPU byte budget for a dtype-packed whole-rollout input cache (0 disables)",
+    )
+    parser.add_argument(
+        "--rollout-indexed-state-graphs", action="store_true",
+        help="include recurrent state gather/scatter in rollout CUDA Graphs",
+    )
+    parser.add_argument("--rollout-adaptive-batching", action="store_true",
+                        help="coalesce in-flight frames up to one GPU batch latency, bounded at 25 ms")
+    parser.add_argument("--rollout-cache-static-memory", action="store_true",
+                        help="cache observation-independent effect/profile encodings for each fixed-policy wave")
     parser.add_argument("--rollout-segment-seconds", type=int, default=40)
     parser.add_argument("--snapshot-every", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--gamma", type=float, default=0.9997)
     parser.add_argument("--gae-lambda", type=float, default=0.98)
     parser.add_argument("--shaping-beta", type=float, default=0.05)
+    parser.add_argument("--terminal-reward-scale", type=float, default=1.0,
+                        help="absolute terminal win/loss reward; draw remains zero")
     parser.add_argument(
         "--personal-elixir-overflow-penalty",
         dest="personal_elixir_overflow_penalty",
@@ -954,7 +1511,26 @@ def main() -> int:
     parser.add_argument("--elixir-overflow-step-penalty-cap", type=float, default=0.1)
     parser.add_argument("--clip-range", type=float, default=0.1)
     parser.add_argument("--hog-deploy-reward", type=float, default=0.0)
-    parser.add_argument("--fireball-king-activation-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--fireball-king-activation-penalty",
+        type=float,
+        default=0.0,
+        help="legacy Fireball-only one-sided penalty; keep 0 with --king-activation-penalty",
+    )
+    parser.add_argument(
+        "--king-activation-penalty",
+        type=float,
+        default=DEFAULT_KING_ACTIVATION_PENALTY,
+        help="zero-sum first enemy-king activation penalty c (activator -c, victim +c); stats recorded at c=0",
+    )
+    parser.add_argument("--king-activation-scope", choices=KING_ACTIVATION_SCOPES, default=DEFAULT_KING_ACTIVATION_SCOPE)
+    parser.add_argument(
+        "--king-shaping-mode",
+        choices=KING_SHAPING_MODES,
+        default="princess_gated",
+        help="princess_gated: king damage is out of the tower potential while all princess towers stand",
+    )
+    parser.add_argument("--king-potential-weight", type=float, default=DEFAULT_KING_POTENTIAL_WEIGHT)
     parser.add_argument("--hog-deploy-reward-episode-cap", type=float, default=0.1)
     parser.add_argument(
         "--hog-deploy-opening-reward",
@@ -971,8 +1547,26 @@ def main() -> int:
     parser.add_argument("--ppo-epochs", type=int, default=2)
     parser.add_argument("--lane-minibatch-size", type=int, default=256)
     parser.add_argument("--lane-microbatch-size", type=int, default=96)
+    parser.add_argument(
+        "--activation-checkpointing",
+        choices=("none", "default", "all"),
+        default="none",
+        help=(
+            "learner-only recompute in the PPO backward (default = attention+spatial, all = +pair-bias); "
+            "ignored under no_grad and CUDA Graph capture, so rollout inference is unchanged"
+        ),
+    )
     parser.add_argument("--sequence-chunk-steps", type=int, default=48)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument(
+        "--max-episode-failure-rate",
+        type=float,
+        default=DEFAULT_MAX_EPISODE_FAILURE_RATE,
+        help=(
+            "a failed match (e.g. BattleEnvError) is dropped and logged to episode_failures.jsonl; the run "
+            "still fails when the current wave's failure rate exceeds this fraction (0 = fail on any)"
+        ),
+    )
     parser.add_argument("--expert-bc-manifest", type=Path)
     parser.add_argument("--expert-bc-coefficient", type=float, default=0.2)
     parser.add_argument("--expert-bc-records-per-rank", type=int, default=2)
@@ -980,13 +1574,100 @@ def main() -> int:
     parser.add_argument("--expert-bc-hog-gate-weight", type=float, default=0.0)
     parser.add_argument("--expert-bc-hog-gate-scope", choices=("all", "proactive-first"), default="all")
     parser.add_argument("--expert-bc-hog-gate-gradient-scope", choices=("full", "gate-head-only"), default="full")
-    parser.add_argument("--gate-temperature-start", type=float, default=DEFAULT_GATE_TEMPERATURE_START)
-    parser.add_argument("--gate-temperature-end", type=float, default=DEFAULT_GATE_TEMPERATURE_END)
+    parser.add_argument(
+        "--expert-bc-delay-weight",
+        type=float,
+        help="BC delay-head weight (default 0 under --delay-policy earliest, else the legacy 1)",
+    )
+    parser.add_argument(
+        "--expert-bc-continue-second-weight",
+        type=float,
+        help="BC SECOND class weight (default 32 under --delay-policy earliest = strong-v1 IL, else 1)",
+    )
+    parser.add_argument(
+        "--gate-temperature-start",
+        type=float,
+        help=f"default {DEFAULT_GATE_TEMPERATURE_START}; default 1 with --anchor-checkpoint",
+    )
+    parser.add_argument(
+        "--gate-temperature-end",
+        type=float,
+        help=f"default {DEFAULT_GATE_TEMPERATURE_END}; default 1 with --anchor-checkpoint",
+    )
     parser.add_argument("--gate-temperature-anneal-updates", type=int, default=DEFAULT_GATE_TEMPERATURE_ANNEAL_UPDATES)
-    parser.add_argument("--continue-temperature", type=float, default=DEFAULT_CONTINUE_TEMPERATURE)
+    parser.add_argument(
+        "--continue-temperature",
+        type=float,
+        help=f"default {DEFAULT_CONTINUE_TEMPERATURE}; default 1 with --anchor-checkpoint",
+    )
+    parser.add_argument(
+        "--ddp-backend",
+        choices=DDP_BACKENDS,
+        default="nccl",
+        help="gloo allows several ranks per GPU (world size a multiple of the visible GPU count)",
+    )
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--validate", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--preflight-only", action="store_true",
+                        help="validate topology/model/config startup, write preflight.json and exit before collection")
+    return parser
+
+
+def _expert_bc_loss_weights(args: argparse.Namespace) -> ILLossWeightsV4:
+    """BC weights consistent with the IL objective (strong-v1: delay 0, SECOND x32)."""
+
+    earliest = args.delay_policy != DELAY_POLICY_SAMPLE
+    delay = (0.0 if earliest else 1.0) if args.expert_bc_delay_weight is None else float(args.expert_bc_delay_weight)
+    second = (
+        (32.0 if earliest else 1.0)
+        if args.expert_bc_continue_second_weight is None
+        else float(args.expert_bc_continue_second_weight)
+    )
+    return ILLossWeightsV4(value=0.0, delay=delay, continue_second_weight=second)
+
+
+def _resolve_opponent_mix(args: argparse.Namespace) -> dict[str, int]:
+    """current-il (frozen IL argmax) / self-play / fixed checkpoints / PFSP snapshots, in percent."""
+
+    self_play = int(args.self_play_percent)
+    fixed = int(args.fixed_opponent_percent)
+    history = int(args.history_percent)
+    for name, value in (("self-play", self_play), ("fixed opponent", fixed), ("history", history)):
+        if not 0 <= value <= 100:
+            raise ValueError(f"{name} percent must be in [0, 100]")
+    if fixed and not args.fixed_opponent_checkpoint:
+        raise ValueError("fixed opponent percent requires at least one checkpoint")
+    if args.fixed_opponent_checkpoint and not fixed:
+        raise ValueError("fixed opponent checkpoints require a positive percent")
+    il = 100 - self_play - fixed - history
+    if il < 0:
+        raise ValueError("self-play, fixed opponent and history percentages exceed 100")
+    return {"current_il": il, "self_play": self_play, "fixed_opponent": fixed, "history": history}
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+    anchor_kl_config = _anchor_kl_config(args)
+    (gate_temperature_start, gate_temperature_end, continue_temperature) = _resolve_temperatures(
+        args, anchor_enabled=anchor_kl_config is not None
+    )
+    args.gate_temperature_start = gate_temperature_start
+    args.gate_temperature_end = gate_temperature_end
+    args.continue_temperature = continue_temperature
+    if not math.isfinite(args.max_episode_failure_rate) or not 0.0 <= args.max_episode_failure_rate <= 1.0:
+        raise ValueError("--max-episode-failure-rate must be in [0, 1]")
+    if args.critic_warmup_iters < 0:
+        raise ValueError("critic warmup iterations cannot be negative")
+    if args.environment_warmup_ticks <= 0:
+        raise ValueError("environment warmup ticks must be positive")
+    validate_king_reward_parameters_v4(
+        king_activation_penalty=args.king_activation_penalty,
+        king_activation_scope=args.king_activation_scope,
+        king_shaping_mode=args.king_shaping_mode,
+        king_potential_weight=args.king_potential_weight,
+    )
+    expert_bc_loss_weights = _expert_bc_loss_weights(args)
     if (
         not math.isfinite(args.expert_bc_coefficient)
         or args.expert_bc_coefficient <= 0
@@ -997,34 +1678,30 @@ def main() -> int:
         raise ValueError("expert Hog gate weight must be finite and nonnegative")
     if args.expert_bc_hog_gate_weight and args.expert_bc_manifest is None:
         raise ValueError("expert Hog gate supervision requires an expert BC manifest")
-    if args.il_opening_force_after_seconds is not None and args.il_opening_force_after_seconds <= 0:
-        raise ValueError("IL opening timeout must be positive")
-    opening_force_config = (
-        {"enabled": False}
-        if args.il_opening_force_after_seconds is None
-        else {
-            "enabled": True,
-            "scope": "il-anchor-only",
-            "after_seconds": args.il_opening_force_after_seconds,
-            "condition": "IL has not acted since game start",
-            "once_per_game": True,
-            "force_learner": False,
-            "force_fixed_opponents": False,
-            "downstream_decode": "IL argmax over legal actions",
-        }
-    )
+    opening_force_options = _training_opening_force_options(args)
+    opening_force_config = {
+        "enabled": True,
+        "scope": "both-owners-all-matchups",
+        "after_seconds": args.opening_force_after_seconds,
+        "condition": "each owner has not acted, independently of the other owner's activity",
+        "once_per_owner_per_game": True,
+        "force_learner": True,
+        "force_fixed_opponents": True,
+        "downstream_decode": "frozen opponents use interface argmax; learner keeps sampling",
+    }
     il_anchor_checkpoint = args.il_anchor_checkpoint or args.checkpoint
-    self_play_percent = int(args.self_play_percent)
-    fixed_opponent_percent = int(args.fixed_opponent_percent)
+    opponent_mix = _resolve_opponent_mix(args)
+    self_play_percent = opponent_mix["self_play"]
+    fixed_opponent_percent = opponent_mix["fixed_opponent"]
+    history_percent = opponent_mix["history"]
     fixed_opponent_paths = tuple(args.fixed_opponent_checkpoint)
-    if not 0 <= self_play_percent <= 100:
-        raise ValueError("self-play percent must be in [0, 100]")
-    if not 0 <= fixed_opponent_percent <= 100:
-        raise ValueError("fixed opponent percent must be in [0, 100]")
-    if fixed_opponent_percent and not fixed_opponent_paths:
-        raise ValueError("fixed opponent percent requires at least one checkpoint")
-    if fixed_opponent_paths and not fixed_opponent_percent:
-        raise ValueError("fixed opponent checkpoints require a positive percent")
+    if str(args.gate_logit_offset).strip().lower() != "auto":
+        try:
+            gate_offset_value = float(args.gate_logit_offset)
+        except ValueError as error:
+            raise ValueError("--gate-logit-offset must be 'auto' or a number") from error
+        if not math.isfinite(gate_offset_value):
+            raise ValueError("--gate-logit-offset must be finite")
     fixed_opponent_il_max_average_elixir = (
         None if args.fixed_opponent_il_max_average_elixir is None else float(args.fixed_opponent_il_max_average_elixir)
     )
@@ -1059,13 +1736,13 @@ def main() -> int:
     resolved_fixed_paths = tuple(path.resolve() for path in fixed_opponent_paths)
     if len(set(resolved_fixed_paths)) != len(resolved_fixed_paths):
         raise ValueError("fixed opponent checkpoint paths must be unique")
-    il_opponent_percent = 100 - self_play_percent - fixed_opponent_percent
-    if il_opponent_percent < 0:
-        raise ValueError("self-play and fixed opponent percentages exceed 100")
+    il_opponent_percent = opponent_mix["current_il"]
+    # The matchmaker's history share covers both fixed checkpoints and PFSP
+    # snapshots; _balanced_assignments splits it by the two CLI shares.
     matchmaker_config = MatchmakerConfigV4(
         current_current=self_play_percent,
         current_il=il_opponent_percent,
-        current_history=fixed_opponent_percent,
+        current_history=fixed_opponent_percent + history_percent,
         focus_tail_current_focus_percent=75,
     )
     positive = (
@@ -1112,9 +1789,16 @@ def main() -> int:
     if not dist.is_available():
         raise RuntimeError("PyTorch distributed support is unavailable")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    dist.init_process_group(backend="nccl")
+    ready = json.loads(args.engine_ready.read_text(encoding="utf-8"))
+    if not isinstance(ready, Mapping) or ready.get("ok") is not True:
+        raise RuntimeError("production PPO topology is not ready")
+    device_index = _rank_cuda_device_index(
+        local_rank, backend=args.ddp_backend, device_count=torch.cuda.device_count(),
+        rank_cuda_device=ready.get("rank_cuda_device"),
+    )
+    torch.cuda.set_device(device_index)
+    device = torch.device("cuda", device_index)
+    dist.init_process_group(backend=args.ddp_backend)
     # Establish rank-to-device identity before the first barrier so NCCL never
     # has to guess which GPU a process owns.
     device_probe = torch.zeros((), device=device)
@@ -1131,7 +1815,7 @@ def main() -> int:
     ready = json.loads(args.engine_ready.read_text(encoding="utf-8"))
     if not isinstance(ready, Mapping) or ready.get("ok") is not True:
         raise ValueError("engine readiness artifact is invalid")
-    engine_count, lanes = _validate_topology(ready, world_size=world_size)
+    engine_count, lanes = _validate_topology(ready, world_size=world_size, backend=args.ddp_backend)
     engine_hosts = _ready_engine_hosts(ready, engine_count=engine_count)
     engine_ports = _ready_engine_ports(ready, engine_count=engine_count)
     engine_worker_ports = _ready_engine_worker_ports(ready, engine_count=engine_count)
@@ -1164,6 +1848,7 @@ def main() -> int:
         (args.output_dir / "league-checkpoints").mkdir(parents=True, exist_ok=True)
     dist.barrier()
     metrics_path = args.output_dir / "metrics.jsonl"
+    phase_path = args.output_dir / "phase.json"
     matches_path = args.output_dir / "matches.jsonl"
     league_path = args.output_dir / "league.json"
 
@@ -1177,16 +1862,35 @@ def main() -> int:
     except KeyError as error:
         raise ValueError("learner deck ID is absent from the deck pool") from error
     environment_config = ppo_environment_config_v4(gamma_per_decision=args.gamma, shaping_beta=args.shaping_beta)
+    # Worker-side override only (AsyncResidentEngineSpecV4.environment_warmup_ticks);
+    # EnvironmentConfigV1's default stays 130.  The local copy keeps config.json's
+    # ruleset identity equal to what the workers build.
+    environment_config = replace(environment_config, warmup_ticks=int(args.environment_warmup_ticks))
     max_decision_steps = math.ceil(environment_config.max_battle_ticks / 5) + 4
 
-    current_model = build_production_model_v4(device=device)
+    def make_optimizer(model: UniversalCardPolicyV4) -> torch.optim.Optimizer:
+        return torch.optim.AdamW(model.parameters(), lr=args.learning_rate, eps=1e-5, weight_decay=0.0)
+
+    # Learner == actor (same object).  Built from the checkpoint's contract,
+    # delay policy and gate correction set before any CUDA Graph capture.
+    current_model, current_payload, optimizer = _load_contract_model(
+        args.checkpoint if args.resume_checkpoint is None else args.resume_checkpoint,
+        device=device,
+        delay_policy=args.delay_policy,
+        gate_logit_offset=args.gate_logit_offset,
+        # Only a strict PPO resume restores optimizer state (never the IL one).
+        optimizer_factory=None if args.resume_checkpoint is None else make_optimizer,
+    )
+    gate_logit_offset_applied = _gate_logit_offset_of(current_model)
     # Actor batches and learner ACT batches have different row groupings.
     # BF16 location logits are unusually sensitive to those GEMM/conv shapes,
     # so keep this small head in FP32 while the rest of PPO remains autocast.
     current_model.set_ppo_location_head_fp32(True)
-    optimizer = torch.optim.AdamW(current_model.parameters(), lr=args.learning_rate, eps=1e-5, weight_decay=0.0)
+    current_model.set_activation_checkpointing(
+        {"none": False, "default": True, "all": ("pair-bias", "attention", "spatial")}[args.activation_checkpointing]
+    )
     if args.resume_checkpoint is None:
-        current_payload = load_actor_critic_checkpoint(args.checkpoint, current_model, map_location=device)
+        optimizer = make_optimizer(current_model)
         _set_temperatures(
             current_model,
             gate_temperature=_gate_temperature_for_update(
@@ -1199,9 +1903,7 @@ def main() -> int:
         )
         initial_update_step = 0
     else:
-        current_payload = load_actor_critic_checkpoint(
-            args.resume_checkpoint, current_model, optimizer=optimizer, map_location=device
-        )
+        assert optimizer is not None
         if current_payload.get("optimizer_state_dict") is None:
             raise ValueError("resume checkpoint lacks optimizer state")
         initial_update_step = int(current_payload["update_step"])
@@ -1224,10 +1926,33 @@ def main() -> int:
     actor_model = current_model
     segment_actor_stream = torch.cuda.Stream(device=actor_device)
     actor_state_id = behavior_state_id
-    anchor_model, anchor_payload = _load_frozen_model(
-        il_anchor_checkpoint, device=actor_device, gate_temperature=args.gate_temperature_start
-    )
-    anchor_state_id = str(anchor_payload["checkpoint_id"])
+    reference_model_options = {
+        "device": actor_device,
+        "delay_policy": args.delay_policy,
+        "gate_logit_offset": args.gate_logit_offset,
+        "gate_temperature": args.gate_temperature_start,
+        "continue_temperature": args.continue_temperature,
+    }
+    anchor_policy = _load_interface_opponent_model(il_anchor_checkpoint, device=actor_device)
+    anchor_model, anchor_state_id = anchor_policy.model, anchor_policy.checkpoint_id
+    # The calibrated KL reference must never share the deployed opponent object.
+    reference_model: UniversalCardPolicyV4 | None = None
+    reference_state_id: str | None = None
+    if args.anchor_checkpoint is not None:
+        reference_model, reference_payload = _load_frozen_model(
+            args.anchor_checkpoint, sampling=False, **reference_model_options
+        )
+        reference_state_id = str(reference_payload["checkpoint_id"])
+        if asdict(reference_model.config) != asdict(current_model.config) and rank == 0:
+            print(
+                {
+                    "event": "ppo_anchor_architecture_differs",
+                    "learner": asdict(current_model.config),
+                    "reference": asdict(reference_model.config),
+                },
+                flush=True,
+            )
+    anchor_controller = None if anchor_kl_config is None else AdaptiveKLControllerV4(anchor_kl_config)
     expert_bc_sampler = (
         None
         if args.expert_bc_manifest is None
@@ -1247,6 +1972,7 @@ def main() -> int:
             hog_gate_weight=args.expert_bc_hog_gate_weight,
             hog_gate_scope=args.expert_bc_hog_gate_scope,
             hog_gate_gradient_scope=args.expert_bc_hog_gate_gradient_scope,
+            loss_weights=expert_bc_loss_weights,
         )
     )
     bc_identities = [None for _ in range(world_size)]
@@ -1254,9 +1980,40 @@ def main() -> int:
     if any(item != expert_bc_contract for item in bc_identities):
         raise RuntimeError("GPU ranks loaded different expert BC contracts")
     resume_contract = {
-        "schema": "v4-ppo-strict-resume.v1",
+        # Strict part (STRICT_RESUME_KEYS): architecture / observation / action
+        # contract and data contract.  The rest may change on resume.
+        "schema": RESUME_CONTRACT_SCHEMA,
+        "learner_contract": checkpoint_contract(current_model),
+        "delay_policy": args.delay_policy,
+        "gate_logit_offset": gate_logit_offset_applied,
+        "behavior_temperatures": {
+            "action": current_model.ppo_action_temperature,
+            "continue": args.continue_temperature,
+        },
+        "gate_temperature_schedule": (
+            args.gate_temperature_start,
+            args.gate_temperature_end,
+            args.gate_temperature_anneal_updates,
+        ),
+        "environment_warmup_ticks": int(args.environment_warmup_ticks),
+        "training_command_delay": {
+            "server_delay_ticks": 20, "card_jitter_ticks": (0, 3),
+            "distribution": "uniform_integer_per_actor_compound", "earliest_total_ticks": (21, 24),
+        },
+        "decision_ticks": 5,
         "anchor_checkpoint_id": anchor_state_id,
-        "deck_pool": str(args.deck_pool.resolve()),
+        "il_anchor_kl": (
+            None
+            if anchor_kl_config is None
+            else {**anchor_kl_config.contract(), "reference_checkpoint_id": reference_state_id,
+                  "reference_state": "per-resident-actor frozen LSTM carried across rollout segments",
+                  "temperatures": "actual rollout temperatures for both learner and reference"}
+        ),
+        "critic_warmup_iters": int(args.critic_warmup_iters),
+        "reward_parameters": _king_reward_parameters(args),
+        # Content identity (strict) so a run can resume on another cluster path.
+        "deck_pool": "sha256:" + hashlib.sha256(args.deck_pool.read_bytes()).hexdigest(),
+        "deck_pool_path": str(args.deck_pool.resolve()),
         "engine_count": engine_count,
         "resident_slots_per_engine": lanes,
         "world_size": world_size,
@@ -1265,6 +2022,7 @@ def main() -> int:
         "gamma": args.gamma,
         "gae_lambda": args.gae_lambda,
         "shaping_beta": args.shaping_beta,
+        "terminal_reward_scale": args.terminal_reward_scale,
         "hog_deploy_reward": args.hog_deploy_reward,
         **(
             {"fireball_king_activation_penalty": args.fireball_king_activation_penalty}
@@ -1292,6 +2050,7 @@ def main() -> int:
         "ppo_epochs": args.ppo_epochs,
         "lane_minibatch_size": args.lane_minibatch_size,
         "lane_microbatch_size": args.lane_microbatch_size,
+        "activation_checkpointing": args.activation_checkpointing,
         "sequence_chunk_steps": args.sequence_chunk_steps,
         "max_grad_norm": args.max_grad_norm,
         "gate_temperature_start": args.gate_temperature_start,
@@ -1307,8 +2066,20 @@ def main() -> int:
             matchmaker_config.current_il,
             matchmaker_config.current_history,
         ),
+        "opponent_mix_percent": opponent_mix,
+        "il_opponent_decision": "argmax",
+        "frozen_opponent_inference": {
+            "loader": "load_policy_v4 (launch_interface.cmd)",
+            "decision": "argmax",
+            "delay_policy": DELAY_POLICY_EARLIEST,
+            "additional_gate_logit_offset": 0.0,
+            "temperatures": "checkpoint values (no learner overrides)",
+            "scope": ["current-il", "history", "fixed"],
+        },
         "self_play_percent": self_play_percent,
         "fixed_opponent_percent": fixed_opponent_percent,
+        "history_percent": history_percent,
+        "empty_history_fallback": POLICY_IL,
         "fixed_opponent_checkpoints": tuple(str(path) for path in resolved_fixed_paths),
         "fixed_opponent_il_max_average_elixir": (fixed_opponent_il_max_average_elixir),
         "learner_deck_id": learner_deck_id,
@@ -1323,15 +2094,19 @@ def main() -> int:
         "focus_tail_current_focus_percent": 75,
         "opening_force": opening_force_config,
     }
-    # Omit the optional key when disabled to preserve old no-BC strict resumes.
-    if expert_bc_contract is not None:
-        resume_contract["expert_bc"] = expert_bc_contract
+    resume_contract["expert_bc"] = expert_bc_contract
     resume_extra = current_payload.get("extra")
+    resume_contract_changes: dict[str, dict[str, Any]] = {}
+    anchor_controller_restored = False
     if args.resume_checkpoint is not None:
         if not isinstance(resume_extra, Mapping) or (resume_extra.get("strict_boundary") is not True):
             raise ValueError("resume checkpoint is not a strict PPO boundary")
-        if resume_extra.get("resume_contract") != resume_contract:
-            raise ValueError("resume checkpoint training contract changed")
+        resume_contract_changes = _check_resume_contract(resume_extra.get("resume_contract"), resume_contract)
+        if anchor_controller is not None and isinstance(resume_extra.get("anchor_kl_controller_state"), Mapping):
+            # Same anchor config -> continue the adaptive beta; changed -> restart from the CLI.
+            anchor_controller_restored = anchor_controller.load_state_dict(resume_extra["anchor_kl_controller_state"])
+        if rank == 0 and resume_contract_changes:
+            print({"event": "ppo_resume_contract_changes", "changes": resume_contract_changes}, flush=True)
         initial_batch_index = int(resume_extra["next_batch_index"])
     else:
         initial_batch_index = 1
@@ -1367,17 +2142,21 @@ def main() -> int:
     )
     league = None
     league_rng = None
+    fixed_league = None
     if rank == 0:
         league_rng = random.Random(args.seed ^ 0x4F31_AA09)
+        # Fixed opponents live in their own league (uniform), so the PFSP
+        # snapshot pool keeps growing and sampling when fixed opponents exist.
+        fixed_league = PolicyLeagueV4(anchor_checkpoint_id=anchor_state_id, anchor_checkpoint_path=il_anchor_checkpoint)
+        for fixed_path in resolved_fixed_paths:
+            if args.resume_checkpoint is None and fixed_path == args.checkpoint.resolve():
+                fixed_checkpoint_id = source_checkpoint_id
+                fixed_update_step = int(current_payload["update_step"])
+            else:
+                fixed_checkpoint_id, fixed_update_step = _checkpoint_identity(fixed_path)
+            fixed_league.add_snapshot(fixed_checkpoint_id, fixed_path, update_step=fixed_update_step)
         if args.resume_checkpoint is None:
             league = PolicyLeagueV4(anchor_checkpoint_id=anchor_state_id, anchor_checkpoint_path=il_anchor_checkpoint)
-            for fixed_path in resolved_fixed_paths:
-                if fixed_path == args.checkpoint.resolve():
-                    fixed_checkpoint_id = source_checkpoint_id
-                    fixed_update_step = int(current_payload["update_step"])
-                else:
-                    fixed_checkpoint_id, fixed_update_step = _checkpoint_identity(fixed_path)
-                league.add_snapshot(fixed_checkpoint_id, fixed_path, update_step=fixed_update_step)
         else:
             assert isinstance(resume_extra, Mapping) and matchmaker is not None
             matchmaker_state = resume_extra.get("matchmaker_state")
@@ -1392,7 +2171,24 @@ def main() -> int:
                 learner_opponent_sampler.load_state_dict(sampler_state)
             league = PolicyLeagueV4.from_dict(league_state)
             if league.anchor_checkpoint_id != anchor_state_id:
-                raise ValueError("resume checkpoint IL anchor changed")
+                # The IL anchor is an opponent/anchor parameter: allowed to change on resume.
+                print(
+                    {
+                        "event": "ppo_resume_il_anchor_changed",
+                        "checkpoint": league.anchor_checkpoint_id,
+                        "current": anchor_state_id,
+                    },
+                    flush=True,
+                )
+                league = PolicyLeagueV4(
+                    anchor_checkpoint_id=anchor_state_id,
+                    anchor_checkpoint_path=il_anchor_checkpoint,
+                    entries=tuple(league.entries),
+                )
+            stored_fixed = resume_extra.get("fixed_league_state")
+            if isinstance(stored_fixed, Mapping):
+                previous = {item.checkpoint_id: item for item in PolicyLeagueV4.from_dict(stored_fixed).entries}
+                fixed_league.entries = [previous.get(item.checkpoint_id, item) for item in fixed_league.entries]
             league_rng.setstate(resume_extra["league_rng_state"])
     history_cache: dict[str, UniversalCardPolicyV4] = {}
 
@@ -1407,10 +2203,17 @@ def main() -> int:
             capture_mode="compact",
             worker_host=engine_worker_hosts[engine_index],
             worker_port=engine_worker_ports[engine_index],
-            force_il_opponent_opening_after_seconds=(args.il_opening_force_after_seconds),
+            **opening_force_options,
+            environment_warmup_ticks=int(args.environment_warmup_ticks),
+            training_command_delay_jitter_ticks=3,
         )
         for engine_index in engine_indices
     )
+    # Learner and KL reference share the training delay policy. Frozen battle
+    # opponents independently retain the interface's earliest delay policy.
+    for label, model in (("learner", current_model), ("reference", reference_model)):
+        if model is not None and model.delay_policy != args.delay_policy:
+            raise RuntimeError(f"{label} delay policy {model.delay_policy!r} != {args.delay_policy!r}")
     dist.barrier()
 
     wandb_run: Any | None = None
@@ -1456,15 +2259,50 @@ def main() -> int:
             },
             "entropy_coefficient": 0.0,
             "inference_batch_wait_ms": 2.0,
+            "inference_batch_wait_max_ms": 25.0 if args.rollout_adaptive_batching else 2.0,
             "capture_mode": "compact",
             "collector": "remote-segmented-cuda-graph",
             "expert_bc": expert_bc_contract,
+            "expert_bc_loss_weights": asdict(expert_bc_loss_weights) if expert_bc_contract is not None else None,
+            "anchor_checkpoint": None if args.anchor_checkpoint is None else str(args.anchor_checkpoint.resolve()),
+            "anchor_reference_checkpoint_id": reference_state_id,
+            "anchor_kl_controller_restored": anchor_controller_restored,
+            "resume_contract_changes": resume_contract_changes,
+            "learner_model_config": asdict(current_model.config),
+            "gate_logit_offset_applied": gate_logit_offset_applied,
             "wandb": {"mode": "offline", "project": WANDB_PROJECT},
         }
         (args.output_dir / "config.json").write_text(
             json.dumps(run_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        wandb_run = _init_offline_wandb(args.output_dir, run_config)
+        if not args.preflight_only:
+            wandb_run = _init_offline_wandb(args.output_dir, run_config)
+
+    if args.preflight_only:
+        if rank == 0:
+            preflight = {
+                "startup_validated": True,
+                "world_size": world_size,
+                "rollout_segment_seconds": args.rollout_segment_seconds,
+                "gate_temperature_start": args.gate_temperature_start,
+                "gate_temperature_end": args.gate_temperature_end,
+                "behavior_temperatures": run_config["behavior_temperatures"],
+                "gate_logit_offset_applied": gate_logit_offset_applied,
+                "learner_and_opponent_gate_bias_equal": torch.equal(
+                    current_model.gate_head[-1].bias, anchor_model.gate_head[-1].bias),
+                "reference_enabled": reference_model is not None,
+                "reference_state": "independent recurrence carried across resident segments",
+                "opening_force": opening_force_config,
+                "gae_lambda": args.gae_lambda,
+                "shaping_beta": args.shaping_beta,
+                "collection_started": False,
+                "optimizer_steps": 0,
+            }
+            (args.output_dir / "preflight.json").write_text(json.dumps(preflight, indent=2) + "\n")
+            print(json.dumps({"event": "ppo_preflight_complete", **preflight}), flush=True)
+        dist.barrier()
+        dist.destroy_process_group()
+        return 0
 
     ppo_config = PPOConfigV4(
         gamma=args.gamma,
@@ -1477,11 +2315,20 @@ def main() -> int:
         target_kl=args.target_kl,
     )
 
+    # Stored with every PPO checkpoint: the gate correction is already in the
+    # gate bias (never applied twice on reload), and the delay policy it used.
+    checkpoint_policy_extra = {
+        GATE_LOGIT_OFFSET_EXTRA_KEY: gate_logit_offset_applied,
+        "delay_policy": args.delay_policy,
+    }
+
     def prepare_collection(
         policy_state_id: str,
     ) -> tuple[tuple[ClusterMatchAssignmentV4, ...], dict[str, UniversalCardPolicyV4], str]:
         if rank == 0:
             assert matchmaker is not None and league is not None and league_rng is not None
+            assert fixed_league is not None
+            split_shares = fixed_opponent_percent + history_percent > 0
             schedule = _balanced_assignments(
                 matchmaker,
                 league,
@@ -1489,11 +2336,13 @@ def main() -> int:
                 match_capacities=match_capacities,
                 rich_capacities=rich_capacities,
                 special_towers_require_rich=False,
-                uniform_history_sampling=bool(resolved_fixed_paths),
                 fixed_opponent_il_max_average_elixir=(fixed_opponent_il_max_average_elixir),
                 deck_average_elixir_by_id=deck_average_elixir_by_id,
                 learner_deck=learner_deck,
                 learner_opponent_sampler=learner_opponent_sampler,
+                fixed_league=fixed_league if split_shares else None,
+                fixed_opponent_percent=fixed_opponent_percent,
+                history_percent=history_percent,
             )
         else:
             schedule = None
@@ -1506,7 +2355,9 @@ def main() -> int:
         rng_state = _rank_rng_state(device)
         try:
             historical = _load_history_models(
-                local, history_cache, device=actor_device, gate_temperature=args.gate_temperature_start
+                local,
+                history_cache,
+                device=actor_device,
             )
         finally:
             _set_rank_rng_state(rng_state, device=device)
@@ -1531,7 +2382,12 @@ def main() -> int:
                     historical,
                     gamma_per_decision=args.gamma,
                     shaping_beta=args.shaping_beta,
+                    terminal_reward_scale=args.terminal_reward_scale,
                     fireball_king_activation_penalty=args.fireball_king_activation_penalty,
+                    indexed_state_graphs=args.rollout_indexed_state_graphs,
+                    adaptive_batching=args.rollout_adaptive_batching,
+                    cache_static_memory=args.rollout_cache_static_memory,
+                    **_king_reward_parameters(args),
                     hog_deploy_reward=args.hog_deploy_reward,
                     hog_deploy_reward_episode_cap=args.hog_deploy_reward_episode_cap,
                     hog_deploy_opening_reward=args.hog_deploy_opening_reward,
@@ -1546,6 +2402,7 @@ def main() -> int:
                     unilateral_elixir_overflow_penalty=(args.unilateral_elixir_overflow_penalty),
                     elixir_overflow_step_penalty_cap=(args.elixir_overflow_step_penalty_cap),
                     policy_state_id=policy_state_id,
+                    tolerate_episode_failures=True,
                     max_decision_steps=max_decision_steps,
                     validate_tensors=args.validate,
                     segment_decision_steps=args.rollout_segment_seconds * 4,
@@ -1563,6 +2420,7 @@ def main() -> int:
     segment_assignments: tuple[ClusterMatchAssignmentV4, ...] | None = None
     segment_history_models: dict[str, UniversalCardPolicyV4] | None = None
     segment_session_can_resume = True
+    reference_states = ReferenceStateCacheV4() if reference_model is not None else None
     resume_rng_pending = args.resume_checkpoint is not None
 
     def start_segment_session(policy_state_id: str) -> None:
@@ -1572,6 +2430,8 @@ def main() -> int:
         nonlocal resume_rng_pending
         if segment_executor is not None or segment_future is not None:
             raise RuntimeError("segmented collector session is already running")
+        if reference_states is not None:
+            reference_states.clear()
         (segment_assignments, segment_history_models, segment_policy_state_id) = prepare_collection(policy_state_id)
         if resume_rng_pending:
             _restore_rank_rng_state(current_payload, rank=rank, world_size=world_size, device=device)
@@ -1603,12 +2463,23 @@ def main() -> int:
 
     batch_index = initial_batch_index
     batch_completed_games = 0
+    wave_episode_failures = 0
+    episode_failures_path = args.output_dir / "episode_failures.jsonl"
     batch_collection_seconds = 0.0
     batch_end_to_end_seconds = 0.0
     batch_reports: list[Mapping[str, object]] = []
     batch_segments: list[Mapping[str, object]] = []
     run_failed = True
+    phase_iteration = initial_update_step + 1
+
+    def publish_phase(phase: str, iteration: int) -> None:
+        nonlocal phase_iteration
+        phase_iteration = iteration
+        if rank == 0:
+            _write_phase(phase_path, phase, iteration)
+
     try:
+        publish_phase("rollout", initial_update_step + 1)
         start_segment_session(actor_state_id)
         for update_step in range(initial_update_step + 1, args.updates + 1):
             dist.barrier()
@@ -1616,9 +2487,12 @@ def main() -> int:
             if segment_assignments is None or segment_history_models is None:
                 raise RuntimeError("segmented collector metadata is incomplete")
             collected = next_segment_collection()
+            post_collection_started = time.perf_counter()
+            publish_phase("critic_warmup" if update_step <= args.critic_warmup_iters else "update", update_step)
             history_models = segment_history_models
             collected_policy_state_id = collected.rollout.policy_state_id
-            _release_rollout_cuda_graphs((actor_model, anchor_model, *history_models.values()), device=actor_device)
+            if not args.retain_rollout_cuda_graphs:
+                _release_rollout_cuda_graphs((actor_model, anchor_model, *history_models.values()), device=actor_device)
             gathered = _gather_objects(
                 {"reports": collected.reports, "timing": collected.timing}, rank=rank, world_size=world_size
             )
@@ -1631,6 +2505,15 @@ def main() -> int:
                 )
                 rejected = sum(sum(int(value) for value in report["rejected_actions"]) for report in reports)
                 truncated = sum(bool(report["truncated"]) for report in reports)
+                # Dropped matches (worker exceptions): logged, counted per wave,
+                # and fatal only above --max-episode-failure-rate.
+                segment_failures = _episode_failures_from_shards(gathered)  # type: ignore[arg-type]
+                for row in segment_failures:
+                    _json_log(episode_failures_path, {"update": update_step, "batch_index": batch_index, **row})
+                wave_episode_failures += len(segment_failures)
+                episode_failure_rate, failure_rate_ok = _episode_failure_rate(
+                    wave_episode_failures, engine_count * lanes, max_rate=args.max_episode_failure_rate
+                )
                 collection_ok = (
                     all(
                         float(shard["timing"]["owner_frames"]) > 0  # type: ignore[index]
@@ -1638,12 +2521,17 @@ def main() -> int:
                     )
                     and truncated == 0
                     and rejected == 0
+                    and failure_rate_ok
                 )
                 failure = (
                     None
                     if collection_ok
                     else {
                         "matches": len(reports),
+                        "episode_failures_this_wave": wave_episode_failures,
+                        "episode_failure_rate": episode_failure_rate,
+                        "max_episode_failure_rate": args.max_episode_failure_rate,
+                        "last_episode_failure": segment_failures[-1] if segment_failures else None,
                         "rejected_actions": rejected,
                         "truncated": truncated,
                         "rejection_details": tuple(
@@ -1663,7 +2551,13 @@ def main() -> int:
                         checkpoint_id = report["opponent_checkpoint_id"]
                         if checkpoint_id is not None:
                             learner_owner = int(report["current_owners"][0])
-                            league.record_result(str(checkpoint_id), float(report["result"][learner_owner]))
+                            assert fixed_league is not None
+                            target_league = (
+                                fixed_league
+                                if any(item.checkpoint_id == str(checkpoint_id) for item in fixed_league.entries)
+                                else league
+                            )
+                            target_league.record_result(str(checkpoint_id), float(report["result"][learner_owner]))
                 segment_session_can_resume = all(
                     float(shard["timing"].get("live_engines", 1)) > 0  # type: ignore[index]
                     for shard in gathered
@@ -1716,16 +2610,32 @@ def main() -> int:
             learner_rollout = collected.rollout
             rollout_gate_temperature = float(learner_rollout.gate_temperature)
             source_owner_frames_local = int(learner_rollout.valid_mask.sum())
+            behavior_count_started = time.perf_counter()
             behavior_counts = _rollout_behavior_counts(learner_rollout, current_model).to(device)
             dist.all_reduce(behavior_counts, op=dist.ReduceOp.SUM)
             behavior_metrics = _rollout_behavior_metrics(
                 behavior_counts.cpu(), delay_offset_ms=current_model.config.delay_offset_ms
             )
+            behavior_count_seconds = time.perf_counter() - behavior_count_started
+            pre_optimizer_seconds = time.perf_counter() - post_collection_started
             update_started = time.perf_counter()
             # Reports and timing were gathered above; the learner consumes every
             # valid lane and can release the collection wrapper before optimization.
             del collected
             gc.collect()
+            # cuDNN RNN backward requires training mode.  The model has no dropout
+            # or batch norm (LSTM dropout 0, Layer/GroupNorm only), so train() does
+            # not change any log-prob; the rollout resumes in eval() below.
+            current_model.train()
+            critic_warmup = update_step <= args.critic_warmup_iters
+            anchor_coefficient = 0.0 if anchor_controller is None else anchor_controller.value
+            anchor_continue_coefficient = 0.0 if anchor_controller is None else anchor_controller.continue_value
+            reference_initial_state = (
+                None if reference_states is None else reference_states.prepare(reference_model, learner_rollout)
+            )
+            reference_final_state = (
+                None if reference_model is None else reference_model.initial_state(learner_rollout.batch_size)
+            )
             update_metrics = distributed_ppo_update_v4(
                 current_model,
                 optimizer,
@@ -1737,9 +2647,41 @@ def main() -> int:
                 config=ppo_config,
                 expected_policy_state_id=collected_policy_state_id,
                 validate=args.validate,
+                reference_model=reference_model,
+                reference_initial_state=reference_initial_state,
+                reference_final_state_out=reference_final_state,
+                anchor_kl_coefficient=anchor_coefficient,
+                anchor_continue_kl_coefficient=anchor_continue_coefficient,
+                value_only=critic_warmup,
+                device_rollout_budget_gib=args.rollout_device_cache_gib,
             )
+            anchor_metrics: dict[str, float] = {}
+            if reference_states is not None:
+                reference_states.commit(learner_rollout, reference_final_state)
+            if anchor_controller is not None:
+                kl_rows = [row for row in update_metrics if "anchor_kl" in row]
+                kl_weight = sum(float(row["valid_count"]) for row in kl_rows)
+                observed_kl = (
+                    sum(float(row["anchor_kl"]) * float(row["valid_count"]) for row in kl_rows) / kl_weight
+                    if kl_weight > 0
+                    else 0.0
+                )
+                # The actor is frozen during critic warmup: KL stays ~0 and would
+                # only drive beta down, so the controller waits for the actor.
+                if kl_rows and not critic_warmup:
+                    anchor_controller.update(observed_kl)
+                anchor_metrics = {
+                    "anchor_kl_observed": observed_kl,
+                    "anchor_kl_target": anchor_controller.config.target_kl,
+                    "anchor_kl_coefficient_used": anchor_coefficient,
+                    "anchor_continue_kl_coefficient_used": anchor_continue_coefficient,
+                    "anchor_kl_coefficient_next": anchor_controller.value,
+                    "anchor_continue_kl_coefficient_next": anchor_controller.continue_value,
+                    "anchor_controller_updates": anchor_controller.updates,
+                }
             bc_metrics = {}
-            if expert_bc_sampler is not None:
+            # Expert BC moves the actor, so it waits for the critic warmup too.
+            if expert_bc_sampler is not None and not critic_warmup:
                 bc_metrics = distributed_expert_bc_update_v4(
                     current_model,
                     optimizer,
@@ -1753,6 +2695,7 @@ def main() -> int:
                     max_grad_norm=args.max_grad_norm,
                     rollout=learner_rollout,
                     validate=args.validate,
+                    loss_weights=expert_bc_loss_weights,
                 )
                 if rank == 0:
                     print({"event": "ppo_expert_bc_complete", "update": update_step, **bc_metrics}, flush=True)
@@ -1763,7 +2706,10 @@ def main() -> int:
                 anneal_updates=args.gate_temperature_anneal_updates,
             )
             current_model.set_ppo_gate_temperature(next_gate_temperature)
+            # Back to inference mode before the collector resumes on this model.
+            current_model.eval()
             update_seconds_local = time.perf_counter() - update_started
+            post_optimizer_started = time.perf_counter()
             update_seconds = torch.tensor(update_seconds_local, device=device)
             dist.all_reduce(update_seconds, op=dist.ReduceOp.MAX)
             peak_cuda = torch.tensor(
@@ -1801,9 +2747,10 @@ def main() -> int:
                         training_stage="ppo-league-snapshot",
                         gamma_per_decision=args.gamma,
                         gae_lambda=args.gae_lambda,
+                        extra=checkpoint_policy_extra,
                     )
-                    if not resolved_fixed_paths:
-                        league.add_snapshot(league_checkpoint_id, league_checkpoint, update_step=update_step)
+                    # Snapshots always join the PFSP pool, also with fixed opponents.
+                    league.add_snapshot(league_checkpoint_id, league_checkpoint, update_step=update_step)
                 league.save(league_path)
                 strict_boundary = not segment_session_can_resume or update_step == args.updates
                 if strict_boundary:
@@ -1817,8 +2764,13 @@ def main() -> int:
                         gamma_per_decision=args.gamma,
                         gae_lambda=args.gae_lambda,
                         extra={
+                            **checkpoint_policy_extra,
                             "strict_boundary": True,
                             "resume_contract": resume_contract,
+                            "fixed_league_state": None if fixed_league is None else fixed_league.to_dict(),
+                            "anchor_kl_controller_state": (
+                                None if anchor_controller is None else anchor_controller.state_dict()
+                            ),
                             "rank_rng_states": rank_rng_states,
                             "matchmaker_state": matchmaker.state_dict(),
                             "learner_opponent_sampler_state": (
@@ -1834,6 +2786,7 @@ def main() -> int:
             actor_state_id = behavior_state_id
             dist.barrier()
             cycle_seconds_local = time.perf_counter() - cycle_started
+            post_optimizer_seconds = time.perf_counter() - post_optimizer_started
             cycle_seconds = torch.tensor(cycle_seconds_local, device=device)
             dist.all_reduce(cycle_seconds, op=dist.ReduceOp.MAX)
 
@@ -1871,6 +2824,9 @@ def main() -> int:
                         "model_seconds",
                         "action_seconds",
                         "storage_seconds",
+                        "rollout_finalize_seconds",
+                        "deferred_storage_finalize_seconds",
+                        "packed_tail_padding_seconds",
                         "command_seconds",
                         "inference_batches",
                         "inference_mean_frame_packets",
@@ -1917,10 +2873,16 @@ def main() -> int:
                     "collection_boundary_bootstrap_count": (collection_boundary_bootstrap_count),
                     "collection_initial_hidden_abs_max": (collection_initial_hidden_abs_max),
                     **collection_phase_seconds,
+                    "episode_failure_count": len(segment_failures),
+                    "wave_episode_failures": wave_episode_failures,
+                    "episode_failure_rate": episode_failure_rate,
                     "native_rejected_actions": sum(
                         sum(int(value) for value in report["rejected_actions"]) for report in reports
                     ),
                     "optimizer_seconds": float(update_seconds),
+                    "rank0_behavior_count_seconds": behavior_count_seconds,
+                    "rank0_pre_optimizer_seconds": pre_optimizer_seconds,
+                    "rank0_post_optimizer_seconds": post_optimizer_seconds,
                     "optimizer_peak_cuda_allocated_gib": (float(peak_cuda[0]) / 1024**3),
                     "optimizer_peak_cuda_reserved_gib": (float(peak_cuda[1]) / 1024**3),
                     "sequential_iteration_seconds": float(cycle_seconds),
@@ -1936,6 +2898,12 @@ def main() -> int:
                     ),
                     **behavior_metrics,
                     **averaged,
+                    **anchor_metrics,
+                    "critic_warmup": critic_warmup,
+                    "delay_policy": args.delay_policy,
+                    # SECOND rate over continue-eligible ACT ticks of this rollout.
+                    "second_rate": behavior_metrics["continue_eligible_second_rate"],
+                    "fixed_league_entries": None if fixed_league is None else len(fixed_league.entries),
                     **bc_metrics,
                 }
                 batch_segments.append(metric)
@@ -1963,6 +2931,8 @@ def main() -> int:
                 resume_state_id = (
                     behavior_state_id if update_step < args.updates and segment_session_can_resume else None
                 )
+                if resume_state_id is not None:
+                    publish_phase("rollout", update_step + 1)
                 segment_resumes.put(resume_state_id)
                 if resume_state_id is None and segment_future is not None:
                     segment_future.result()
@@ -1977,13 +2947,20 @@ def main() -> int:
                     if update_step < args.updates:
                         batch_index += 1
                         batch_completed_games = 0
+                        wave_episode_failures = 0
                         batch_collection_seconds = 0.0
                         batch_end_to_end_seconds = 0.0
                         batch_reports.clear()
                         batch_segments.clear()
+                        publish_phase("rollout", update_step + 1)
                         start_segment_session(behavior_state_id)
         run_failed = False
     finally:
+        if rank == 0:
+            try:
+                _write_phase(phase_path, "idle", phase_iteration)
+            except OSError:
+                pass
         if segment_resumes is not None and segment_future is not None and not (segment_future.done()):
             try:
                 segment_resumes.put_nowait(None)

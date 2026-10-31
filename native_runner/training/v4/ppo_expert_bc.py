@@ -153,8 +153,26 @@ def hog_gate_nll_sum(sequence, evaluation, *, scope="all", metadata=None, frame_
     return torch.where(mask, nll, torch.zeros_like(nll)).sum(), mask.sum()
 
 
+LEGACY_EXPERT_BC_LOSS_WEIGHTS = ILLossWeightsV4(value=0.0)
+
+
+def _expert_bc_loss_weights(loss_weights):
+    weights = LEGACY_EXPERT_BC_LOSS_WEIGHTS if loss_weights is None else loss_weights
+    if not isinstance(weights, ILLossWeightsV4):
+        raise TypeError("expert BC loss weights must be ILLossWeightsV4")
+    if weights.value != 0.0:
+        raise ValueError("expert BC never trains the value head")
+    return weights
+
+
 def expert_bc_contract_v4(
-    sampler, *, coefficient=0.2, hog_gate_weight=0.0, hog_gate_scope="all", hog_gate_gradient_scope="full"
+    sampler,
+    *,
+    coefficient=0.2,
+    hog_gate_weight=0.0,
+    hog_gate_scope="all",
+    hog_gate_gradient_scope="full",
+    loss_weights=None,
 ):
     if not math.isfinite(hog_gate_weight) or hog_gate_weight < 0:
         raise ValueError("expert Hog gate weight must be finite and nonnegative")
@@ -198,6 +216,17 @@ def expert_bc_contract_v4(
             normal_bc_gradient_scope="full",
             clipping="unchanged shared global norm; may rescale all normal BC gradients",
         )
+    weights = _expert_bc_loss_weights(loss_weights)
+    # Recorded only when it differs from the legacy weights (old contracts unchanged).
+    if weights != LEGACY_EXPERT_BC_LOSS_WEIGHTS:
+        contract["loss_weights"] = {
+            "gate": weights.gate,
+            "candidate": weights.candidate,
+            "target": weights.target,
+            "delay": weights.delay,
+            "continue_action": weights.continue_action,
+            "continue_second_weight": weights.continue_second_weight,
+        }
     return contract
 
 
@@ -456,7 +485,13 @@ def distributed_expert_bc_update_v4(
     hog_gate_weight=0.0,
     hog_gate_scope="all",
     hog_gate_gradient_scope="full",
+    loss_weights=None,
 ):
+    """``loss_weights`` defaults to the legacy ``ILLossWeightsV4(value=0)``; a
+    strong-v1 (delay earliest) run passes ``delay=0, continue_second_weight=32``
+    so BC matches the IL objective instead of training the noisy delay head."""
+
+    bc_loss_weights = _expert_bc_loss_weights(loss_weights)
     if not math.isfinite(coefficient) or coefficient <= 0 or sequence_chunk_steps <= 0:
         raise ValueError("BC coefficient and chunk length must be positive")
     if not math.isfinite(hog_gate_weight) or hog_gate_weight < 0:
@@ -522,7 +557,7 @@ def distributed_expert_bc_update_v4(
                     loss = imitation_loss(
                         chunk,
                         evaluation,
-                        weights=ILLossWeightsV4(value=0.0),
+                        weights=bc_loss_weights,
                         gate_act_weight=8.0,
                         delay_neighbor_weight=0.2,
                     )

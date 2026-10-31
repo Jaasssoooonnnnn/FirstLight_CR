@@ -76,6 +76,9 @@ class _MatchRuntimeV4:
     decision_steps: int = 0
     started: float = 0.0
     active_actions: tuple[int, int] = (0, 0)
+    # Per owner: decision steps that chose ACT, and those that issued a second micro-action.
+    act_steps: tuple[int, int] = (0, 0)
+    second_action_steps: tuple[int, int] = (0, 0)
     first_nonwait_action_tick: tuple[int | None, int | None] = (None, None)
     first_successful_card_tick: tuple[int | None, int | None] = (None, None)
     full_elixir_deferred_decision_ticks_before_first_card: tuple[int, int] = (0, 0)
@@ -85,6 +88,9 @@ class _MatchRuntimeV4:
     deck_average_elixir: tuple[float, float] = (0.0, 0.0)
     opening_forced_owner: int | None = None
     opening_forced_tick: int | None = None
+    # Per-owner evidence for training's independent opening deadlines. The
+    # singular fields above retain the first intervention for legacy readers.
+    opening_forced_ticks_by_owner: tuple[int | None, int | None] = (None, None)
     elixir_overflow_wasted: tuple[float, float] = (0.0, 0.0)
     elixir_overflow_penalty_total: tuple[float, float] = (0.0, 0.0)
     personal_elixir_overflow_wasted: tuple[float, float] = (0.0, 0.0)
@@ -116,6 +122,15 @@ class _MatchRuntimeV4:
     fireball_king_activations: tuple[int, int] = (0, 0)
     fireball_king_activation_penalty_total: tuple[float, float] = (0.0, 0.0)
     fireball_king_activation_details: list[dict[str, object]] = field(default_factory=list)
+    # Generalized first sleeping-King activation (king_activation_reward.apply_king_activation_reward_v4).
+    # Indexed by activating owner; recorded at coefficient 0 too.
+    king_activation_seen_owners: set[int] = field(default_factory=set)
+    king_activations: tuple[int, int] = (0, 0)
+    king_activation_tick: tuple[int | None, int | None] = (None, None)
+    king_activation_source_card_id: tuple[int | None, int | None] = (None, None)
+    king_activation_source_unattributed: tuple[int, int] = (0, 0)
+    king_activation_reward_total: tuple[float, float] = (0.0, 0.0)
+    king_activation_details: list[dict[str, object]] = field(default_factory=list)
 
 
 class RetryResidentNativeClashEnv(ResidentNativeClashEnv):
@@ -329,6 +344,21 @@ def _model_key(assignment: ClusterMatchAssignmentV4, owner: int) -> str:
     raise RuntimeError("current-current matchup exposed a frozen owner")
 
 
+def _final_tower_hitpoints(observation: Any) -> tuple[dict[str, object], ...]:
+    """Public tower state from the final owner-0 observation, ordered stably."""
+
+    return tuple(
+        {
+            "owner": int(tower.owner),
+            "tower_kind": str(tower.tower_kind),
+            "hitpoints": float(tower.hitpoints),
+            "max_hitpoints": float(tower.max_hitpoints),
+            "active": bool(tower.active),
+        }
+        for tower in sorted(observation.towers, key=lambda item: (int(item.owner), str(item.tower_kind)))
+    )
+
+
 def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
     observation = runtime.observations[0]
     terminal = observation.terminal
@@ -353,6 +383,8 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         "crowns": crowns,
         "truncated": bool(observation.truncated),
         "active_actions": runtime.active_actions,
+        "act_steps": runtime.act_steps,
+        "second_action_steps": runtime.second_action_steps,
         "first_nonwait_action_tick": runtime.first_nonwait_action_tick,
         "first_successful_card_tick": runtime.first_successful_card_tick,
         "full_elixir_deferred_decision_ticks_before_first_card": (
@@ -364,6 +396,13 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         "fireball_king_activations": runtime.fireball_king_activations,
         "fireball_king_activation_penalty_total": runtime.fireball_king_activation_penalty_total,
         "fireball_king_activation_details": runtime.fireball_king_activation_details,
+        "king_activations": runtime.king_activations,
+        "king_activation_tick": runtime.king_activation_tick,
+        "king_activation_source_card_id": runtime.king_activation_source_card_id,
+        "king_activation_source_unattributed": runtime.king_activation_source_unattributed,
+        "king_activation_reward_total": runtime.king_activation_reward_total,
+        "king_activation_details": tuple(runtime.king_activation_details),
+        "king_shaping_mode": getattr(runtime.environment, "king_shaping_mode", "legacy"),
         "hog_deploy_reward_total": runtime.hog_deploy_reward_total,
         "first_hog_timing_reward_total": runtime.first_hog_timing_reward_total,
         "first_hog_deferral_penalty_total": (runtime.first_hog_deferral_penalty_total),
@@ -376,6 +415,7 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         "deck_average_elixir": runtime.deck_average_elixir,
         "opening_forced_owner": runtime.opening_forced_owner,
         "opening_forced_tick": runtime.opening_forced_tick,
+        "opening_forced_ticks_by_owner": runtime.opening_forced_ticks_by_owner,
         "elixir_overflow_wasted": runtime.elixir_overflow_wasted,
         "elixir_overflow_penalty_total": (runtime.elixir_overflow_penalty_total),
         "personal_elixir_overflow_wasted": (runtime.personal_elixir_overflow_wasted),
@@ -391,4 +431,10 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         "rejected_actions": runtime.rejected_actions,
         "rejection_details": tuple(runtime.rejection_details),
         "elapsed_seconds": time.perf_counter() - runtime.started,
+        # Additive terminal detail (TerminalV1 / ObservationV1.towers).
+        "terminal_ended": bool(terminal.ended),
+        "terminal_reason": terminal.reason,
+        "terminal_winner": terminal.winner,
+        "terminal_reported_tick": terminal.terminal_tick,
+        "final_tower_hitpoints": _final_tower_hitpoints(observation),
     }

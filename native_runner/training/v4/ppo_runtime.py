@@ -99,6 +99,10 @@ def episode_for_matchup_v4(matchup: ScheduledMatchupV4, environment: Environment
 def validate_reward_parameters_v4(parameters: Mapping[str, object]) -> None:
     """One validation boundary shared by the trainer, collector, and worker."""
 
+    terminal_scale = float(parameters.get("terminal_reward_scale", 1.0))
+    if not math.isfinite(terminal_scale) or terminal_scale <= 0.0:
+        raise ValueError("terminal reward scale must be finite and positive")
+
     def require_finite(names: tuple[str, ...], message: str) -> None:
         if any(not math.isfinite(parameters[name]) or parameters[name] < 0.0 for name in names):
             raise ValueError(message)

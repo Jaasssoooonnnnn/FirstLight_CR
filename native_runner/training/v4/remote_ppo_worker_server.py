@@ -84,6 +84,19 @@ def _run_worker(connection: RemoteWorkerConnection, request: Mapping[str, object
             if request.get("fireball_king_activation_penalty", 0.0)
             else {}
         ),
+        # Generalized King reward knobs: forwarded whenever present so an
+        # explicit 0 / legacy from the trainer is never replaced by a default.
+        **{
+            name: cast(request[name])
+            for name, cast in (
+                ("king_activation_penalty", float),
+                ("king_activation_scope", str),
+                ("king_shaping_mode", str),
+                ("king_potential_weight", float),
+                ("terminal_reward_scale", float),
+            )
+            if name in request
+        },
     )
 
 

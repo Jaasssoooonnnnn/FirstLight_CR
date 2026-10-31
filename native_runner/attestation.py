@@ -39,7 +39,8 @@ def verify_runner_attestation(
     actual = attestation if isinstance(attestation, RunnerAttestationV1) else attestation_from_response(attestation)
     if not actual.production_ready:
         raise RunnerAttestationError("native runner is not production-ready: content, hook, or hash gate failed")
-    if actual.package_name != "nullsroyale.rel.free" or actual.abi != "arm64-v8a":
+    expected_package = str(manifest.config.get("runtime_package_name", "nullsroyale.rel.free"))
+    if actual.package_name != expected_package or actual.abi != "arm64-v8a":
         raise RunnerAttestationError(f"native runner package/ABI mismatch: {actual.package_name!r}/{actual.abi!r}")
 
     expected = {

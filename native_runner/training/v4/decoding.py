@@ -21,7 +21,7 @@ from .native_actions import (
     mirror_play_runtime_contract,
 )
 from .catalog import CardCatalogV1
-from .config import ModelConfigV4
+from .config import MATCH_SCALAR_NAMES, ModelConfigV4
 from .tensors import (
     ActionCandidatesV4,
     ActionSequenceV4,
@@ -64,14 +64,159 @@ def candidate_uid_v4(
     return int.from_bytes(digest, "big", signed=False) & ((1 << 63) - 1)
 
 
-class ShadowCandidateLegality:
-    """Open-loop legality state for at most two candidate micro-actions."""
+# Delay-aware legality (C1 fix): a candidate is legal when its cost is
+# affordable at some allowed delay bin of the decision window, i.e. at the
+# touch tick d + k (k = offset_ms / 50 native ticks) rather than at the
+# decision tick d:
+#
+#     e(k) = min(10, e(0) + regen_per_tick * k) - spent
+#
+# where e(0) is ``candidates.elixir`` (BattleEnvV1's ``effective_elixir``:
+# raw elixir minus elixir reserved by in-flight own commands, clamped at 0)
+# and ``spent`` is the cost of the earlier micro-actions of the same decision
+# (touched commands are reserved, not deducted, until the engine executes them
+# 20 ticks later, so the raw bar keeps capping at 10).  BattleEnvV1's action
+# mask (``affordable_from_bin``) and ``_validate_compound_actions`` apply the
+# same rule, so a sampled compound action always passes the environment.
+#
+# The switch is ``ModelConfigV4.delay_aware_legality`` (default True); this
+# module constant only mirrors that default.  ``ShadowCandidateLegality`` reads
+# the flag from its ``config`` unless ``delay_aware=`` overrides it.  Pre-fix
+# checkpoints load with the decision-tick rule (``checkpoint.LEGACY_FIELD_DEFAULTS``).
+DELAY_AWARE_LEGALITY_DEFAULT: bool = ModelConfigV4().delay_aware_legality
+ELIXIR_CAP = 10.0
+ELIXIR_MULTIPLIER_SCALAR_INDEX = MATCH_SCALAR_NAMES.index("elixir_multiplier_over_3")
+# Full 10-elixir bar duration per match multiplier.  Mirrors
+# ``battle_env.ELIXIR_SEGMENTS`` (1x 28 s, 2x 14 s, 3x 9.3 s): one elixir per
+# 2.8 s = 56 ticks at 1x.  Kept local so this module never imports the engine.
+ELIXIR_FULL_BAR_MS_BY_MULTIPLIER: tuple[tuple[int, int], ...] = ((1, 28_000), (2, 14_000), (3, 9_300))
+_AFFORDABLE_TOLERANCE = 1e-6
 
-    def __init__(self, candidates: ActionCandidatesV4, config: ModelConfigV4) -> None:
+# Inference delay-bin policy (``UniversalCardPolicyV4.set_delay_policy``).
+# ``sample`` uses the delay head (sample or argmax, as before); ``earliest``
+# ignores the head and plays the first bin of the legal delay mask, i.e. the
+# first bin at which the chosen candidate is affordable under the shadow's
+# sequential, order-preserving legality (and the inference cap).  Legacy
+# checkpoints (``delay_aware_legality=False``) therefore always get bin 0.
+DELAY_POLICY_SAMPLE = "sample"
+DELAY_POLICY_EARLIEST = "earliest"
+DELAY_POLICIES: tuple[str, ...] = (DELAY_POLICY_SAMPLE, DELAY_POLICY_EARLIEST)
+
+
+def validate_delay_policy(policy: object) -> str:
+    if not isinstance(policy, str) or policy not in DELAY_POLICIES:
+        raise ValueError(f"delay policy must be one of {DELAY_POLICIES}, got {policy!r}")
+    return policy
+
+
+def earliest_delay_offset_bin(delay_offset_mask: Tensor) -> Tensor:
+    """First legal bin ``[B]`` of a legal delay mask ``[B,K]``.
+
+    An empty row maps to bin 0, the never-observed fallback the delay
+    categorical uses for such rows.  Shape-static (CUDA Graph safe).
+    """
+
+    if delay_offset_mask.dtype != torch.bool or delay_offset_mask.ndim != 2 or delay_offset_mask.shape[1] <= 0:
+        raise ValueError("delay offset mask must be bool [B,K]")
+    # Number of leading illegal bins == index of the first legal bin; a row
+    # with no legal bin counts K, which ``where`` folds back to bin 0.
+    leading = delay_offset_mask.long().cumsum(dim=-1).eq(0).sum(dim=-1)
+    return torch.where(leading >= delay_offset_mask.shape[1], torch.zeros_like(leading), leading)
+
+
+def elixir_multiplier_from_match_scalars(match_scalars: Tensor) -> Tensor:
+    """Return the per-row match elixir multiplier (1, 2 or 3) as float32 [B]."""
+
+    if match_scalars.ndim != 2 or match_scalars.shape[1] <= ELIXIR_MULTIPLIER_SCALAR_INDEX:
+        raise ValueError("match_scalars must have shape [B,F] with the elixir multiplier column")
+    return match_scalars[:, ELIXIR_MULTIPLIER_SCALAR_INDEX].to(torch.float32) * 3.0
+
+
+def elixir_regen_per_tick(multiplier: Tensor) -> Tensor:
+    """Native elixir regeneration per 50 ms tick for each row's multiplier.
+
+    Stored match scalars are fp16 (``2/3`` becomes ``0.66650``), so known
+    multipliers are snapped to the native segment table; any other positive
+    value falls back to the linear ``multiplier / 56`` model.
+    """
+
+    value = multiplier.to(torch.float32)
+    rate = value.clamp_min(0.0) * float(10.0 * NATIVE_TICK_MS / ELIXIR_FULL_BAR_MS_BY_MULTIPLIER[0][1])
+    for level, full_bar_ms in ELIXIR_FULL_BAR_MS_BY_MULTIPLIER:
+        rate = torch.where((value - float(level)).abs() < 0.25, float(10.0 * NATIVE_TICK_MS / full_bar_ms), rate)
+    return rate
+
+
+class ShadowCandidateLegality:
+    """Open-loop legality state for at most two candidate micro-actions.
+
+    With ``delay_aware`` (default ``config.delay_aware_legality``) a candidate
+    is legal when ``cost <= elixir_at(k)`` for some delay bin ``k`` that is
+    allowed (``allowed_delay_bins``, e.g. the model's inference delay cap) and
+    not earlier than the previous micro-action's bin, where::
+
+        elixir_at(k) = max(e0, min(10, e0 + regen_per_tick * ticks(k))) - spent
+
+    ``e0`` is ``candidates.elixir`` (the environment's effective elixir at the
+    decision tick) and ``spent`` the cost of the earlier micro-actions; touched
+    commands are reserved rather than deducted, so the raw bar keeps capping at
+    10 while they are in flight.  This is exactly BattleEnvV1's sequential
+    compound check.  Without regeneration (``delay_aware=False``) it reduces
+    bit-exactly to the historical ``cost <= elixir_at_d - spent`` rule.
+
+    ``elixir_multiplier`` is the per-row match multiplier (1/2/3); it defaults
+    to 1x (conservative).  ``remaining_elixir`` keeps its historical meaning
+    (elixir at ``d`` minus spent cost) because it is a model input via
+    ``shadow_features``.
+    """
+
+    def __init__(
+        self,
+        candidates: ActionCandidatesV4,
+        config: ModelConfigV4,
+        *,
+        elixir_multiplier: Tensor | float | None = None,
+        delay_aware: bool | None = None,
+        allowed_delay_bins: Tensor | None = None,
+    ) -> None:
         self.base = candidates
         self.config = config
         batch, count = candidates.mask.shape
+        bins = len(config.delay_offset_ms)
+        self.delay_aware = bool(config.delay_aware_legality) if delay_aware is None else bool(delay_aware)
         self.remaining_elixir = candidates.elixir.clone()
+        if allowed_delay_bins is not None:
+            shape = tuple(allowed_delay_bins.shape)
+            if allowed_delay_bins.dtype != torch.bool or shape not in ((bins,), (batch, bins)):
+                raise ValueError("allowed_delay_bins must be bool [K] or [B,K]")
+            allowed = allowed_delay_bins.to(candidates.mask.device)
+            self.allowed_delay_bins: Tensor | None = allowed[None].expand(batch, -1) if allowed.ndim == 1 else allowed
+        else:
+            self.allowed_delay_bins = None
+        if self.delay_aware:
+            if elixir_multiplier is None:
+                multiplier = candidates.elixir.new_ones(batch, dtype=torch.float32)
+            elif isinstance(elixir_multiplier, Tensor):
+                multiplier = elixir_multiplier.to(device=candidates.elixir.device, dtype=torch.float32)
+                if tuple(multiplier.shape) != (batch,):
+                    raise ValueError("elixir_multiplier must have shape [B]")
+            else:
+                multiplier = candidates.elixir.new_full((batch,), float(elixir_multiplier), dtype=torch.float32)
+            self.regen_per_tick: Tensor | None = elixir_regen_per_tick(multiplier).to(candidates.elixir.dtype)
+            # ``ModelConfigV4`` freezes the offsets at 0..200 ms in 50 ms steps,
+            # so bin k is exactly k native ticks.  ``arange`` keeps this free of
+            # host-to-device copies (safe inside the live CUDA Graph capture).
+            if any(int(value) != index * NATIVE_TICK_MS for index, value in enumerate(config.delay_offset_ms)):
+                raise ValueError("delay-aware legality requires delay offsets of k * 50 ms")
+            self.delay_ticks: Tensor | None = torch.arange(
+                bins, dtype=candidates.elixir.dtype, device=candidates.elixir.device
+            )
+            # Cost of the earlier micro-actions of this decision (reserved).
+            self.spent_elixir: Tensor | None = torch.zeros_like(candidates.elixir)
+        else:
+            self.regen_per_tick = None
+            self.delay_ticks = None
+            self.spent_elixir = None
         self.used_candidate = torch.zeros_like(candidates.mask)
         self.used_ability = torch.zeros(batch, dtype=torch.bool, device=candidates.mask.device)
         self.used_hand_row = torch.zeros(batch, config.max_own_cards, dtype=torch.bool, device=candidates.mask.device)
@@ -113,8 +258,56 @@ class ShadowCandidateLegality:
             result &= ~blocked
         return result
 
+    def elixir_at_bins(self) -> Tensor:
+        """Elixir available at each delay bin ``[B,K]`` for the next micro-action.
+
+        ``max(e0, min(10, e0 + regen * k)) - spent``: regeneration of the raw
+        bar stops at the cap (never lowering an already-higher value), and the
+        earlier micro-actions' costs stay reserved.  The ordering constraint in
+        ``delay_offset_mask`` excludes bins before the previous micro-action.
+        """
+
+        bins = len(self.config.delay_offset_ms)
+        if self.regen_per_tick is None or self.delay_ticks is None or self.spent_elixir is None:
+            return self.remaining_elixir[:, None].expand(-1, bins)
+        start = self.base.elixir[:, None]
+        accrued = start + self.regen_per_tick[:, None] * self.delay_ticks[None, :]
+        capped = torch.maximum(accrued.clamp_max(ELIXIR_CAP), start.expand(-1, bins))
+        return capped - self.spent_elixir[:, None]
+
+    def affordable_at_bins(self) -> Tensor:
+        """Whether each candidate's cost is affordable at each delay bin ``[B,C,K]``."""
+
+        return self.base.cost[:, :, None] <= self.elixir_at_bins()[:, None, :] + _AFFORDABLE_TOLERANCE
+
+    def _ordering_mask(self, *, step: int) -> Tensor:
+        bins = torch.arange(len(self.config.delay_offset_ms), device=self.previous_delay_offset_bin.device)
+        if step == 0:
+            return torch.ones(
+                self.previous_delay_offset_bin.shape[0], bins.shape[0], dtype=torch.bool, device=bins.device
+            )
+        return bins[None] >= self.previous_delay_offset_bin[:, None]
+
+    def _reachable_bins(self) -> Tensor:
+        """Bins ``[B,K]`` a next micro-action may use: not before the previous
+        micro-action (``previous_delay_offset_bin`` is 0 before the first) and
+        allowed by ``allowed_delay_bins``."""
+
+        bins = torch.arange(len(self.config.delay_offset_ms), device=self.previous_delay_offset_bin.device)
+        reachable = bins[None] >= self.previous_delay_offset_bin[:, None]
+        if self.allowed_delay_bins is not None:
+            reachable = reachable & self.allowed_delay_bins
+        return reachable
+
     def candidate_mask(self) -> Tensor:
-        result = self.base.mask & ~self.used_candidate & (self.base.cost <= self.remaining_elixir[:, None] + 1e-6)
+        if self.delay_aware:
+            # Legal when affordable at some reachable bin.  A candidate whose
+            # only affordable bins are excluded by the inference delay cap is
+            # illegal here rather than relying on the delay head's fallback.
+            affordable = (self.affordable_at_bins() & self._reachable_bins()[:, None, :]).any(dim=-1)
+        else:
+            affordable = self.base.cost <= self.remaining_elixir[:, None] + _AFFORDABLE_TOLERANCE
+        result = self.base.mask & ~self.used_candidate & affordable
         result &= ~((self.selected_count[:, None] > 0) & (self.base.native_visible_card_id == MIRROR_CARD_ID))
         result &= ~(self.used_ability[:, None] & (self.base.variant == CANDIDATE_ABILITY))
         deploy = self.base.variant == CANDIDATE_DEPLOY
@@ -135,13 +328,28 @@ class ShadowCandidateLegality:
             1, candidate_index[:, None, None, None].expand(-1, 1, self.config.board_height, self.config.board_width)
         )[:, 0]
 
-    def delay_offset_mask(self, *, step: int) -> Tensor:
-        bins = torch.arange(len(self.config.delay_offset_ms), device=self.previous_delay_offset_bin.device)
-        if step == 0:
-            return torch.ones(
-                self.previous_delay_offset_bin.shape[0], bins.shape[0], dtype=torch.bool, device=bins.device
-            )
-        return bins[None] >= self.previous_delay_offset_bin[:, None]
+    def delay_offset_mask(self, *, step: int, candidate_index: Tensor | None = None) -> Tensor:
+        """Legal delay bins ``[B,K]``: order-preserving and, when delay-aware
+        and ``candidate_index`` is given, affordable for that candidate and
+        allowed by ``allowed_delay_bins``.
+
+        A row whose selected candidate is affordable at no such bin (an
+        inactive row, or an illegal candidate rejected by ``candidate_mask``)
+        falls back to the ordering mask so the distribution stays defined.
+        The legacy rule (``delay_aware=False``) returns the ordering mask
+        unchanged; callers apply their own inference cap on top.
+        """
+
+        ordering = self._ordering_mask(step=step)
+        if not self.delay_aware or candidate_index is None:
+            return ordering
+        selected = candidate_index.clamp(0, self.base.mask.shape[1] - 1)
+        bins = ordering.shape[1]
+        affordable = self.affordable_at_bins().gather(1, selected[:, None, None].expand(-1, 1, bins))[:, 0]
+        allowed = ordering & affordable
+        if self.allowed_delay_bins is not None:
+            allowed = allowed & self.allowed_delay_bins
+        return torch.where(allowed.any(dim=-1, keepdim=True), allowed, ordering)
 
     def shadow_features(self, *, step: int) -> Tensor:
         output = self.remaining_elixir.new_zeros(self.remaining_elixir.shape[0], self.config.shadow_feature_dim)
@@ -167,6 +375,8 @@ class ShadowCandidateLegality:
             if indices.numel() == 0:
                 return
             chosen = candidate_index[indices]
+            if self.spent_elixir is not None:
+                self.spent_elixir[indices] += self.base.cost[indices, chosen]
             self.remaining_elixir[indices] -= self.base.cost[indices, chosen]
             self.used_candidate[indices, chosen] = True
             self.selected_count[indices] += 1
@@ -216,6 +426,8 @@ class ShadowCandidateLegality:
         chosen = candidate_index.clamp(0, self.base.mask.shape[1] - 1)
         chosen_column = chosen[:, None]
         selected_cost = self.base.cost.gather(1, chosen_column)[:, 0]
+        if self.spent_elixir is not None:
+            self.spent_elixir = self.spent_elixir + selected_cost * rows.to(selected_cost.dtype)
         self.remaining_elixir -= selected_cost * rows.to(selected_cost.dtype)
         self.used_candidate |= rows[:, None] & (self._candidate_rows[None] == chosen_column)
         self.selected_count += rows.to(self.selected_count.dtype)
@@ -418,7 +630,14 @@ def decode_action_sequence_v4(
         horizontal_mirror=horizontal_mirror,
         hand_slot_permutation=tuple(int(value) for value in hand_slot_permutation),
     )
-    shadow = ShadowCandidateLegality(candidates, actual)
+    # Same legality rule as sampling and as ``BattleEnvV1._validate_compound_actions``
+    # (``config.delay_aware_legality``): each micro-action must be affordable
+    # at its own touch bin, with the match multiplier the tensorizer exported.
+    raw_multiplier = observation.time.elixir_multiplier
+    multiplier = (
+        float(raw_multiplier) if raw_multiplier is not None and math.isfinite(float(raw_multiplier)) else 1.0
+    )
+    shadow = ShadowCandidateLegality(candidates, actual, elixir_multiplier=multiplier)
     active_row = torch.zeros(candidates.mask.shape[0], dtype=torch.bool, device=candidates.mask.device)
     active_row[row] = True
     decoded: list[ActionV1] = []
@@ -456,6 +675,16 @@ def decode_action_sequence_v4(
             raise ValueError("native V4 decoder does not support entity targets yet")
 
         delay_bin = int(sequence.delay_offset_bin[row, step].item())
+        if not 0 <= delay_bin < len(actual.delay_offset_ms):
+            raise ValueError("sampled delay bin is outside the V4 delay vocabulary")
+        if shadow.delay_aware:
+            selected_candidates = torch.full(
+                (candidates.mask.shape[0],), candidate_row, dtype=torch.long, device=candidates.mask.device
+            )
+            if not bool(shadow.affordable_at_bins()[row, candidate_row, delay_bin].item()) or not bool(
+                shadow.delay_offset_mask(step=step, candidate_index=selected_candidates)[row, delay_bin].item()
+            ):
+                raise ValueError("sampled delay bin is unaffordable under V4 shadow state")
         offset_ms = int(actual.delay_offset_ms[delay_bin])
         timing = _timing_metadata(
             step=step,

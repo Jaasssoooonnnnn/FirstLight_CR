@@ -128,6 +128,8 @@ struct StoredTowerTroopRuntimeState {
 
 std::uintptr_t remaining_vtable_offset(const void*) { return 0; }
 bool read_combat_object_vector(void*,void***,std::int32_t*) { return false; }
+bool g_live_capture_delta_active = false;
+std::uint64_t g_live_capture_visibility_from_sequence = 1;
 #include "tower_troop_runtime_telemetry.inc"
 #include "visibility_runtime_telemetry.inc"
 
@@ -146,6 +148,8 @@ int main() {
         visible.buff_global_id=0xFFFFFFFF;visible.invisible_count_after=1;
         visible.subject.native_object_id=28;visible.hook_offset=0x1FFFF;visible.complete_context=true;
         for(int i=0;i<scenario;++i) publish_visibility_runtime_record(visible);
+        g_live_capture_delta_active=scenario>4;
+        g_live_capture_visibility_from_sequence=g_visibility_match->next_sequence-1;
         emit(append_visibility_runtime_events_json,scenario==5?8:7,scenario+1,scenario==6?29:31);
         begin_tower_troop_runtime_epoch(7,scenario+1);
         for(int i=0;i<10;++i) {

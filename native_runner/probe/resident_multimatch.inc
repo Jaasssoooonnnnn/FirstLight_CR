@@ -5,9 +5,10 @@
 //
 // The control server is a single persistent pthread.  After the legacy
 // headless worker has exited, that thread becomes the sole libg execution
-// lane.  Each slot owns a live GameStateManager and its replay root; switching
-// slots only swaps probe bookkeeping and telemetry epochs, never serializes or
-// reconstructs the native match.
+// lane.  Each slot owns a live GameStateManager, its replay root and its runtime
+// telemetry; switching slots only swaps probe bookkeeping and the bound
+// MatchTelemetry, never serializes or reconstructs the native match or resets
+// its telemetry history.
 
 constexpr std::size_t kResidentMaxSlots = 16;
 
@@ -25,14 +26,13 @@ struct ResidentMatchSlot {
   std::uint32_t stagnant_steps = 0;
   bool ended = false;
   bool telemetry_ready = false;
-  // Tower troop actions are not guaranteed to tick during every five-tick
-  // resident slice.  Preserve their last authoritative state across slot
-  // switches instead of losing it when the process-global hook epoch resets.
-  std::size_t tower_troop_runtime_count = 0;
-  StoredTowerTroopRuntimeState tower_troop_runtimes[kMaxStoredTowerTroopRuntimes];
 };
 
 ResidentMatchSlot g_resident_slots[kResidentMaxSlots];
+// Each slot's telemetry outlives the matches it hosts, exactly like the process
+// defaults do for a single-match process: a new match starts a new epoch in the
+// same rings and sequence counters.  Allocated on the slot's first construction.
+std::unique_ptr<MatchTelemetry> g_resident_slot_telemetry[kResidentMaxSlots];
 std::int32_t g_resident_bound_slot = -1;
 std::uint64_t g_resident_switch_count = 0;
 std::uint64_t g_resident_total_steps = 0;
@@ -61,10 +61,6 @@ void resident_save_bound_slot() {
   slot.tick = g_last_controlled_tick;
   slot.last_loaded_queue_count = g_last_loaded_queue_count;
   slot.ended = g_control_ended;
-  if (slot.telemetry_ready && slot.tick >= 0) {
-    slot.tower_troop_runtime_count = copy_tower_troop_runtime_snapshot(
-        slot.generation, slot.state_epoch, slot.tick, slot.tower_troop_runtimes, kMaxStoredTowerTroopRuntimes);
-  }
 }
 
 void resident_clear_probe_context() {
@@ -94,12 +90,12 @@ void resident_clear_probe_context() {
   g_next_snapshot_handle = 1;
 }
 
-bool resident_bind_slot(std::int32_t slot_id, bool reset_telemetry = true) {
+bool resident_bind_slot(std::int32_t slot_id) {
   if (!resident_slot_id_valid(slot_id)) {
     return false;
   }
   ResidentMatchSlot &slot = g_resident_slots[slot_id];
-  if (!slot.occupied || slot.manager == nullptr) {
+  if (!slot.occupied || slot.manager == nullptr || g_resident_slot_telemetry[slot_id] == nullptr) {
     return false;
   }
   if (g_resident_bound_slot == slot_id && g_controlled_manager == slot.manager) {
@@ -119,17 +115,9 @@ bool resident_bind_slot(std::int32_t slot_id, bool reset_telemetry = true) {
   g_last_controlled_tick = slot.tick;
   g_last_loaded_queue_count = slot.last_loaded_queue_count;
   g_control_ended = slot.ended;
-
-  if (reset_telemetry) {
-    begin_combat_event_epoch(slot.manager, slot.generation, slot.state_epoch);
-    begin_runtime_telemetry_epoch(slot.manager, slot.generation, slot.state_epoch);
-    bind_combat_event_object_manager(slot.manager);
-    restore_tower_troop_runtime_snapshot(slot.generation, slot.state_epoch, slot.tick, slot.tower_troop_runtimes,
-                                         slot.tower_troop_runtime_count);
-    // Runtime hook rings are process-local.  They become attributable to
-    // this slot only after this newly bound epoch executes a native step.
-    slot.telemetry_ready = false;
-  }
+  // The slot's rings, counters, causal markers and caches continue exactly
+  // where its previous step left them.
+  bind_match_telemetry(g_resident_slot_telemetry[slot_id].get());
   return true;
 }
 
@@ -171,6 +159,7 @@ void resident_destroy_slot(std::int32_t slot_id) {
   slot = {};
   resident_clear_probe_context();
   g_resident_bound_slot = -1;
+  bind_match_telemetry(nullptr);
 }
 
 bool resident_start_mode(char *response, std::size_t response_size) {
@@ -268,15 +257,27 @@ bool resident_construct_slot(std::int32_t slot_id, const char *replay_json, char
   if (g_resident_slots[slot_id].occupied) {
     resident_destroy_slot(slot_id);
   }
+  if (g_resident_slot_telemetry[slot_id] == nullptr) {
+    g_resident_slot_telemetry[slot_id].reset(new (std::nothrow) MatchTelemetry());
+    if (g_resident_slot_telemetry[slot_id] == nullptr) {
+      release_json_object(replay_root);
+      std::snprintf(response, response_size,
+                    "{\"ok\":false,\"envId\":%d,\"error\":\"could not allocate match telemetry\"}", slot_id);
+      return false;
+    }
+  }
   resident_save_bound_slot();
   resident_clear_probe_context();
   g_resident_bound_slot = slot_id;
+  // Native construction and load hooks must publish into this slot's history.
+  bind_match_telemetry(g_resident_slot_telemetry[slot_id].get());
 
   void *const context_a = g_game_state_context_a();
   void *const context_b = g_game_state_context_b();
   if (!prewarm_location_tilemap(context_a, location_id)) {
     release_json_object(replay_root);
     g_resident_bound_slot = -1;
+    bind_match_telemetry(nullptr);
     std::snprintf(response, response_size, "{\"ok\":false,\"envId\":%d,\"error\":\"could not prepare native tilemap\"}",
                   slot_id);
     return false;
@@ -285,6 +286,7 @@ bool resident_construct_slot(std::int32_t slot_id, const char *replay_json, char
   if (manager == nullptr) {
     release_json_object(replay_root);
     g_resident_bound_slot = -1;
+    bind_match_telemetry(nullptr);
     std::snprintf(response, response_size,
                   "{\"ok\":false,\"envId\":%d,\"error\":\"could not allocate GameStateManager\"}", slot_id);
     return false;
@@ -316,6 +318,7 @@ bool resident_construct_slot(std::int32_t slot_id, const char *replay_json, char
     release_json_object(replay_root);
     resident_clear_probe_context();
     g_resident_bound_slot = -1;
+    bind_match_telemetry(nullptr);
     std::snprintf(response, response_size,
                   "{\"ok\":false,\"envId\":%d,\"error\":\"native manager did not load a fresh empty-stream match\"}",
                   slot_id);
@@ -667,11 +670,15 @@ template <typename T> T resident_read_le(const std::uint8_t *source) {
 }
 
 constexpr char kResidentTrainingCaptureMagic[4] = {'C', 'R', 'T', 'F'};
-constexpr std::uint16_t kResidentTrainingCaptureVersion = 4;
+// Version 5 appends the rich JSON envelopes of every runtime family that the
+// binary layout does not carry completely (see resident_write_training_json_families).
+constexpr std::uint16_t kResidentTrainingCaptureVersion = 6;
 // Chaotic late-game states can retain enough combat/phase ring entries to
 // exceed 512 KiB even though ordinary training frames are only a few KiB.
 // This is scratch capacity only: the batch channel still sends writer.used.
-constexpr std::size_t kResidentTrainingCaptureBytes = 4 * 1024 * 1024;
+// Version 5 also carries the retained phase/visibility/remaining rings as JSON,
+// so the scratch matches the full JSON observation response.
+constexpr std::size_t kResidentTrainingCaptureBytes = kFullObservationResponseBytes;
 constexpr std::int32_t kResidentTrainingNoneI32 = INT32_MIN;
 
 struct ResidentTrainingWriter {
@@ -749,6 +756,131 @@ std::int32_t resident_training_native_id_slot(std::uint32_t native_object_id, vo
     }
   }
   return -2;
+}
+
+// The training capture must give PPO exactly the semantics the JSON atomic capture
+// gives IL construction and inference. Families without a complete binary layout are
+// appended verbatim, produced by the same encoders as the rich JSON observation and
+// in the same order: each as u32 byte length + UTF-8 JSON object.
+using ResidentJsonFamilyEncoder = bool (*)(std::uint64_t, std::uint64_t, std::int32_t, char *, std::size_t,
+                                           std::size_t *);
+constexpr ResidentJsonFamilyEncoder kResidentTrainingJsonFamilies[] = {
+    append_phase_runtime_events_json,
+    append_special_movement_runtime_events_json,
+    append_action_movement_runtime_events_json,
+    append_character_state_runtime_events_json,
+    append_visibility_runtime_events_json,
+    append_remaining_runtime_events_json,
+    append_tower_troop_runtime_envelope_json,
+};
+
+// The phase, visibility and remaining rings retain thousands of events; resending the
+// whole retained window every five ticks dominated single-slot capture cost. After a
+// capture of the same match identity and ring epoch, only events from the previous
+// capture's next sequence are sent (the envelopes' transmitFromSequence delta, the same
+// mechanism the live capture uses). Any identity or ring-epoch change falls back to the
+// full retained window. Every slot keeps its own rings, so it keeps its own cursors and
+// slot switches never force a full window. The Python batch channel verifies continuity.
+struct ResidentTrainingRingCursor {
+  std::uint64_t epoch_first = 0;
+  std::uint64_t next = 0;
+};
+struct ResidentTrainingFamilyCursors {
+  bool valid = false;
+  std::uint64_t generation = 0;
+  std::uint64_t state_epoch = 0;
+  ResidentTrainingRingCursor phase;
+  ResidentTrainingRingCursor visibility;
+  ResidentTrainingRingCursor remaining;
+};
+ResidentTrainingFamilyCursors g_resident_training_family_cursors[kResidentMaxSlots];
+
+ResidentTrainingRingCursor resident_training_ring_state(const std::atomic<std::uint64_t> &epoch_first,
+                                                        const std::atomic<std::uint64_t> &next) {
+  return {epoch_first.load(std::memory_order_acquire), next.load(std::memory_order_acquire)};
+}
+
+// CR_TRAINING_AUDIT (diagnostic only): every compact capture also carries the full
+// atomic JSON observation of the same frame, and ring families are sent as full
+// windows, so the host can compare the compact snapshot with the JSON snapshot.
+bool resident_training_audit_enabled() {
+  static const bool enabled = std::getenv("CR_TRAINING_AUDIT") != nullptr;
+  return enabled;
+}
+
+std::uint64_t resident_training_delta_from(bool same_match, const ResidentTrainingRingCursor &cursor,
+                                           const ResidentTrainingRingCursor &current) {
+  // 0 clamps to the oldest retained sequence inside the encoders (full window).
+  return !resident_training_audit_enabled() && same_match && cursor.epoch_first == current.epoch_first && cursor.next <= current.next ? cursor.next : 0;
+}
+
+bool resident_write_training_json_families(ResidentTrainingWriter *writer, std::uint64_t generation,
+                                           std::uint64_t state_epoch, std::int32_t tick) {
+  constexpr std::size_t kFamilyCount = sizeof(kResidentTrainingJsonFamilies) / sizeof(kResidentTrainingJsonFamilies[0]);
+  if (writer == nullptr || !writer->u16(static_cast<std::uint16_t>(kFamilyCount))) {
+    return false;
+  }
+  if (!resident_slot_id_valid(g_resident_bound_slot)) {
+    return writer->valid = false;
+  }
+  ResidentTrainingFamilyCursors &cursors = g_resident_training_family_cursors[g_resident_bound_slot];
+  const bool same_match =
+      cursors.valid && cursors.generation == generation && cursors.state_epoch == state_epoch;
+  const bool saved_active = g_live_capture_delta_active;
+  const std::uint64_t saved_phase = g_live_capture_phase_from_sequence;
+  const std::uint64_t saved_visibility = g_live_capture_visibility_from_sequence;
+  const std::uint64_t saved_remaining = g_live_capture_remaining_from_sequence;
+  g_live_capture_delta_active = true;
+  g_live_capture_phase_from_sequence = resident_training_delta_from(
+      same_match, cursors.phase,
+      resident_training_ring_state(g_phase_match->epoch_first_sequence, g_phase_match->next_sequence));
+  g_live_capture_visibility_from_sequence = resident_training_delta_from(
+      same_match, cursors.visibility,
+      resident_training_ring_state(g_visibility_match->epoch_first_sequence, g_visibility_match->next_sequence));
+  g_live_capture_remaining_from_sequence = resident_training_delta_from(
+      same_match, cursors.remaining,
+      resident_training_ring_state(g_remaining_match->epoch_first_sequence, g_remaining_match->next_sequence));
+  struct RestoreLiveDelta {
+    bool active;
+    std::uint64_t phase, visibility, remaining;
+    ~RestoreLiveDelta() {
+      g_live_capture_delta_active = active;
+      g_live_capture_phase_from_sequence = phase;
+      g_live_capture_visibility_from_sequence = visibility;
+      g_live_capture_remaining_from_sequence = remaining;
+    }
+  } restore{saved_active, saved_phase, saved_visibility, saved_remaining};
+  cursors.valid = false;
+  for (const ResidentJsonFamilyEncoder encode : kResidentTrainingJsonFamilies) {
+    if (!writer->reserve(sizeof(std::uint32_t))) {
+      return false;
+    }
+    const std::size_t length_offset = writer->used;
+    writer->used += sizeof(std::uint32_t);
+    char *const json = reinterpret_cast<char *>(writer->data + writer->used);
+    const std::size_t available = writer->capacity - writer->used;
+    std::size_t json_used = 0;
+    if (!encode(generation, state_epoch, tick, json, available, &json_used) || json_used == 0 ||
+        json_used > available || json_used > UINT32_MAX) {
+      return writer->valid = false;
+    }
+    resident_write_le<std::uint32_t>(writer->data + length_offset, static_cast<std::uint32_t>(json_used));
+    writer->used += json_used;
+  }
+  if (!writer->valid) {
+    return false;
+  }
+  // The rings only advance while this thread steps the bound match, so the sequences
+  // read now are exactly the encoded windows' next sequences.
+  cursors.valid = true;
+  cursors.generation = generation;
+  cursors.state_epoch = state_epoch;
+  cursors.phase = resident_training_ring_state(g_phase_match->epoch_first_sequence, g_phase_match->next_sequence);
+  cursors.visibility =
+      resident_training_ring_state(g_visibility_match->epoch_first_sequence, g_visibility_match->next_sequence);
+  cursors.remaining =
+      resident_training_ring_state(g_remaining_match->epoch_first_sequence, g_remaining_match->next_sequence);
+  return true;
 }
 
 bool resident_write_training_combat_fact(ResidentTrainingWriter *writer, const CombatEntityFact &fact) {
@@ -924,13 +1056,17 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
     for (std::int32_t deck_slot = 0; deck_slot < deck_count; ++deck_slot) {
       CardStateView card;
 
-      if (!read_card_state(player, deck_slot, false, &card)) {
+      // Same selection-validated read as the JSON observation's deck entries.
+      if (!read_card_state(player, deck_slot, true, &card)) {
         return false;
       }
       writer.values<std::int32_t>({
           card.deck_slot,
           card.card_id,
+          card.command_card_id,
       });
+      writer.u32(card.card_parameter);
+      writer.i32(card.cost);
     }
 
     for (std::int32_t index = 0; index < ability_count; ++index) {
@@ -1046,6 +1182,32 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
       return false;
     }
     const std::uint32_t data_global_id = static_cast<std::uint32_t>(signed_data_global_id);
+    // Rare per-object mechanic runtimes travel as the JSON path's own encodings.
+    NativeEntityResourceStateView entity_resource;
+    const NativeEntityResourceReadStatus entity_resource_status =
+        read_native_entity_resource_state(object, &entity_resource);
+    NativePeriodicAttackModifierStateView periodic_attack_modifier;
+    const NativePeriodicAttackModifierReadStatus periodic_attack_modifier_status =
+        read_native_periodic_attack_modifier_state(object, objects, count, &periodic_attack_modifier);
+    NativeCaptureRuntimeStateView capture_runtime;
+    const NativeCaptureRuntimeReadStatus capture_runtime_status =
+        read_native_capture_runtime_state(object, objects, count, &capture_runtime);
+    NativeThresholdRelocationStateView threshold_relocation;
+    const NativeThresholdRelocationReadStatus threshold_relocation_status =
+        read_native_threshold_relocation_state(object, &threshold_relocation);
+    if (entity_resource_status == NativeEntityResourceReadStatus::Invalid ||
+        periodic_attack_modifier_status == NativePeriodicAttackModifierReadStatus::Invalid ||
+        capture_runtime_status == NativeCaptureRuntimeReadStatus::Invalid ||
+        threshold_relocation_status == NativeThresholdRelocationReadStatus::Invalid) {
+      return false;
+    }
+    const bool entity_resource_valid = entity_resource_status == NativeEntityResourceReadStatus::Valid;
+    const bool periodic_attack_modifier_valid =
+        periodic_attack_modifier_status == NativePeriodicAttackModifierReadStatus::Valid;
+    const bool capture_runtime_valid = capture_runtime_status == NativeCaptureRuntimeReadStatus::Valid;
+    const bool threshold_relocation_valid = threshold_relocation_status == NativeThresholdRelocationReadStatus::Valid;
+    const bool has_mechanic_runtimes =
+        entity_resource_valid || periodic_attack_modifier_valid || capture_runtime_valid || threshold_relocation_valid;
     const TowerTroopRuntimeRecord *tower_troop_runtime = nullptr;
     for (std::size_t index = 0; index < tower_troop_runtime_count; ++index) {
       if (tower_troop_runtimes[index].source_native_object_id == identity.native_object_id) {
@@ -1066,6 +1228,7 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
         effects.header_valid,
         true, // The data global ID above passed native validation.
         tower_troop_runtime != nullptr,
+        has_mechanic_runtimes,
     });
 
     writer.u32(object_flags);
@@ -1142,6 +1305,10 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
           phase.effective_movement_speed_tick,
           phase.movement_delta,
           phase.movement_delta_tick,
+          phase.attack_sequence_progress_raw,
+          phase.attack_sequence_progress_limit,
+          phase.attack_sequence_decay_remaining_ms,
+          phase.attack_sequence_decay_duration_ms,
       };
 
       writer.u32(phase_flags);
@@ -1172,6 +1339,29 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
           runtime.throw_delay_remaining_ms,
       });
       writer.u32(runtime.target_native_object_id);
+    }
+
+    if (has_mechanic_runtimes) {
+      if (!writer.reserve(sizeof(std::uint32_t))) {
+        return false;
+      }
+      const std::size_t length_offset = writer.used;
+      writer.used += sizeof(std::uint32_t);
+      std::size_t json_used = 0;
+      JsonWriter json(reinterpret_cast<char *>(writer.data + writer.used), writer.capacity - writer.used, &json_used);
+      json.begin_object();
+      json.optional("entityResourceRuntime", entity_resource_valid, append_native_entity_resource_json,
+                    entity_resource);
+      json.optional("periodicAttackModifierRuntime", periodic_attack_modifier_valid,
+                    append_native_periodic_attack_modifier_json, periodic_attack_modifier);
+      json.optional("captureRuntime", capture_runtime_valid, append_native_capture_runtime_json, capture_runtime);
+      json.optional("thresholdRelocationRuntime", threshold_relocation_valid, append_native_threshold_relocation_json,
+                    threshold_relocation);
+      if (!json.end_object() || json_used > UINT32_MAX) {
+        return writer.valid = false;
+      }
+      resident_write_le<std::uint32_t>(writer.data + length_offset, static_cast<std::uint32_t>(json_used));
+      writer.used += json_used;
     }
 
     const std::int32_t effect_count = effects.active_effects_valid ? effects.count : 0;
@@ -1206,25 +1396,25 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
 
   const bool combat_attested = g_combat_hooks_attested.load(std::memory_order_acquire);
   const bool combat_installed = g_combat_hooks_installed.load(std::memory_order_acquire);
-  const bool combat_identity = combat_installed && g_combat_epoch_active.load(std::memory_order_acquire) &&
-                               g_combat_game_manager.load(std::memory_order_acquire) == manager &&
-                               g_combat_generation.load(std::memory_order_acquire) == g_control_generation &&
-                               g_combat_state_epoch.load(std::memory_order_acquire) == g_state_epoch;
-  const std::uint64_t combat_next = g_combat_next_sequence.load(std::memory_order_acquire);
+  const bool combat_identity = combat_installed && g_combat_match->epoch_active.load(std::memory_order_acquire) &&
+                               g_combat_match->game_manager.load(std::memory_order_acquire) == manager &&
+                               g_combat_match->generation.load(std::memory_order_acquire) == g_control_generation &&
+                               g_combat_match->state_epoch.load(std::memory_order_acquire) == g_state_epoch;
+  const std::uint64_t combat_next = g_combat_match->next_sequence.load(std::memory_order_acquire);
   const std::uint64_t combat_epoch_first =
-      combat_identity ? g_combat_epoch_first_sequence.load(std::memory_order_acquire) : combat_next;
+      combat_identity ? g_combat_match->epoch_first_sequence.load(std::memory_order_acquire) : combat_next;
   if (combat_next < combat_epoch_first) {
     return false;
   }
   const std::uint64_t combat_oldest = combat_next > combat_epoch_first + kCombatEventRingCapacity
                                           ? combat_next - kCombatEventRingCapacity
                                           : combat_epoch_first;
-  const std::uint64_t combat_overflow = combat_identity ? g_combat_overflow_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t combat_overflow = combat_identity ? g_combat_match->overflow_count.load(std::memory_order_acquire) : 0;
   const std::uint64_t expected_combat_overflow = combat_next - combat_epoch_first > kCombatEventRingCapacity
                                                      ? combat_next - combat_epoch_first - kCombatEventRingCapacity
                                                      : 0;
   const std::uint64_t combat_rejected =
-      combat_identity ? g_combat_rejected_capture_count.load(std::memory_order_acquire) : 0;
+      combat_identity ? g_combat_match->rejected_capture_count.load(std::memory_order_acquire) : 0;
   const std::uint64_t combat_event_count = combat_next - combat_oldest;
   const bool combat_complete = combat_identity && combat_attested && combat_installed && combat_rejected == 0 &&
                                combat_overflow == expected_combat_overflow &&
@@ -1245,7 +1435,7 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
   });
   writer.u16(static_cast<std::uint16_t>(combat_event_count));
   for (std::uint64_t sequence = combat_oldest; sequence < combat_next; ++sequence) {
-    CombatRingSlot &slot = g_combat_event_ring[(sequence - 1) % kCombatEventRingCapacity];
+    CombatRingSlot &slot = g_combat_match->event_ring[(sequence - 1) % kCombatEventRingCapacity];
     if (slot.published_sequence.load(std::memory_order_acquire) != sequence) {
       return false;
     }
@@ -1282,16 +1472,23 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
         !writer.i32(record.deployment.form_code) || !resident_write_training_combat_fact(&writer, record.target) ||
         !resident_write_training_combat_fact(&writer, record.immediate_source) ||
         !resident_write_training_combat_fact(&writer, record.source) ||
-        !resident_write_training_combat_fact(&writer, record.projectile)) {
+        !resident_write_training_combat_fact(&writer, record.projectile) ||
+        !resident_write_training_combat_fact(&writer, record.related) ||
+        !resident_write_training_combat_fact(&writer, record.route_source_before) ||
+        !resident_write_training_combat_fact(&writer, record.route_target_before) ||
+        !resident_write_training_combat_fact(&writer, record.route_source_after) ||
+        !resident_write_training_combat_fact(&writer, record.route_target_after) ||
+        !writer.i32(record.destination_before_x) || !writer.i32(record.destination_before_y) ||
+        !writer.i32(record.destination_after_x) || !writer.i32(record.destination_after_y)) {
       return false;
     }
   }
 
-  const bool phase_identity = g_phase_runtime_generation.load(std::memory_order_acquire) == g_control_generation &&
-                              g_phase_runtime_state_epoch.load(std::memory_order_acquire) == g_state_epoch;
-  const std::uint64_t phase_next = g_phase_runtime_next_sequence.load(std::memory_order_acquire);
+  const bool phase_identity = g_phase_match->generation.load(std::memory_order_acquire) == g_control_generation &&
+                              g_phase_match->state_epoch.load(std::memory_order_acquire) == g_state_epoch;
+  const std::uint64_t phase_next = g_phase_match->next_sequence.load(std::memory_order_acquire);
   const std::uint64_t phase_rejected =
-      phase_identity ? g_phase_runtime_rejected_count.load(std::memory_order_acquire) : 0;
+      phase_identity ? g_phase_match->rejected_count.load(std::memory_order_acquire) : 0;
   const bool phase_attested = g_phase_runtime_hooks_attested.load(std::memory_order_acquire);
   const bool phase_installed = g_phase_runtime_hooks_installed.load(std::memory_order_acquire);
   const bool phase_complete = phase_identity && phase_installed && phase_rejected == 0;
@@ -1311,12 +1508,12 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
   });
   writer.u16(0);
   const bool tower_identity =
-      g_tower_troop_runtime_generation.load(std::memory_order_acquire) == g_control_generation &&
-      g_tower_troop_runtime_state_epoch.load(std::memory_order_acquire) == g_state_epoch;
+      g_tower_troop_match->generation.load(std::memory_order_acquire) == g_control_generation &&
+      g_tower_troop_match->state_epoch.load(std::memory_order_acquire) == g_state_epoch;
   const bool tower_attested = g_tower_troop_runtime_hooks_attested.load(std::memory_order_acquire);
   const bool tower_installed = g_tower_troop_runtime_hooks_installed.load(std::memory_order_acquire);
   const std::uint64_t tower_rejected =
-      tower_identity ? g_tower_troop_runtime_rejected_count.load(std::memory_order_acquire) : 0;
+      tower_identity ? g_tower_troop_match->rejected_count.load(std::memory_order_acquire) : 0;
   const bool tower_complete = tower_identity && tower_attested && tower_installed && tower_rejected == 0;
 
   if (!tower_complete) {
@@ -1324,6 +1521,9 @@ bool build_resident_training_capture(std::uint8_t *response, std::size_t respons
   }
   writer.u32((tower_attested ? 1U : 0U) | (tower_installed ? 2U : 0U) | (tower_complete ? 4U : 0U));
   writer.u64(tower_rejected);
+  if (!resident_write_training_json_families(&writer, g_control_generation, g_state_epoch, tick)) {
+    return false;
+  }
   if (!writer.valid) {
     return false;
   }
@@ -1572,6 +1772,23 @@ void handle_resident_batch_session(int socket_fd, bool training_capture = false,
             payload[0] = '\0';
             succeeded = build_atomic_observation_json_locked(payload, payload_capacity);
             payload_size = std::strlen(payload);
+          } else if (resident_training_audit_enabled()) {
+            if (json_fallback_payload == nullptr) {
+              json_fallback_payload.reset(new (std::nothrow) char[kFullObservationResponseBytes]);
+            }
+            static constexpr char kAuditMarker[] = "\nCRAUDIT\n";
+            if (json_fallback_payload != nullptr) {
+              json_fallback_payload[0] = '\0';
+              if (build_atomic_observation_json_locked(json_fallback_payload.get(), kFullObservationResponseBytes)) {
+                const std::size_t json_size = std::strlen(json_fallback_payload.get());
+                if (payload_size + sizeof(kAuditMarker) - 1 + json_size <= primary_payload_capacity) {
+                  std::memcpy(payload + payload_size, kAuditMarker, sizeof(kAuditMarker) - 1);
+                  payload_size += sizeof(kAuditMarker) - 1;
+                  std::memcpy(payload + payload_size, json_fallback_payload.get(), json_size);
+                  payload_size += json_size;
+                }
+              }
+            }
           }
         } else {
           succeeded = build_atomic_observation_json_locked(payload, payload_capacity);

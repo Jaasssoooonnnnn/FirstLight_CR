@@ -13,8 +13,8 @@ import torch
 
 from ...battle_env import BattleEnvV1
 from ...contracts import ObservationV1
-from .checkpoint import load_actor_critic_checkpoint
-from .decoding import ShadowCandidateLegality, decode_action_sequence_v4
+from .checkpoint import model_config_from_contract, read_actor_critic_checkpoint, restore_actor_critic_checkpoint
+from .decoding import DELAY_POLICY_SAMPLE, ShadowCandidateLegality, decode_action_sequence_v4
 from .expert import POLICY_DECISION_TICKS
 from .factory import build_episode_tensorizer_v4, build_production_model_v4
 from .model import UniversalCardPolicyV4
@@ -204,13 +204,27 @@ def resolve_v4_checkpoint(path: str | Path) -> Path:
     return matches[-1].resolve()
 
 
-def load_policy_v4(checkpoint: str | Path, *, device: torch.device | str) -> LoadedPolicyV4:
-    """Construct the production V4 model and load a strict V4 checkpoint."""
+def load_policy_v4(
+    checkpoint: str | Path, *, device: torch.device | str, delay_policy: str | None = None
+) -> LoadedPolicyV4:
+    """Construct the V4 model a checkpoint was trained with and load it strictly.
+
+    The architecture comes from the checkpoint contract (``model_config``), so
+    checkpoints with a larger CNN or LSTM load without extra flags.
+    ``delay_policy`` (``"sample"`` or ``"earliest"``) defaults to the value the
+    checkpoint records in ``extra.delay_policy``, else ``"sample"``.  A recorded
+    ``extra.inference_delay_offset_max_ms`` limits the delay bins as in training.
+    """
 
     checkpoint_path = resolve_v4_checkpoint(checkpoint)
     actual_device = torch.device(device)
-    model = build_production_model_v4(device=actual_device)
-    payload = load_actor_critic_checkpoint(checkpoint_path, model, map_location=actual_device, restore_rng=False)
+    payload = read_actor_critic_checkpoint(checkpoint_path, map_location=actual_device)
+    model = build_production_model_v4(device=actual_device, config=model_config_from_contract(payload["contract"]))
+    payload = restore_actor_critic_checkpoint(payload, model, restore_rng=False)
+    extra = payload.get("extra") if isinstance(payload.get("extra"), Mapping) else {}
+    if extra.get("inference_delay_offset_max_ms") is not None:
+        model.set_inference_delay_offset_max_ms(int(extra["inference_delay_offset_max_ms"]))
+    model.set_delay_policy(delay_policy or str(extra.get("delay_policy", DELAY_POLICY_SAMPLE)))
     model.eval()
     return LoadedPolicyV4(
         model=model,
@@ -245,7 +259,8 @@ class PolicySessionV4:
         self._cuda_graph: _DeterministicCudaGraphV4 | None = None
         if self.device.type == "cuda" and not self.sample and not self.validate_tensors:
             by_device = _POLICY_CUDA_GRAPHS_V4.setdefault(model, {})
-            device_key = str(self.device)
+            # A captured graph bakes the delay policy in.
+            device_key = f"{self.device}|delay_policy={model.delay_policy}"
             cached = by_device.get(device_key)
             if cached is None:
                 cached = _DeterministicCudaGraphV4(self.device)

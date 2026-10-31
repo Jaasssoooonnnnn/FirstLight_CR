@@ -63,11 +63,15 @@ def test_native_telemetry_wire_contract(tmp_path: Path) -> None:
 #include <string>
 #include <iostream>
 #include <cassert>
+#include "combat_deployment_layout.h"
 #include "phase_runtime_layout.h"
 #include "probe_json.h"
 #define LOGE(...) ((void)0)
 constexpr std::int32_t kNativeObjectIdEntityKeyTag = -2;
 constexpr int kPlayerCount = 2;
+bool g_live_capture_delta_active = false;
+std::uint64_t g_live_capture_combat_from_sequence = 1;
+std::uint64_t g_live_capture_phase_from_sequence = 1;
 '''
     for name in (
         "json_boolean",
@@ -97,8 +101,8 @@ constexpr int kPlayerCount = 2;
     output = subprocess.check_output([str(executable)]).replace(b"\r\n", b"\n")
     # 120 successful envelope/snapshot fixtures plus five malformed ring/identity
     # cases. The C++ fixture also verifies four insufficient buffer capacities.
-    # Compared byte-for-byte with the private baseline in offline mode.
+    # Measured with the resident-training probe build (per-match telemetry).
     assert len(output.splitlines()) == 125
     assert hashlib.sha256(output).hexdigest() == (
-        "d15bd108d0652cd1991d53fffb70663fbb4912fdbcda50041c46d3277b226d97"
+        "8090d3ac873b2afb5f61ad127c0ad3305e58b4ec006b977fb96d1eb19e7de5f6"
     )

@@ -12,6 +12,8 @@ UNIVERSAL_OBSERVATION_VERSION = "universal-semantic-observation.v4"
 UNIVERSAL_ACTION_VERSION = "universal-candidate-action.v4"
 UNIVERSAL_CARD_CATALOG_VERSION = "universal-card-catalog.v3"
 
+CARD_ID_GATE_MODES = ("learned", "zero", "one")
+
 
 CARD_RUNTIME_FEATURE_NAMES = (
     "in_hand",
@@ -30,7 +32,19 @@ CARD_RUNTIME_FEATURE_NAMES = (
     "ability_casting",
     "ability_active",
     "unknown_opponent_card_fraction",
+    # Own commands already submitted and still in flight (the battle executes
+    # a touch 20 ticks later).  Opponent commands stay hidden until they land.
+    "pending_execution",
+    "pending_ticks_remaining_over_20",
+    "pending_target_x_over_board_width",
+    "pending_target_y_over_board_height",
+    "ability_pending",
 )
+
+# Column of ``pending_ticks_remaining_over_20`` in own/opponent card runtime
+# features.  Neutralised (written as 0.0) when
+# ``ModelConfigV4.neutralize_pending_ticks_remaining`` is set; see there.
+PENDING_TICKS_REMAINING_FEATURE_INDEX = CARD_RUNTIME_FEATURE_NAMES.index("pending_ticks_remaining_over_20")
 
 TOWER_FEATURE_NAMES = (
     "hitpoints_ratio",
@@ -312,10 +326,78 @@ class ModelConfigV4:
     initial_act_probability: float = 0.15
     initial_second_probability: float = 0.25
 
+    # Observation-contract flag (not an ablation).  Live receipts report the
+    # touch tick as the execution tick, so ``pending_ticks_remaining_over_20``
+    # is always 0 in live play while IL caches and PPO self-play see a
+    # decaying positive value.  When set, the tensorizer writes 0.0 into that
+    # own-card column and cached observations are zeroed on load, keeping the
+    # runtime width (and existing caches/checkpoints) unchanged.
+    neutralize_pending_ticks_remaining: bool = True
+
+    # Action-contract flag (not an ablation; no parameters or input widths
+    # depend on it).  When set, elixir legality is checked at the touch tick:
+    # a candidate is legal when its cost is affordable at some delay bin of the
+    # 0..200 ms decision window, i.e. with ``k`` ticks of native regeneration
+    # (``ShadowCandidateLegality``; BattleEnvV1 applies the same rule to its
+    # action mask and compound validation).  Checkpoints written before this
+    # field existed keep the decision-tick rule (``False``) through
+    # ``checkpoint.LEGACY_FIELD_DEFAULTS``.
+    delay_aware_legality: bool = True
+
+    # Architecture ablation switches.  Every default reproduces the baseline
+    # exactly (same modules, same parameter count).  Switches that remove an
+    # input multiply it by zero instead of skipping its module, so every
+    # parameter stays in the autograd graph (IL DDP runs with
+    # ``find_unused_parameters=False``).  Switches that replace a module
+    # construct the replacement only when enabled.
+    #
+    # Location head reads a learned constant [C,H,W] map instead of the
+    # spatial ResNet memory.  The conditioned keys still feed the delay head,
+    # the action embedding and the continue head.
+    ablate_spatial_memory: bool = False
+    # Zero the named summary at the encoder output, so the recurrent core and
+    # every policy/value skip connection see zeros.
+    ablate_spatial_summary: bool = False
+    ablate_event_summary: bool = False
+    ablate_previous_action_summary: bool = False
+    # Zero the additive attention biases inside every relation block.
+    ablate_relation_bias: bool = False
+    ablate_spatial_pair_bias: bool = False
+    # Zero the mechanic-profile memory consumed by every encoder.  Active
+    # effects still reach children and towers through effect memory.
+    ablate_mechanic_profiles: bool = False
+    # Card-ID residual gate of GlobalCardEncoder only: "learned" (sigmoid
+    # gate), "zero" (semantics only) or "one" (ungated ID residual).  The
+    # effect-ID and child-archetype gates and the ungated ability-ID
+    # embeddings are separate and unaffected.
+    card_id_gate: str = "learned"
+    # Replace the LSTMCell by a two-layer MLP of the core input: hidden is
+    # MLP(core_input), cell is zero, and the incoming state is ignored.
+    ablate_lstm: bool = False
+    # Decoder context ignores the token memory (attention output times zero).
+    ablate_decoder_cross_attention: bool = False
+
     def __post_init__(self) -> None:
-        invalid = sorted(item.name for item in fields(self) if item.type == "int" and getattr(self, item.name) <= 0)
+        invalid = sorted(
+            item.name
+            for item in fields(self)
+            if item.type == "int" and item.name != "transformer_layers" and getattr(self, item.name) <= 0
+        )
         if invalid:
             raise ValueError(f"V4 dimensions must be positive: {invalid}")
+        if self.transformer_layers < 0:
+            raise ValueError("transformer_layers must be non-negative")
+        non_bool = sorted(
+            item.name for item in fields(self) if item.type == "bool" and not isinstance(getattr(self, item.name), bool)
+        )
+        if non_bool:
+            raise ValueError(f"V4 ablation switches must be bool: {non_bool}")
+        if self.card_id_gate not in CARD_ID_GATE_MODES:
+            raise ValueError(f"card_id_gate must be one of {CARD_ID_GATE_MODES}")
+        if self.spatial_hidden_channels % 8:
+            raise ValueError("spatial_hidden_channels must be divisible by 8 (GroupNorm groups)")
+        if self.decoder_hidden_dim % self.attention_heads:
+            raise ValueError("decoder_hidden_dim must be divisible by attention_heads")
         if (self.board_width, self.board_height) != (18, 32):
             raise ValueError("V4 arena grid is frozen at width=18, height=32")
         if self.decision_ticks != 5:
@@ -353,3 +435,28 @@ class ModelConfigV4:
         ):
             if not 0.0 < probability < 1.0:
                 raise ValueError(f"{name} must be in (0, 1)")
+
+    def active_ablations(self) -> dict[str, object]:
+        """Ablation switches (and a zero-layer Transformer) that differ from the baseline."""
+
+        baseline = ModelConfigV4()
+        active: dict[str, object] = {
+            name: getattr(self, name) for name in ABLATION_FIELD_NAMES if getattr(self, name) != getattr(baseline, name)
+        }
+        if self.transformer_layers == 0:
+            active["transformer_layers"] = 0
+        return active
+
+
+ABLATION_FIELD_NAMES = (
+    "ablate_spatial_memory",
+    "ablate_spatial_summary",
+    "ablate_event_summary",
+    "ablate_previous_action_summary",
+    "ablate_relation_bias",
+    "ablate_spatial_pair_bias",
+    "ablate_mechanic_profiles",
+    "card_id_gate",
+    "ablate_lstm",
+    "ablate_decoder_cross_attention",
+)

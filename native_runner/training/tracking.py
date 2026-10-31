@@ -102,9 +102,15 @@ class DeterministicPublicTracker:
         ability_cooldown_ms_by_owner_card: (Mapping[int, Mapping[int, int]] | None) = None,
         ability_max_charges_by_owner_card: (Mapping[int, Mapping[int, int]] | None) = None,
         ability_form_to_base_card: Mapping[int, int] | None = None,
+        unknown_deck_owners: frozenset[int] = frozenset(),
     ) -> None:
         self.decks = {int(owner): tuple(int(card) for card in deck) for owner, deck in decks.items()}
-        if set(self.decks) != {0, 1} or any(len(deck) != 8 or len(set(deck)) != 8 for deck in self.decks.values()):
+        self.unknown_deck_owners = frozenset(unknown_deck_owners)
+        if not self.unknown_deck_owners.issubset({0, 1}) or len(self.unknown_deck_owners) > 1:
+            raise ValueError("only one live opponent deck may be unknown")
+        if set(self.decks) != {0, 1} or any(
+            (bool(deck) if owner in self.unknown_deck_owners else len(deck) != 8 or len(set(deck)) != 8)
+            for owner, deck in self.decks.items()):
             raise ValueError("tracker requires two distinct eight-card decks")
         self.card_costs = {int(card): float(cost) for card, cost in card_costs.items()}
         self.ability_cost_by_owner = {int(owner): float(cost) for owner, cost in ability_cost_by_owner.items()}
@@ -148,7 +154,7 @@ class DeterministicPublicTracker:
                 if any(ticks <= 0 for ticks in cooldowns.values()):
                     raise ValueError("ability cooldowns must be positive")
                 outside_deck = set(costs).difference(self.decks[owner])
-                if outside_deck:
+                if outside_deck and owner not in self.unknown_deck_owners:
                     raise ValueError(
                         f"card-aware ability contracts contain cards outside owner {owner} deck: {sorted(outside_deck)}"
                     )
@@ -165,7 +171,7 @@ class DeterministicPublicTracker:
                 if any(maximum <= 0 for maximum in charges.values()):
                     raise ValueError("ability max charges must be positive")
                 outside_deck = set(charges).difference(self.decks[owner])
-                if outside_deck:
+                if outside_deck and owner not in self.unknown_deck_owners:
                     raise ValueError(
                         "card-aware ability charge contracts contain cards "
                         f"outside owner {owner} deck: {sorted(outside_deck)}"
@@ -209,7 +215,7 @@ class DeterministicPublicTracker:
                 if any(required <= 0 for required in requirements.values()):
                     raise ValueError("evolution cycle requirements must be positive")
                 outside_deck = set(requirements).difference(self.decks[owner])
-                if outside_deck:
+                if outside_deck and owner not in self.unknown_deck_owners:
                     raise ValueError(
                         "owner-specific evolution cycles contain cards outside "
                         f"owner {owner} deck: {sorted(outside_deck)}"
@@ -235,6 +241,8 @@ class DeterministicPublicTracker:
         self._ready = False
 
     def reset(self, *, tick: int, initial_elixir: Mapping[int, float]) -> None:
+        for owner in self.unknown_deck_owners:
+            self.decks[owner] = ()
         if set(initial_elixir) != {0, 1}:
             raise ValueError("initial elixir must cover both owners")
         values = {owner: float(initial_elixir[owner]) for owner in (0, 1)}
@@ -332,7 +340,13 @@ class DeterministicPublicTracker:
 
     def _record_card_play(self, owner: int, card_id: int, *, exact_cost: float | None = None) -> None:
         if card_id not in self._card_states[owner]:
-            raise ValueError(f"public play used card {card_id} outside owner {owner} deck")
+            if owner not in self.unknown_deck_owners or card_id not in self.card_costs or len(self.decks[owner]) >= 8:
+                raise ValueError(f"public play used card {card_id} outside owner {owner} deck")
+            self.decks[owner] = (*self.decks[owner], card_id)
+            required = self.evolution_cycle_required_by_owner[owner].get(card_id, 0)
+            self._card_states[owner][card_id] = PublicCardState(
+                availability=AvailabilityIndex.UNKNOWN_INITIAL, cycle_distance=0, initial_state_known=False,
+                evolution_cycle_required=required, evolution_cycle_remaining=required)
         if card_id not in self._revealed_card_order[owner]:
             self._revealed_card_order[owner].append(card_id)
         current = self._card_states[owner]

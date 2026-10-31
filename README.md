@@ -28,13 +28,18 @@
 >
 > [Watch in English (YouTube)](https://www.youtube.com/watch?v=TpfhzVlXWqw&lc=UgyyW1z5iYdLX8BZ0xl4AaABAg) · [观看中文版（哔哩哔哩）](https://www.bilibili.com/video/BV17Zb46JE9h)
 
-## Pretrained models
+## Pretrained model
 
-**General is a strong model across decks. The author used the Hog 2.6 specialist to reach Hall of Fame.**
+This branch ships **Everlight**, trained after two changes to the environment:
 
-The [training history](docs/training_history.md) covers how the models were trained and evaluated.
+- A card or ability now takes effect 20 ticks (1 second) after it is played, as in the real game. Replay reconstruction, IL, PPO and the match interface all use this delay. In the interface it applies to both the player and the model.
+- The model sees its own cards that have been played but have not reached the arena yet.
 
-Choose **General** for different decks or a **Hog 2.6 specialist** for Hog Cycle. Both are included in the repository. See the [model guide](checkpoints/README.md) for checkpoint details and evaluation.
+Everlight also has a larger network. The spatial CNN has 128 channels and 5 residual blocks (previously 64 and 3), and the LSTM has 768 units (previously 512). It was trained with imitation learning and then with PPO self-play; the included checkpoint is PPO update 80.
+
+The five earlier models (General, IL, Active IL and the two Hog 2.6 specialists) are on the [`main`](https://github.com/Jaasssoooonnnnn/FirstLight_CR/tree/main) branch. They were trained without the delay and cannot be loaded on this branch.
+
+See the [model guide](checkpoints/README.md) for loading and evaluation.
 
 ## Features
 
@@ -45,7 +50,7 @@ Choose **General** for different decks or a **Hog 2.6 specialist** for Hog Cycle
 - **Match and replay interface.** Play against a model, control both sides manually, or watch training and collected replays in one offline VM.
 - **Source code.** The probe, APK build tools, battle environment, and training code are included.
 
-**122 supported cards · 5 included checkpoints · 252,238 replays · 17,836,160 actions**
+**122 supported cards · 1 included checkpoint · 252,238 replays · 17,836,160 actions**
 
 See [compatibility data](native_runner/data/competitive/README.md) for the cards and forms supported by each version. Download the replay dataset from [Hugging Face](https://huggingface.co/datasets/VanguardX101/IL_Replay).
 
@@ -99,13 +104,13 @@ To open the interface after installation, run `FirstLight_CR\launch_interface.cm
 
 Start with [IL_Replay](https://huggingface.co/datasets/VanguardX101/IL_Replay) for imitation learning, or generate a small workflow example with `python tools/make_demo_data.py`. The [training guide](docs/training.md) covers cache generation, IL, engine clusters, Linux AVD preparation, and distributed PPO.
 
-To compare two included checkpoints, stop any console task and run:
+To compare two checkpoints, stop any console task and run the evaluator. The example plays Everlight against itself as a quick check:
 
 ```powershell
 ./native_runner/start_offline.ps1
 .\.venv\Scripts\python.exe -m native_runner.training.v4.evaluate `
-  --checkpoint-a ./checkpoints/General/checkpoint-step-00000460.pt `
-  --checkpoint-b ./checkpoints/IL/checkpoint-step-00029396.pt `
+  --checkpoint-a ./checkpoints/Everlight/v15-general-il100-kl5e-2-v80.pt `
+  --checkpoint-b ./checkpoints/Everlight/v15-general-il100-kl5e-2-v80.pt `
   --games 2 --output ./evaluations/comparison
 ```
 

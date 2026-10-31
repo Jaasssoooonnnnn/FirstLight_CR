@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from native_runner.attestation import (
     RunnerAttestationError,
@@ -89,6 +90,15 @@ def _attestation(**overrides: object) -> RunnerAttestationV1:
 
 
 class RunnerAttestationTests(unittest.TestCase):
+    def test_selected_package_still_requires_exact_engine_probe_and_content(self) -> None:
+        base = _manifest()
+        selected = replace(base, ruleset_id="", config={**dict(base.config), "runtime_package_name": "com.supercell.clashroyale"})
+        verify_runner_attestation(_attestation(package_name="com.supercell.clashroyale"), selected)
+        with self.assertRaisesRegex(RunnerAttestationError, "package/ABI mismatch"):
+            verify_runner_attestation(_attestation(), selected)
+        with self.assertRaisesRegex(RunnerAttestationError, "probe_sha256"):
+            verify_runner_attestation(_attestation(package_name="com.supercell.clashroyale", probe_sha256="7" * 64), selected)
+
     def test_live_identity_binds_every_manifested_native_file_and_build_id(self) -> None:
         actual = verify_runner_attestation(_attestation(), _manifest())
         self.assertTrue(actual.production_ready)

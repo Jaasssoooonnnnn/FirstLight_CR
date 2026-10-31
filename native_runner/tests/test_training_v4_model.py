@@ -451,7 +451,7 @@ def test_v4_frontend_projection_widths_are_frozen() -> None:
             if isinstance(layer, torch.nn.Linear)
         ]
 
-    assert linear_shapes(model.card_token_encoder.runtime) == [(16, 128), (128, 256)]
+    assert linear_shapes(model.card_token_encoder.runtime) == [(21, 128), (128, 256)]
     assert linear_shapes(model.tower_encoder.feature) == [(21, 128), (128, 256)]
     assert isinstance(model.tower_encoder.position, torch.nn.Linear)
     assert linear_shapes(model.tower_encoder.position) == [(6, 256)]

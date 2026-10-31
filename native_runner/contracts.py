@@ -104,7 +104,12 @@ class FrozenMapping(Mapping[str, Any]):
     __slots__ = ("_data", "_hash")
 
     def __init__(self, value: Mapping[str, Any] | None = None) -> None:
-        data = {str(key): _freeze(item) for key, item in (value or {}).items()}
+        # Inline _freeze's and str()'s identity cases (str keys, scalar values).
+        passthrough = _FREEZE_PASSTHROUGH_TYPES
+        data = {
+            (key if type(key) is str else str(key)): (item if type(item) in passthrough else _freeze(item))
+            for key, item in (value or {}).items()
+        }
         self._data = MappingProxyType(data)
         self._hash: int | None = None
 
@@ -116,6 +121,24 @@ class FrozenMapping(Mapping[str, Any]):
 
     def __len__(self) -> int:
         return len(self._data)
+
+    # Delegate the read-only Mapping mixins to the backing proxy.  The inherited
+    # versions route every key through ``__getitem__`` in Python; results and
+    # iteration order are identical (hot in observe/tensorize).
+    def __contains__(self, key: object) -> bool:
+        return key in self._data
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data.get(key, default)
+
+    def keys(self):  # type: ignore[override]
+        return self._data.keys()
+
+    def items(self):  # type: ignore[override]
+        return self._data.items()
+
+    def values(self):  # type: ignore[override]
+        return self._data.values()
 
     def __repr__(self) -> str:
         return f"FrozenMapping({dict(self._data)!r})"
@@ -137,7 +160,19 @@ class FrozenMapping(Mapping[str, Any]):
         return self
 
 
+_FREEZE_PASSTHROUGH_TYPES = frozenset({str, int, float, bool, type(None), FrozenMapping})
+
+
 def _freeze(value: Any) -> Any:
+    # Exact-type fast paths skip the ABC isinstance checks below; they return
+    # exactly what the general branches would (subclasses still take those).
+    value_type = type(value)
+    if value_type in _FREEZE_PASSTHROUGH_TYPES:
+        return value
+    if value_type is dict or value_type is MappingProxyType:
+        return FrozenMapping(value)
+    if value_type is tuple or value_type is list:
+        return tuple([_freeze(item) for item in value])
     if isinstance(value, FrozenMapping):
         return value
     if isinstance(value, Mapping):
@@ -150,7 +185,8 @@ def _freeze(value: Any) -> Any:
 
 
 def frozen_mapping(value: Mapping[str, Any] | None = None) -> FrozenMapping:
-    return value if isinstance(value, FrozenMapping) else FrozenMapping(value)
+    # ``type(...) is`` first: FrozenMapping is an ABC, so isinstance is a Python-level call.
+    return value if type(value) is FrozenMapping or isinstance(value, FrozenMapping) else FrozenMapping(value)
 
 
 def _jsonable(value: Any) -> Any:
@@ -396,8 +432,14 @@ def _set_provenance(instance: Any, name: str, required: Iterable[str], label: st
     object.__setattr__(instance, name, _semantic_provenance(getattr(instance, name), required, label=label))
 
 
+@cache
+def _split_names(names: str) -> tuple[str, ...]:
+    # Field lists are string literals; split each one once.
+    return tuple(names.split())
+
+
 def _nonnegative(instance: Any, names: str, prefix: str = "") -> None:
-    for name in names.split():
+    for name in _split_names(names):
         value = getattr(instance, name)
         if value is not None and value < 0:
             raise ContractError(f"{prefix}{name} must be non-negative")
@@ -459,6 +501,11 @@ class SemanticEvidenceLevel(str, Enum):
     STATIC_DECLARED = "static_declared"
     NOT_APPLICABLE = "not_applicable"
     UNKNOWN = "unknown"
+
+
+# A str-valued Enum is neither a Mapping nor a sequence/set, so _freeze returns it
+# unchanged; evidence levels are frozen hundreds of times per observation.
+_FREEZE_PASSTHROUGH_TYPES = _FREEZE_PASSTHROUGH_TYPES | {SemanticEvidenceLevel}
 
 
 class EffectKind(str, Enum):
@@ -999,20 +1046,25 @@ class SemanticProvenanceV1(StrictContractMixin):
     VERSION: ClassVar[str] = SEMANTIC_PROVENANCE_VERSION
 
     def __post_init__(self) -> None:
+        # Exact-type check first: same result as _enum without formatting its label.
         evidence = {
-            str(name): _enum(SemanticEvidenceLevel, value, f"semantic evidence for {name}")
+            str(name): (
+                value
+                if type(value) is SemanticEvidenceLevel
+                else _enum(SemanticEvidenceLevel, value, f"semantic evidence for {name}")
+            )
             for name, value in self.field_evidence.items()
         }
         if not evidence or any(not name for name in evidence):
             raise ContractError("semantic provenance requires named fields")
-        sources = {str(name): tuple(str(item) for item in values) for name, values in self.source_fields.items()}
+        sources = {str(name): tuple(map(str, values)) for name, values in self.source_fields.items()}
         if not set(sources).issubset(evidence):
             raise ContractError("semantic provenance source_fields reference unknown fields")
         if self.observed_tick is not None and self.observed_tick < 0:
             raise ContractError("semantic provenance observed_tick must be non-negative")
         object.__setattr__(self, "field_evidence", frozen_mapping(evidence))
         object.__setattr__(self, "source_fields", frozen_mapping(sources))
-        object.__setattr__(self, "notes", tuple(str(item) for item in self.notes))
+        object.__setattr__(self, "notes", tuple(map(str, self.notes)))
 
     @property
     def unknown_fields(self) -> tuple[str, ...]:
@@ -1021,9 +1073,13 @@ class SemanticProvenanceV1(StrictContractMixin):
         )
 
     def validate_fields(self, expected: Iterable[str], *, label: str) -> None:
-        expected_set = {str(item) for item in expected}
-        actual = set(self.field_evidence)
+        # Field universes are module-level frozensets of str: already normalized.
+        expected_set = _str_frozenset(expected) if type(expected) is frozenset else None
+        if expected_set is None:
+            expected_set = {str(item) for item in expected}
+        actual = self.field_evidence.keys()
         if actual != expected_set:
+            actual = set(actual)
             missing = sorted(expected_set.difference(actual))
             extra = sorted(actual.difference(expected_set))
             raise ContractError(f"{label} provenance must cover every field exactly; missing={missing}, extra={extra}")
@@ -1061,6 +1117,11 @@ class SemanticProvenanceV1(StrictContractMixin):
     STRICT_LABEL: ClassVar[str] = "semantic provenance"
 
 
+@cache
+def _str_frozenset(values: frozenset) -> frozenset[str] | None:
+    return values if all(type(item) is str for item in values) else None
+
+
 def _semantic_provenance(
     value: SemanticProvenanceV1 | Mapping[str, Any], expected: Iterable[str], *, label: str
 ) -> SemanticProvenanceV1:
@@ -1094,7 +1155,7 @@ def _require_presence_evidence(
 
 def _validate_domains(instance: Any, label: str, *, singular: str = "", plural: str = "") -> None:
     for names, collection in ((singular, False), (plural, True)):
-        for name in names.split():
+        for name in _split_names(names):
             state = getattr(instance, name)
             present = bool(state) if collection else state is not None
             evidence = instance.runtime_provenance.field_evidence[name]
@@ -2052,7 +2113,8 @@ def _runtime_extension_mapping(
 ) -> FrozenMapping | None:
     if value is None:
         return None
-    if not isinstance(value, Mapping) or set(value) != {"version", *fields}:
+    # Runtime mappings arrive as mappingproxy, whose ABC isinstance check is never cached.
+    if not (type(value) is MappingProxyType or isinstance(value, Mapping)) or set(value) != {"version", *fields}:
         raise ContractError(f"{label} fields do not match {version}")
     if value.get("version") != version or value.get("phase") not in phases:
         raise ContractError(f"{label} version/phase is invalid")

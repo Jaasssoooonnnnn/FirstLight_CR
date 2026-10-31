@@ -34,7 +34,14 @@ struct CharacterStateRawRecord {
   bool complete_context = false;
 };
 
-EpochRing<CharacterStateRawRecord, kCharacterStateRingCapacity> g_character_state_ring;
+// One match's retained character-state ring.  Hooks publish into the bound instance
+// (see MatchTelemetry in cr_replay_probe.cpp).
+struct CharacterStateMatchTelemetry {
+  EpochRing<CharacterStateRawRecord, kCharacterStateRingCapacity> ring;
+};
+
+CharacterStateMatchTelemetry g_character_state_default_match;
+CharacterStateMatchTelemetry *g_character_state_match = &g_character_state_default_match;
 std::atomic<bool> g_character_state_hook_attested{false};
 std::atomic<bool> g_character_state_hook_installed{false};
 
@@ -65,15 +72,15 @@ std::uintptr_t character_state_caller_offset(const void *address) {
 }
 
 void begin_character_state_runtime_epoch(std::uint64_t generation, std::uint64_t state_epoch) {
-  g_character_state_ring.begin(generation, state_epoch);
+  g_character_state_match->ring.begin(generation, state_epoch);
 }
 
 void reject_character_state_record(const CombatCaptureContext &context) {
-  g_character_state_ring.reject(context.generation, context.state_epoch);
+  g_character_state_match->ring.reject(context.generation, context.state_epoch);
 }
 
 std::uint64_t publish_character_state_record(CharacterStateRawRecord record) {
-  return g_character_state_ring.publish(record);
+  return g_character_state_match->ring.publish(record);
 }
 
 bool same_character_state_entity(const CombatEntityFact &before, const CombatEntityFact &after) {
@@ -166,7 +173,7 @@ bool append_character_state_runtime_events_json(std::uint64_t generation, std::u
                                                 std::int32_t observation_tick, char *response,
                                                 std::size_t response_size, std::size_t *used) {
   return append_epoch_ring_events(
-      g_character_state_ring,
+      g_character_state_match->ring,
       {cr_character_state_runtime::kSchema, "allowlisted-native-character-state-hook-ring",
        "sha-build-id-prologue-abi-kind5-card-identity-committed-state"},
       generation, state_epoch, observation_tick, g_character_state_hook_attested.load(std::memory_order_acquire),

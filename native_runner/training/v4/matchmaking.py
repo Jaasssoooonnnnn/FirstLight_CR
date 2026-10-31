@@ -477,7 +477,7 @@ class DeckMatchmakerV4:
 
     def _refill_policy_cycle(self, *, has_history: bool) -> None:
         config = self.config
-        history = POLICY_HISTORY if has_history else POLICY_CURRENT
+        history = POLICY_HISTORY if has_history else POLICY_IL
         self._policy_cycle = (
             [POLICY_CURRENT] * config.current_current
             + [POLICY_IL] * config.current_il

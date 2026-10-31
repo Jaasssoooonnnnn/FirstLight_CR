@@ -9,6 +9,8 @@
 #include <cstring>
 #include <thread>
 
+bool g_live_capture_delta_active = false;
+std::uint64_t g_live_capture_remaining_from_sequence = 0;
 
 struct FakeObject {
     alignas(void*) std::uint8_t bytes[0x200] = {};
@@ -29,9 +31,13 @@ const char* g_libg_path = "";
 std::atomic<bool> g_combat_hooks_attested{false};
 std::atomic<bool> g_combat_hooks_installed{false};
 std::atomic<bool> g_combat_hooks_enabled{false};
-std::atomic<bool> g_combat_epoch_active{false};
-std::atomic<std::uint64_t> g_combat_generation{0};
-std::atomic<std::uint64_t> g_combat_state_epoch{0};
+struct CombatMatchTelemetry {
+    std::atomic<bool> epoch_active{false};
+    std::atomic<std::uint64_t> generation{0};
+    std::atomic<std::uint64_t> state_epoch{0};
+};
+CombatMatchTelemetry g_combat_default_match;
+CombatMatchTelemetry* g_combat_match = &g_combat_default_match;
 std::atomic<bool> g_phase_runtime_hooks_attested{false};
 std::atomic<bool> g_phase_runtime_hooks_installed{false};
 
@@ -455,10 +461,10 @@ int main() {
     g_test_context.state_epoch = 1;
     g_test_context.tick = 130;
     g_test_context_active.store(true, std::memory_order_release);
-    g_combat_generation.store(1, std::memory_order_release);
-    g_combat_state_epoch.store(1, std::memory_order_release);
+    g_combat_match->generation.store(1, std::memory_order_release);
+    g_combat_match->state_epoch.store(1, std::memory_order_release);
     g_combat_hooks_enabled.store(true, std::memory_order_release);
-    g_combat_epoch_active.store(true, std::memory_order_release);
+    g_combat_match->epoch_active.store(true, std::memory_order_release);
     g_remaining_runtime_hooks_attested.store(
         true, std::memory_order_release);
     g_remaining_runtime_hooks_installed.store(
@@ -484,7 +490,7 @@ int main() {
             return 1;
         }
     }
-    if (g_remaining_runtime_next_sequence.load() != 2 ||
+    if (g_remaining_match->next_sequence.load() != 2 ||
         captures_after_first != 2 ||
         g_capture_combat_entity_calls.load() !=
             captures_after_first ||
@@ -498,13 +504,13 @@ int main() {
     g_test_area_result.store(false, std::memory_order_release);
     if (remaining_area_damage_eligible_hook(
             &subject, &source, 0) ||
-        g_remaining_runtime_next_sequence.load() != 3 ||
+        g_remaining_match->next_sequence.load() != 3 ||
         g_capture_combat_entity_calls.load() != 4) {
         return 1;
     }
     (void)remaining_area_damage_eligible_hook(
         &subject, &source, 0);
-    if (g_remaining_runtime_next_sequence.load() != 3 ||
+    if (g_remaining_match->next_sequence.load() != 3 ||
         g_capture_combat_entity_calls.load() != 4) {
         return 1;
     }
@@ -519,8 +525,8 @@ int main() {
         &reused_subject, &source, 1);
     g_test_context.generation = 2;
     g_test_context.state_epoch = 2;
-    g_combat_generation.store(2, std::memory_order_release);
-    g_combat_state_epoch.store(2, std::memory_order_release);
+    g_combat_match->generation.store(2, std::memory_order_release);
+    g_combat_match->state_epoch.store(2, std::memory_order_release);
     (void)remaining_area_damage_eligible_hook(
         &reused_subject, &source, 1);
     remaining_area_eligibility_cache_invalidate_pointer(
@@ -529,16 +535,16 @@ int main() {
         &reused_subject, &source, 1);
     (void)remaining_area_damage_eligible_hook(
         &reused_subject, &source, 2);
-    if (g_remaining_runtime_next_sequence.load() != 9 ||
+    if (g_remaining_match->next_sequence.load() != 9 ||
         g_capture_combat_entity_calls.load() != 16 ||
-        g_remaining_runtime_rejected_count.load() != 0) {
+        g_remaining_match->rejected_count.load() != 0) {
         return 1;
     }
 
     g_test_context.generation = 3;
     g_test_context.state_epoch = 3;
-    g_combat_generation.store(3, std::memory_order_release);
-    g_combat_state_epoch.store(3, std::memory_order_release);
+    g_combat_match->generation.store(3, std::memory_order_release);
+    g_combat_match->state_epoch.store(3, std::memory_order_release);
     g_test_area_result.store(true, std::memory_order_release);
     std::atomic<bool> concurrent_start{false};
     std::atomic<bool> concurrent_failed{false};
@@ -563,17 +569,17 @@ int main() {
         worker.join();
     }
     if (concurrent_failed.load(std::memory_order_acquire) ||
-        g_remaining_runtime_next_sequence.load() != 10 ||
+        g_remaining_match->next_sequence.load() != 10 ||
         g_capture_combat_entity_calls.load() != 18 ||
-        g_remaining_runtime_rejected_count.load() != 0) {
+        g_remaining_match->rejected_count.load() != 0) {
         return 1;
     }
 
     g_test_context.generation = 4;
     g_test_context.state_epoch = 4;
     g_test_context.tick = 400;
-    g_combat_generation.store(4, std::memory_order_release);
-    g_combat_state_epoch.store(4, std::memory_order_release);
+    g_combat_match->generation.store(4, std::memory_order_release);
+    g_combat_match->state_epoch.store(4, std::memory_order_release);
     remaining_refresh_epoch(g_test_context);
     RemainingRemovalCapture delayed;
     delayed.validated = true;
@@ -587,15 +593,15 @@ int main() {
     g_test_member_count = 1;
     remaining_runtime_note_confirmed_remove(delayed, false);
     remaining_runtime_reconcile_pending_removals(g_test_context);
-    if (g_remaining_runtime_next_sequence.load() != 10 ||
-        g_remaining_runtime_rejected_count.load() != 0) {
+    if (g_remaining_match->next_sequence.load() != 10 ||
+        g_remaining_match->rejected_count.load() != 0) {
         return 1;
     }
     g_test_context.tick = 401;
     g_test_member_count = 0;
     remaining_runtime_reconcile_pending_removals(g_test_context);
-    if (g_remaining_runtime_next_sequence.load() != 11 ||
-        g_remaining_runtime_rejected_count.load() != 0) {
+    if (g_remaining_match->next_sequence.load() != 11 ||
+        g_remaining_match->rejected_count.load() != 0) {
         return 1;
     }
 
@@ -609,8 +615,8 @@ int main() {
         &reused_subject, 0x08, 102);
     g_test_context.tick = 402;
     remaining_runtime_reconcile_pending_removals(g_test_context);
-    if (g_remaining_runtime_next_sequence.load() != 12 ||
-        g_remaining_runtime_rejected_count.load() != 0) {
+    if (g_remaining_match->next_sequence.load() != 12 ||
+        g_remaining_match->rejected_count.load() != 0) {
         return 1;
     }
 
@@ -641,14 +647,14 @@ int main() {
     g_test_context.generation = 5;
     g_test_context.state_epoch = 5;
     g_test_context.tick = 500;
-    g_combat_generation.store(5, std::memory_order_release);
-    g_combat_state_epoch.store(5, std::memory_order_release);
+    g_combat_match->generation.store(5, std::memory_order_release);
+    g_combat_match->state_epoch.store(5, std::memory_order_release);
     remaining_refresh_epoch(g_test_context);
     g_test_members[0] = &source;
     g_test_members[1] = &subject;
     g_test_member_count = 2;
     RemainingPendingSpawnAttach& delayed_attach =
-        g_remaining_pending_spawn_attaches[0];
+        g_remaining_match->pending_spawn_attaches[0];
     delayed_attach.active = true;
     delayed_attach.context = g_test_context;
     delayed_attach.source_pointer = &source;
@@ -659,10 +665,10 @@ int main() {
     remaining_runtime_reconcile_pending_spawn_attaches(
         g_test_context);
     const RemainingRawRecord attached =
-        g_remaining_runtime_ring[
+        g_remaining_match->ring[
             (12 - 1) % kRemainingRuntimeRingCapacity].record;
-    if (g_remaining_runtime_next_sequence.load() != 13 ||
-        g_remaining_runtime_rejected_count.load() != 0 ||
+    if (g_remaining_match->next_sequence.load() != 13 ||
+        g_remaining_match->rejected_count.load() != 0 ||
         attached.kind != RemainingRawKind::SpawnAttach ||
         attached.source.native_object_id != 202 ||
         attached.target.native_object_id != 101 ||
@@ -674,8 +680,8 @@ int main() {
     g_test_context.generation = 6;
     g_test_context.state_epoch = 6;
     g_test_context.tick = 600;
-    g_combat_generation.store(6, std::memory_order_release);
-    g_combat_state_epoch.store(6, std::memory_order_release);
+    g_combat_match->generation.store(6, std::memory_order_release);
+    g_combat_match->state_epoch.store(6, std::memory_order_release);
     remaining_refresh_epoch(g_test_context);
     RemainingRawRecord tracked_spawn = remaining_base_record(
         g_test_context,
@@ -699,7 +705,7 @@ int main() {
         kRemainingRuntimeUnset);
     remaining_runtime_reconcile_tracked_lifetimes(
         g_test_context);
-    if (g_remaining_runtime_next_sequence.load() != 13) {
+    if (g_remaining_match->next_sequence.load() != 13) {
         return 1;
     }
     g_test_member_count = 0;
@@ -707,9 +713,9 @@ int main() {
     remaining_runtime_reconcile_tracked_lifetimes(
         g_test_context);
     const RemainingRawRecord tracked_despawn =
-        g_remaining_runtime_ring[
+        g_remaining_match->ring[
             (13 - 1) % kRemainingRuntimeRingCapacity].record;
-    if (g_remaining_runtime_next_sequence.load() != 14 ||
+    if (g_remaining_match->next_sequence.load() != 14 ||
         tracked_despawn.kind != RemainingRawKind::LifetimeDespawn ||
         tracked_despawn.entity.native_object_id != 101 ||
         tracked_despawn.tick != 601) {
@@ -719,8 +725,8 @@ int main() {
     g_test_context.generation = 7;
     g_test_context.state_epoch = 7;
     g_test_context.tick = 700;
-    g_combat_generation.store(7, std::memory_order_release);
-    g_combat_state_epoch.store(7, std::memory_order_release);
+    g_combat_match->generation.store(7, std::memory_order_release);
+    g_combat_match->state_epoch.store(7, std::memory_order_release);
     remaining_refresh_epoch(g_test_context);
     g_test_members[0] = &source;
     g_test_member_count = 1;
@@ -730,8 +736,8 @@ int main() {
         &subject, &source, 99);
     g_require_membership_for_capture.store(
         false, std::memory_order_release);
-    if (g_remaining_runtime_next_sequence.load() != 14 ||
-        g_remaining_runtime_rejected_count.load() != 0) {
+    if (g_remaining_match->next_sequence.load() != 14 ||
+        g_remaining_match->rejected_count.load() != 0) {
         return 1;
     }
 
@@ -739,28 +745,28 @@ int main() {
     g_test_context.generation = 8;
     g_test_context.state_epoch = 8;
     g_test_context.tick = 800;
-    g_combat_generation.store(8);
-    g_combat_state_epoch.store(8);
+    g_combat_match->generation.store(8);
+    g_combat_match->state_epoch.store(8);
     remaining_refresh_epoch(g_test_context);
     g_test_member_count = 0;
     for (std::size_t i = 0; i < 300; ++i) {
-        auto& entry = g_remaining_tracked_lifetimes[i];
+        auto& entry = g_remaining_match->tracked_lifetimes[i];
         entry.active = true;
         entry.capture.validated = true;
         entry.capture.context = g_test_context;
         entry.capture.object_pointer = reinterpret_cast<const void*>(1000 + i);
         entry.capture.entity.native_object_id = 1000 + i;
     }
-    auto before = g_remaining_runtime_next_sequence.load();
+    auto before = g_remaining_match->next_sequence.load();
     remaining_runtime_reconcile_tracked_lifetimes(g_test_context);
-    if (g_remaining_runtime_next_sequence.load() != before + 256) return 11;
+    if (g_remaining_match->next_sequence.load() != before + 256) return 11;
     for (std::size_t i = 0; i < 300; ++i) {
-        if (g_remaining_tracked_lifetimes[i].active != (i >= 256)) return 12;
+        if (g_remaining_match->tracked_lifetimes[i].active != (i >= 256)) return 12;
     }
     remaining_runtime_reconcile_tracked_lifetimes(g_test_context);
-    if (g_remaining_runtime_next_sequence.load() != before + 300) return 13;
+    if (g_remaining_match->next_sequence.load() != before + 300) return 13;
     for (std::size_t i = 0; i < 300; ++i) {
-        const auto& record = g_remaining_runtime_ring[
+        const auto& record = g_remaining_match->ring[
             (before + i - 1) % kRemainingRuntimeRingCapacity].record;
         if (record.kind != RemainingRawKind::LifetimeDespawn ||
             record.entity.native_object_id != 1000 + i || record.tick != 800) return 14;
@@ -774,23 +780,46 @@ int main() {
         capture.entity.native_object_id = 2000 + i;
         remaining_runtime_note_confirmed_remove(capture, false);
     }
-    auto rejected = g_remaining_runtime_rejected_count.load();
+    auto rejected = g_remaining_match->rejected_count.load();
     remaining_runtime_note_confirmed_remove(capture, false);
-    if (g_remaining_runtime_rejected_count.load() != rejected) return 15;
+    if (g_remaining_match->rejected_count.load() != rejected) return 15;
     capture.entity.native_object_id = 9999;
     remaining_runtime_note_confirmed_remove(capture, false);
-    if (g_remaining_runtime_rejected_count.load() != rejected + 1) return 16;
-    auto next = g_remaining_runtime_next_sequence.load();
+    if (g_remaining_match->rejected_count.load() != rejected + 1) return 16;
+    auto next = g_remaining_match->next_sequence.load();
     remaining_runtime_reconcile_pending_removals(g_test_context);
-    if (g_remaining_runtime_next_sequence.load() != next + 256) return 17;
+    if (g_remaining_match->next_sequence.load() != next + 256) return 17;
     // A new epoch drops old entries; it never emits stale removal evidence.
-    g_remaining_tracked_lifetimes[0].active = true;
-    g_remaining_tracked_lifetimes[0].capture = capture;
+    g_remaining_match->tracked_lifetimes[0].active = true;
+    g_remaining_match->tracked_lifetimes[0].capture = capture;
     g_test_context.state_epoch = 9;
-    next = g_remaining_runtime_next_sequence.load();
+    next = g_remaining_match->next_sequence.load();
     remaining_runtime_reconcile_tracked_lifetimes(g_test_context);
-    if (g_remaining_tracked_lifetimes[0].active ||
-        g_remaining_runtime_next_sequence.load() != next) return 18;
+    if (g_remaining_match->tracked_lifetimes[0].active ||
+        g_remaining_match->next_sequence.load() != next) return 18;
+    // Resident multi-match: one process interleaves matches and rebinds the
+    // stepped slot's telemetry. Refreshing the other match's identity must not
+    // reset this match's ring epoch or drop its tracked lifetimes, which is
+    // exactly what one shared table did (a slot switch looked like a new epoch).
+    {
+        RemainingMatchTelemetry* const first = g_remaining_match;
+        static RemainingMatchTelemetry second;
+        CombatCaptureContext first_context = g_test_context;
+        first_context.generation = first_context.state_epoch = 30;
+        CombatCaptureContext second_context = g_test_context;
+        second_context.generation = second_context.state_epoch = 31;
+        remaining_refresh_epoch(first_context);
+        first->tracked_lifetimes[0].active = true;
+        const std::uint64_t first_epoch = first->epoch_first_sequence.load();
+        g_remaining_match = &second;
+        remaining_refresh_epoch(second_context);
+        g_remaining_match = first;
+        remaining_refresh_epoch(first_context);
+        if (first->epoch_first_sequence.load() != first_epoch || !first->tracked_lifetimes[0].active ||
+            first->generation.load() != 30 || second.generation.load() != 31) return 19;
+        remaining_refresh_epoch(second_context);
+        if (first->tracked_lifetimes[0].active) return 20;
+    }
     mark_remaining_runtime_shared_hooks_bound(
         false, false, false, false);
     (void)append_remaining_runtime_events_json(

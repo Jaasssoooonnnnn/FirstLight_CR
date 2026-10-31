@@ -17,6 +17,7 @@ from torch import Tensor
 
 from .model import UniversalCardPolicyV4
 from .tensors import (
+    ActionArgmaxV4,
     ActionEvaluationComponentsV4,
     ActionSequenceV4,
     EncodedObservationV4,
@@ -35,11 +36,82 @@ class RecurrentEvaluationV4:
     value: Tensor
     components: ActionEvaluationComponentsV4
     final_state: RecurrentPolicyStateV4
+    argmax: ActionArgmaxV4 | None = None
 
 
 def _validate_time_batch_mask(value: Tensor, *, time_steps: int, batch_size: int, label: str) -> None:
     if value.dtype != torch.bool or tuple(value.shape) != (time_steps, batch_size):
         raise ValueError(f"{label} must be bool [T,B]")
+
+
+def _evaluate_fused_sequence(
+    model: UniversalCardPolicyV4,
+    flat_observations: UniversalSemanticBatchV4,
+    encoded_flat: EncodedObservationV4,
+    actions: Sequence[ActionSequenceV4],
+    episode_start: Tensor,
+    state: RecurrentPolicyStateV4,
+    *,
+    gate_temperature: float | None,
+    action_temperature: float | None,
+    continue_temperature: float | None,
+    validate: bool,
+    collect_argmax: bool,
+    decode_mask: Tensor | None = None,
+    resets_checked: bool = False,
+) -> RecurrentEvaluationV4:
+    time_steps = len(actions)
+    flat_actions = cast(ActionSequenceV4, concatenate_padded_tensor_records(tuple(actions)))
+    if validate:
+        # The sparse decoder validates only ACT rows; the stepped path also
+        # validated every WAIT row's gate/count/padding agreement.
+        flat_actions.validate(model.config, candidate_count=int(flat_observations.candidates.mask.shape[1]))
+    outputs = model.evaluate_encoded_action_sequence(
+        flat_observations,
+        encoded_flat,
+        state,
+        flat_actions,
+        episode_start,
+        time_steps=time_steps,
+        gate_temperature=gate_temperature,
+        action_temperature=action_temperature,
+        continue_temperature=continue_temperature,
+        validate=validate,
+        return_components=True,
+        collect_argmax=collect_argmax,
+        decode_rows=decode_mask,
+        resets_checked=resets_checked,
+    )
+    log_prob, entropy, value, final_state, components = outputs[:5]
+    return RecurrentEvaluationV4(
+        log_prob=log_prob,
+        entropy=entropy,
+        value=value,
+        components=components,
+        final_state=final_state,
+        argmax=outputs[5] if collect_argmax else None,
+    )
+
+
+def _repeated_tail_rows(lane_steps: Sequence[int], *, time_steps: int, batch_size: int) -> tuple[Tensor, Tensor] | None:
+    """Host ``(distinct rows, row source)`` of a time-major ``[T*B]`` chunk whose lane ``b`` repeats
+    frame ``lane_steps[b] - 1`` at every ``t >= lane_steps[b]``; ``None`` when no frame repeats.
+
+    ``distinct rows`` are the flat rows ``t * B + b`` with ``t < lane_steps[b]``, ascending;
+    ``row source[r]`` is the position in that list of the frame flat row ``r`` holds.
+    """
+
+    steps = torch.tensor([int(item) for item in lane_steps], dtype=torch.long)
+    if tuple(steps.shape) != (batch_size,) or bool(((steps < 1) | (steps > time_steps)).any()):
+        raise ValueError("lane_steps must give 1..T distinct leading frames for every lane")
+    if bool((steps == time_steps).all()):
+        return None
+    time_index = torch.arange(time_steps, dtype=torch.long)[:, None]
+    keep = (time_index < steps[None, :]).flatten()
+    position = torch.cumsum(keep, dim=0) - 1
+    lane_index = torch.arange(batch_size, dtype=torch.long)[None, :]
+    held = (torch.minimum(time_index, steps[None, :] - 1) * batch_size + lane_index).flatten()
+    return keep.nonzero().flatten(), position[held]
 
 
 def evaluate_recurrent_sequence(
@@ -55,8 +127,35 @@ def evaluate_recurrent_sequence(
     validate: bool = True,
     preencode_observations: bool = False,
     encoded_observations: Sequence[EncodedObservationV4] | None = None,
+    collect_argmax: bool = False,
+    fused: bool = False,
+    lane_steps: Sequence[int] | None = None,
+    decode_mask: Tensor | None = None,
+    mid_chunk_reset: bool | None = None,
 ) -> RecurrentEvaluationV4:
-    """Teacher-force actions; callers detach state between TBPTT chunks."""
+    """Teacher-force actions; callers detach state between TBPTT chunks.
+
+    ``fused`` (with ``preencode_observations``) evaluates the whole chunk with
+    ``model.evaluate_encoded_action_sequence``: one fused LSTM call over
+    ``T*B`` rows and one action decode over the ACT rows only, instead of
+    ``T`` stepped decodes.  It needs ``episode_start`` free of resets after
+    step 0; a chunk with a mid-chunk reset falls back to the stepped path.
+    The fused components and argmax equal the stepped ones except on WAIT
+    rows' unmasked delay log-probs/legal mask and downstream argmax, which
+    stay at the decoder's initial zeros / -1 (every consumer masks them; see
+    ``UniversalCardPolicyV4._evaluate_sparse_forced_actions``).
+
+    Tail compression (all optional, from the host-side chunk plan):
+    ``lane_steps[b]`` says lane ``b``'s frames at ``t >= lane_steps[b]`` are
+    exact repeats of frame ``lane_steps[b] - 1`` (a TBPTT chunk past the
+    lane's end); with ``preencode_observations`` only the distinct frames are
+    encoded and the repeats reuse that encoding (the LSTM still advances over
+    every ``[T,B]`` row, so states are unchanged).  ``decode_mask`` (bool
+    ``[T,B]``, fused path only) restricts the ACT decode to the rows a caller
+    reads (see ``_evaluate_sparse_forced_actions``).  ``mid_chunk_reset``
+    (host-computed ``episode_start[1:].any()``) replaces the device check and
+    its host sync when given.
+    """
 
     time_steps = len(observations)
     if time_steps == 0 or len(actions) != time_steps:
@@ -79,9 +178,43 @@ def evaluate_recurrent_sequence(
     ):
         raise ValueError("encoded observations must preserve [T,B]")
     evaluation_observations = observations
+    if decode_mask is not None and (
+        decode_mask.dtype != torch.bool or tuple(decode_mask.shape) != (time_steps, batch_size)
+    ):
+        raise ValueError("decode_mask must be bool [T,B]")
     if preencode_observations:
         flat_observations = cast(UniversalSemanticBatchV4, concatenate_padded_tensor_records(tuple(observations)))
-        encoded_flat = model.encode_observation(flat_observations, validate=validate)
+        compaction = (
+            None
+            if lane_steps is None
+            else _repeated_tail_rows(lane_steps, time_steps=time_steps, batch_size=batch_size)
+        )
+        if compaction is None:
+            encoded_flat = model.encode_observation(flat_observations, validate=validate)
+        else:
+            distinct_rows, row_source = compaction
+            distinct = flat_observations.index_select(distinct_rows.to(device))
+            encoded_flat = model.encode_observation(distinct, validate=validate).index_select(row_source.to(device))
+        if mid_chunk_reset is None:
+            has_reset = time_steps > 1 and bool(torch.any(episode_start[1:]))
+        else:
+            has_reset = time_steps > 1 and bool(mid_chunk_reset)
+        if fused and not has_reset:
+            return _evaluate_fused_sequence(
+                model,
+                flat_observations,
+                encoded_flat,
+                actions,
+                episode_start,
+                state,
+                gate_temperature=gate_temperature,
+                action_temperature=action_temperature,
+                continue_temperature=continue_temperature,
+                validate=validate,
+                collect_argmax=collect_argmax,
+                decode_mask=decode_mask,
+                resets_checked=mid_chunk_reset is not None,
+            )
         evaluation_observations = tuple(
             flat_observations.narrow_batch(step * batch_size, batch_size) for step in range(time_steps)
         )
@@ -90,6 +223,7 @@ def evaluate_recurrent_sequence(
     entropies: list[Tensor] = []
     values: list[Tensor] = []
     components: list[ActionEvaluationComponentsV4] = []
+    argmaxes: list[ActionArgmaxV4] = []
     for step, (observation, expert_action) in enumerate(zip(evaluation_observations, actions, strict=True)):
         evaluate = model.evaluate_actions if encoded_sequence is None else model.evaluate_encoded_actions
         arguments = (observation,) if encoded_sequence is None else (observation, encoded_sequence[step])
@@ -102,9 +236,14 @@ def evaluate_recurrent_sequence(
             action_temperature=action_temperature,
             continue_temperature=continue_temperature,
             validate=validate,
+            **({"collect_argmax": True} if collect_argmax else {}),
         )
         if output.action_components is None:
             raise RuntimeError("V4 action evaluation did not return head components")
+        if collect_argmax:
+            if output.argmax is None:
+                raise RuntimeError("V4 action evaluation did not return argmax choices")
+            argmaxes.append(output.argmax)
         log_probs.append(output.log_prob)
         entropies.append(output.entropy)
         values.append(output.value)
@@ -122,6 +261,16 @@ def evaluate_recurrent_sequence(
             }
         ),
         final_state=state,
+        argmax=(
+            ActionArgmaxV4(
+                **{
+                    item.name: torch.stack([getattr(argmax, item.name) for argmax in argmaxes])
+                    for item in fields(ActionArgmaxV4)
+                }
+            )
+            if collect_argmax
+            else None
+        ),
     )
 
 

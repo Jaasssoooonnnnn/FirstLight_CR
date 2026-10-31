@@ -45,11 +45,18 @@ struct TowerTroopRuntimeRingSlot {
   TowerTroopRuntimeRecord record;
 };
 
-TowerTroopRuntimeRingSlot g_tower_troop_runtime_ring[kTowerTroopRuntimeRingCapacity];
-std::atomic<std::uint64_t> g_tower_troop_runtime_next_sequence{1};
-std::atomic<std::uint64_t> g_tower_troop_runtime_generation{0};
-std::atomic<std::uint64_t> g_tower_troop_runtime_state_epoch{0};
-std::atomic<std::uint64_t> g_tower_troop_runtime_rejected_count{0};
+// One match's retained tower-troop ring.  Hooks publish into the bound instance
+// (see MatchTelemetry in cr_replay_probe.cpp).
+struct TowerTroopMatchTelemetry {
+  TowerTroopRuntimeRingSlot ring[kTowerTroopRuntimeRingCapacity];
+  std::atomic<std::uint64_t> next_sequence{1};
+  std::atomic<std::uint64_t> generation{0};
+  std::atomic<std::uint64_t> state_epoch{0};
+  std::atomic<std::uint64_t> rejected_count{0};
+};
+
+TowerTroopMatchTelemetry g_tower_troop_default_match;
+TowerTroopMatchTelemetry *g_tower_troop_match = &g_tower_troop_default_match;
 std::atomic<bool> g_tower_troop_runtime_hooks_attested{false};
 std::atomic<bool> g_tower_troop_runtime_hooks_installed{false};
 
@@ -60,18 +67,18 @@ TowerTroopRuntimeFunction g_original_chef_runtime_init = nullptr;
 TowerTroopRuntimeFunction g_original_chef_runtime_tick = nullptr;
 
 void begin_tower_troop_runtime_epoch(std::uint64_t generation, std::uint64_t state_epoch) {
-  g_tower_troop_runtime_generation.store(generation, std::memory_order_release);
-  g_tower_troop_runtime_state_epoch.store(state_epoch, std::memory_order_release);
-  g_tower_troop_runtime_rejected_count.store(0, std::memory_order_release);
-  for (TowerTroopRuntimeRingSlot &slot : g_tower_troop_runtime_ring) {
+  g_tower_troop_match->generation.store(generation, std::memory_order_release);
+  g_tower_troop_match->state_epoch.store(state_epoch, std::memory_order_release);
+  g_tower_troop_match->rejected_count.store(0, std::memory_order_release);
+  for (TowerTroopRuntimeRingSlot &slot : g_tower_troop_match->ring) {
     slot.published_sequence.store(0, std::memory_order_release);
   }
 }
 
 void publish_tower_troop_runtime(TowerTroopRuntimeRecord record) {
-  const std::uint64_t sequence = g_tower_troop_runtime_next_sequence.fetch_add(1, std::memory_order_acq_rel);
+  const std::uint64_t sequence = g_tower_troop_match->next_sequence.fetch_add(1, std::memory_order_acq_rel);
   record.sequence = sequence;
-  TowerTroopRuntimeRingSlot &slot = g_tower_troop_runtime_ring[(sequence - 1) % kTowerTroopRuntimeRingCapacity];
+  TowerTroopRuntimeRingSlot &slot = g_tower_troop_match->ring[(sequence - 1) % kTowerTroopRuntimeRingCapacity];
   slot.published_sequence.store(0, std::memory_order_release);
   slot.record = record;
   slot.published_sequence.store(sequence, std::memory_order_release);
@@ -84,8 +91,8 @@ bool capture_tower_troop_runtime_common(void *runtime, std::uintptr_t expected_r
   if (runtime == nullptr || context == nullptr || static_data == nullptr || source == nullptr ||
       !g_tower_troop_runtime_hooks_installed.load(std::memory_order_acquire) ||
       !current_combat_capture_context(context) || context->tick < 0 ||
-      context->generation != g_tower_troop_runtime_generation.load(std::memory_order_acquire) ||
-      context->state_epoch != g_tower_troop_runtime_state_epoch.load(std::memory_order_acquire) ||
+      context->generation != g_tower_troop_match->generation.load(std::memory_order_acquire) ||
+      context->state_epoch != g_tower_troop_match->state_epoch.load(std::memory_order_acquire) ||
       !process_range_is_readable(runtime, minimum_runtime_bytes) ||
       remaining_vtable_offset(runtime) != expected_runtime_vtable) {
     return false;
@@ -143,7 +150,7 @@ void capture_dagger_runtime(void *runtime) {
       read_object_field<std::int32_t>(runtime, cr_tower_troop_runtime::kDaggerRechargeElapsedMsOffset);
   if (static_data != preliminary_data || charge_count < 0 || charge_count > max_charge_count ||
       recharge_elapsed_ms < 0 || recharge_elapsed_ms > recharge_duration_ms) {
-    g_tower_troop_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+    g_tower_troop_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   TowerTroopRuntimeRecord record;
@@ -178,7 +185,7 @@ void capture_chef_runtime(void *runtime) {
     LOGE("tower-troop runtime rejected reason=chef-static-contract "
          "contributionBase=%d startDelayDurationMs=%d",
          contribution_base, start_delay_duration_ms);
-    g_tower_troop_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+    g_tower_troop_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   const std::int32_t start_delay_remaining_ms =
@@ -199,7 +206,7 @@ void capture_chef_runtime(void *runtime) {
          "contributionNeeded=%d throwDelayRemainingMs=%d",
          source.native_object_id, start_delay_remaining_ms, start_delay_duration_ms, cooking_contribution,
          contribution_needed, throw_delay_remaining_ms);
-    g_tower_troop_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+    g_tower_troop_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -220,7 +227,7 @@ void capture_chef_runtime(void *runtime) {
            "capturedNativeObjectId=%u capturedObjectIndex=%d",
            source.native_object_id, target.validated ? 1 : 0, target.present ? 1 : 0, source.owner, target.owner,
            target_handle, target.native_object_id, target.object_index);
-      g_tower_troop_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+      g_tower_troop_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     if (target.present) {
@@ -273,7 +280,7 @@ bool latest_tower_troop_runtime(std::uint64_t generation, std::uint64_t state_ep
   }
   bool found = false;
   TowerTroopRuntimeRecord latest;
-  for (TowerTroopRuntimeRingSlot &slot : g_tower_troop_runtime_ring) {
+  for (TowerTroopRuntimeRingSlot &slot : g_tower_troop_match->ring) {
     const std::uint64_t sequence_before = slot.published_sequence.load(std::memory_order_acquire);
     if (sequence_before == 0) {
       continue;
@@ -306,7 +313,7 @@ std::size_t latest_tower_troop_runtimes(std::uint64_t generation, std::uint64_t 
       capacity < kMaxStoredTowerTroopRuntimes ? capacity : kMaxStoredTowerTroopRuntimes;
   std::uint64_t latest_sequences[kMaxStoredTowerTroopRuntimes] = {};
   std::size_t count = 0;
-  for (TowerTroopRuntimeRingSlot &slot : g_tower_troop_runtime_ring) {
+  for (TowerTroopRuntimeRingSlot &slot : g_tower_troop_match->ring) {
     const std::uint64_t sequence_before = slot.published_sequence.load(std::memory_order_acquire);
     if (sequence_before == 0) {
       continue;
@@ -428,11 +435,11 @@ bool append_tower_troop_runtime_object_json(char *response, std::size_t response
 bool append_tower_troop_runtime_envelope_json(std::uint64_t generation, std::uint64_t state_epoch,
                                               std::int32_t observation_tick, char *response, std::size_t response_size,
                                               std::size_t *used) {
-  const bool identity = g_tower_troop_runtime_generation.load(std::memory_order_acquire) == generation &&
-                        g_tower_troop_runtime_state_epoch.load(std::memory_order_acquire) == state_epoch;
+  const bool identity = g_tower_troop_match->generation.load(std::memory_order_acquire) == generation &&
+                        g_tower_troop_match->state_epoch.load(std::memory_order_acquire) == state_epoch;
   const bool attested = g_tower_troop_runtime_hooks_attested.load(std::memory_order_acquire);
   const bool installed = g_tower_troop_runtime_hooks_installed.load(std::memory_order_acquire);
-  const std::uint64_t rejected = identity ? g_tower_troop_runtime_rejected_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t rejected = identity ? g_tower_troop_match->rejected_count.load(std::memory_order_acquire) : 0;
   return append_json(response, response_size, used,
                      "{\"ok\":true,\"schema\":\"%s\",\"generation\":%llu,"
                      "\"stateEpoch\":%llu,\"observationTick\":%d,"

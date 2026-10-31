@@ -180,13 +180,30 @@ struct RemainingPendingActionSpawn {
   std::uint32_t child_native_object_id = 0;
 };
 
-RemainingRingSlot g_remaining_runtime_ring[kRemainingRuntimeRingCapacity];
-std::atomic<std::uint64_t> g_remaining_runtime_next_sequence{1};
-std::atomic<std::uint64_t> g_remaining_runtime_epoch_first_sequence{1};
-std::atomic<std::uint64_t> g_remaining_runtime_generation{0};
-std::atomic<std::uint64_t> g_remaining_runtime_state_epoch{0};
-std::atomic<std::uint64_t> g_remaining_runtime_overflow_count{0};
-std::atomic<std::uint64_t> g_remaining_runtime_rejected_count{0};
+// One match's retained remaining-runtime ring plus the lifetime, removal and
+// spawn-attachment tables that join events across native steps.  Hooks publish
+// into the bound instance (see MatchTelemetry in cr_replay_probe.cpp); the locks
+// below guard whichever instance is bound.
+struct RemainingMatchTelemetry {
+  RemainingRingSlot ring[kRemainingRuntimeRingCapacity];
+  std::atomic<std::uint64_t> next_sequence{1};
+  std::atomic<std::uint64_t> epoch_first_sequence{1};
+  std::atomic<std::uint64_t> generation{0};
+  std::atomic<std::uint64_t> state_epoch{0};
+  std::atomic<std::uint64_t> overflow_count{0};
+  std::atomic<std::uint64_t> rejected_count{0};
+  RemainingLifetimeEntry pending_removals[kRemainingPendingRemovalCapacity];
+  RemainingLifetimeEntry tracked_lifetimes[kRemainingLifetimeEntryCapacity];
+  RemainingPendingSpawnAttach pending_spawn_attaches[kRemainingPendingSpawnAttachCapacity];
+  RemainingPendingActionSpawn pending_action_spawns[kRemainingPendingActionSpawnCapacity];
+  RemainingAreaEligibilityCacheEntry area_eligibility_cache[kRemainingAreaEligibilityCacheCapacity];
+  std::uint64_t area_eligibility_cache_generation = 0;
+  std::uint64_t area_eligibility_cache_state_epoch = 0;
+  std::size_t area_eligibility_cache_eviction_cursor = 0;
+};
+
+RemainingMatchTelemetry g_remaining_default_match;
+RemainingMatchTelemetry *g_remaining_match = &g_remaining_default_match;
 std::atomic<bool> g_remaining_runtime_hooks_attested{false};
 std::atomic<bool> g_remaining_runtime_independent_hooks_installed{false};
 std::atomic<bool> g_remaining_runtime_area_lifecycle_bound{false};
@@ -195,18 +212,10 @@ std::atomic<bool> g_remaining_runtime_tower_activation_bound{false};
 std::atomic<bool> g_remaining_runtime_lifetime_bound{false};
 std::atomic<bool> g_remaining_runtime_hooks_installed{false};
 std::atomic_flag g_remaining_runtime_epoch_lock = ATOMIC_FLAG_INIT;
-RemainingLifetimeEntry g_remaining_pending_removals[kRemainingPendingRemovalCapacity];
 std::atomic_flag g_remaining_pending_removal_lock = ATOMIC_FLAG_INIT;
-RemainingLifetimeEntry g_remaining_tracked_lifetimes[kRemainingLifetimeEntryCapacity];
 std::atomic_flag g_remaining_tracked_lifetime_lock = ATOMIC_FLAG_INIT;
-RemainingPendingSpawnAttach g_remaining_pending_spawn_attaches[kRemainingPendingSpawnAttachCapacity];
 std::atomic_flag g_remaining_pending_spawn_attach_lock = ATOMIC_FLAG_INIT;
-RemainingPendingActionSpawn g_remaining_pending_action_spawns[kRemainingPendingActionSpawnCapacity];
 std::atomic_flag g_remaining_pending_action_spawn_lock = ATOMIC_FLAG_INIT;
-RemainingAreaEligibilityCacheEntry g_remaining_area_eligibility_cache[kRemainingAreaEligibilityCacheCapacity];
-std::uint64_t g_remaining_area_eligibility_cache_generation = 0;
-std::uint64_t g_remaining_area_eligibility_cache_state_epoch = 0;
-std::size_t g_remaining_area_eligibility_cache_eviction_cursor = 0;
 std::atomic_flag g_remaining_area_eligibility_cache_lock = ATOMIC_FLAG_INIT;
 
 thread_local RemainingRemovalCapture g_remaining_remove_stack[kRemainingRemoveDepth];
@@ -338,15 +347,15 @@ bool remaining_area_eligibility_fast_epoch(CombatCaptureContext *result) {
   if (!g_remaining_runtime_hooks_attested.load(std::memory_order_acquire) ||
       !g_remaining_runtime_hooks_installed.load(std::memory_order_acquire) ||
       !g_combat_hooks_enabled.load(std::memory_order_acquire) ||
-      !g_combat_epoch_active.load(std::memory_order_acquire)) {
+      !g_combat_match->epoch_active.load(std::memory_order_acquire)) {
     return false;
   }
   for (int attempt = 0; attempt < 2; ++attempt) {
-    const std::uint64_t state_epoch_before = g_combat_state_epoch.load(std::memory_order_acquire);
-    const std::uint64_t generation = g_combat_generation.load(std::memory_order_acquire);
-    const std::uint64_t state_epoch_after = g_combat_state_epoch.load(std::memory_order_acquire);
+    const std::uint64_t state_epoch_before = g_combat_match->state_epoch.load(std::memory_order_acquire);
+    const std::uint64_t generation = g_combat_match->generation.load(std::memory_order_acquire);
+    const std::uint64_t state_epoch_after = g_combat_match->state_epoch.load(std::memory_order_acquire);
     if (state_epoch_before == 0 || state_epoch_before != state_epoch_after || generation == 0 ||
-        !g_combat_epoch_active.load(std::memory_order_acquire) ||
+        !g_combat_match->epoch_active.load(std::memory_order_acquire) ||
         !g_combat_hooks_enabled.load(std::memory_order_acquire) ||
         !g_remaining_runtime_hooks_attested.load(std::memory_order_acquire) ||
         !g_remaining_runtime_hooks_installed.load(std::memory_order_acquire)) {
@@ -396,16 +405,16 @@ bool remaining_capture_context_still_current(const CombatCaptureContext &expecte
 }
 
 void remaining_area_eligibility_cache_refresh_locked(const CombatCaptureContext &context) {
-  if (g_remaining_area_eligibility_cache_generation == context.generation &&
-      g_remaining_area_eligibility_cache_state_epoch == context.state_epoch) {
+  if (g_remaining_match->area_eligibility_cache_generation == context.generation &&
+      g_remaining_match->area_eligibility_cache_state_epoch == context.state_epoch) {
     return;
   }
-  for (RemainingAreaEligibilityCacheEntry &entry : g_remaining_area_eligibility_cache) {
+  for (RemainingAreaEligibilityCacheEntry &entry : g_remaining_match->area_eligibility_cache) {
     entry = {};
   }
-  g_remaining_area_eligibility_cache_generation = context.generation;
-  g_remaining_area_eligibility_cache_state_epoch = context.state_epoch;
-  g_remaining_area_eligibility_cache_eviction_cursor = 0;
+  g_remaining_match->area_eligibility_cache_generation = context.generation;
+  g_remaining_match->area_eligibility_cache_state_epoch = context.state_epoch;
+  g_remaining_match->area_eligibility_cache_eviction_cursor = 0;
 }
 
 std::size_t remaining_area_eligibility_cache_hash(std::uintptr_t subject_pointer, std::uintptr_t source_pointer,
@@ -431,7 +440,7 @@ RemainingAreaEligibilityCacheEntry *remaining_area_eligibility_cache_find_locked
   const std::size_t start = remaining_area_eligibility_cache_hash(subject_pointer, source_pointer, option);
   for (std::size_t step = 0; step < kRemainingAreaEligibilityCacheCapacity; ++step) {
     RemainingAreaEligibilityCacheEntry &entry =
-        g_remaining_area_eligibility_cache[(start + step) & (kRemainingAreaEligibilityCacheCapacity - 1)];
+        g_remaining_match->area_eligibility_cache[(start + step) & (kRemainingAreaEligibilityCacheCapacity - 1)];
     if (remaining_area_eligibility_cache_key_matches(entry, context, subject_pointer, source_pointer, option)) {
       return &entry;
     }
@@ -445,16 +454,16 @@ RemainingAreaEligibilityCacheEntry *remaining_area_eligibility_cache_store_slot_
   const std::size_t start = remaining_area_eligibility_cache_hash(subject_pointer, source_pointer, option);
   for (std::size_t step = 0; step < kRemainingAreaEligibilityCacheCapacity; ++step) {
     RemainingAreaEligibilityCacheEntry &entry =
-        g_remaining_area_eligibility_cache[(start + step) & (kRemainingAreaEligibilityCacheCapacity - 1)];
+        g_remaining_match->area_eligibility_cache[(start + step) & (kRemainingAreaEligibilityCacheCapacity - 1)];
     if (!entry.valid) {
       return &entry;
     }
   }
   RemainingAreaEligibilityCacheEntry &evicted =
-      g_remaining_area_eligibility_cache[g_remaining_area_eligibility_cache_eviction_cursor %
+      g_remaining_match->area_eligibility_cache[g_remaining_match->area_eligibility_cache_eviction_cursor %
                                          kRemainingAreaEligibilityCacheCapacity];
-  g_remaining_area_eligibility_cache_eviction_cursor =
-      (g_remaining_area_eligibility_cache_eviction_cursor + 1) % kRemainingAreaEligibilityCacheCapacity;
+  g_remaining_match->area_eligibility_cache_eviction_cursor =
+      (g_remaining_match->area_eligibility_cache_eviction_cursor + 1) % kRemainingAreaEligibilityCacheCapacity;
   return &evicted;
 }
 
@@ -464,7 +473,7 @@ void remaining_area_eligibility_cache_invalidate_pointer(const void *object) {
     return;
   }
   remaining_lock(g_remaining_area_eligibility_cache_lock);
-  for (RemainingAreaEligibilityCacheEntry &entry : g_remaining_area_eligibility_cache) {
+  for (RemainingAreaEligibilityCacheEntry &entry : g_remaining_match->area_eligibility_cache) {
     if (entry.valid && (entry.subject_pointer == pointer || entry.source_pointer == pointer)) {
       entry = {};
     }
@@ -477,9 +486,9 @@ void remaining_area_eligibility_cache_invalidate(const CombatCaptureContext &con
     return;
   }
   remaining_lock(g_remaining_area_eligibility_cache_lock);
-  if (g_remaining_area_eligibility_cache_generation == context.generation &&
-      g_remaining_area_eligibility_cache_state_epoch == context.state_epoch) {
-    for (RemainingAreaEligibilityCacheEntry &entry : g_remaining_area_eligibility_cache) {
+  if (g_remaining_match->area_eligibility_cache_generation == context.generation &&
+      g_remaining_match->area_eligibility_cache_state_epoch == context.state_epoch) {
+    for (RemainingAreaEligibilityCacheEntry &entry : g_remaining_match->area_eligibility_cache) {
       if (entry.valid &&
           (entry.subject_native_object_id == native_object_id || entry.source_native_object_id == native_object_id)) {
         entry = {};
@@ -563,42 +572,42 @@ void remaining_area_effect_tick_hook(void *area) {
 }
 
 void remaining_refresh_epoch(const CombatCaptureContext &context) {
-  if (g_remaining_runtime_generation.load(std::memory_order_acquire) == context.generation &&
-      g_remaining_runtime_state_epoch.load(std::memory_order_acquire) == context.state_epoch) {
+  if (g_remaining_match->generation.load(std::memory_order_acquire) == context.generation &&
+      g_remaining_match->state_epoch.load(std::memory_order_acquire) == context.state_epoch) {
     return;
   }
   if (g_remaining_runtime_epoch_lock.test_and_set(std::memory_order_acquire)) {
-    g_remaining_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+    g_remaining_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  if (g_remaining_runtime_generation.load(std::memory_order_relaxed) != context.generation ||
-      g_remaining_runtime_state_epoch.load(std::memory_order_relaxed) != context.state_epoch) {
+  if (g_remaining_match->generation.load(std::memory_order_relaxed) != context.generation ||
+      g_remaining_match->state_epoch.load(std::memory_order_relaxed) != context.state_epoch) {
     remaining_lock(g_remaining_pending_removal_lock);
-    for (RemainingLifetimeEntry &pending : g_remaining_pending_removals) {
+    for (RemainingLifetimeEntry &pending : g_remaining_match->pending_removals) {
       pending = {};
     }
     remaining_unlock(g_remaining_pending_removal_lock);
     remaining_lock(g_remaining_pending_spawn_attach_lock);
-    for (RemainingPendingSpawnAttach &pending : g_remaining_pending_spawn_attaches) {
+    for (RemainingPendingSpawnAttach &pending : g_remaining_match->pending_spawn_attaches) {
       pending = {};
     }
     remaining_unlock(g_remaining_pending_spawn_attach_lock);
     remaining_lock(g_remaining_pending_action_spawn_lock);
-    for (RemainingPendingActionSpawn &pending : g_remaining_pending_action_spawns) {
+    for (RemainingPendingActionSpawn &pending : g_remaining_match->pending_action_spawns) {
       pending = {};
     }
     remaining_unlock(g_remaining_pending_action_spawn_lock);
     remaining_lock(g_remaining_tracked_lifetime_lock);
-    for (RemainingLifetimeEntry &tracked : g_remaining_tracked_lifetimes) {
+    for (RemainingLifetimeEntry &tracked : g_remaining_match->tracked_lifetimes) {
       tracked = {};
     }
     remaining_unlock(g_remaining_tracked_lifetime_lock);
-    const std::uint64_t first = g_remaining_runtime_next_sequence.load(std::memory_order_acquire);
-    g_remaining_runtime_generation.store(context.generation, std::memory_order_release);
-    g_remaining_runtime_state_epoch.store(context.state_epoch, std::memory_order_release);
-    g_remaining_runtime_epoch_first_sequence.store(first, std::memory_order_release);
-    g_remaining_runtime_overflow_count.store(0, std::memory_order_release);
-    g_remaining_runtime_rejected_count.store(0, std::memory_order_release);
+    const std::uint64_t first = g_remaining_match->next_sequence.load(std::memory_order_acquire);
+    g_remaining_match->generation.store(context.generation, std::memory_order_release);
+    g_remaining_match->state_epoch.store(context.state_epoch, std::memory_order_release);
+    g_remaining_match->epoch_first_sequence.store(first, std::memory_order_release);
+    g_remaining_match->overflow_count.store(0, std::memory_order_release);
+    g_remaining_match->rejected_count.store(0, std::memory_order_release);
   }
   g_remaining_runtime_epoch_lock.clear(std::memory_order_release);
 }
@@ -612,7 +621,7 @@ void remaining_reject_impl(const CombatCaptureContext *context, std::int32_t sou
        source_line, context == nullptr ? -1 : context->tick,
        static_cast<unsigned long long>(context == nullptr ? 0 : context->generation),
        static_cast<unsigned long long>(context == nullptr ? 0 : context->state_epoch));
-  g_remaining_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+  g_remaining_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool remaining_object_is_committed(const void *object, void *object_manager, bool *object_vector_valid) {
@@ -652,13 +661,13 @@ std::uint64_t publish_remaining_record(RemainingRawRecord record) {
   context.state_epoch = record.state_epoch;
   context.tick = record.tick;
   remaining_refresh_epoch(context);
-  const std::uint64_t sequence = g_remaining_runtime_next_sequence.fetch_add(1, std::memory_order_acq_rel);
+  const std::uint64_t sequence = g_remaining_match->next_sequence.fetch_add(1, std::memory_order_acq_rel);
   record.sequence = sequence;
-  const std::uint64_t first = g_remaining_runtime_epoch_first_sequence.load(std::memory_order_acquire);
+  const std::uint64_t first = g_remaining_match->epoch_first_sequence.load(std::memory_order_acquire);
   if (sequence >= first + kRemainingRuntimeRingCapacity) {
-    g_remaining_runtime_overflow_count.fetch_add(1, std::memory_order_relaxed);
+    g_remaining_match->overflow_count.fetch_add(1, std::memory_order_relaxed);
   }
-  RemainingRingSlot &slot = g_remaining_runtime_ring[(sequence - 1) % kRemainingRuntimeRingCapacity];
+  RemainingRingSlot &slot = g_remaining_match->ring[(sequence - 1) % kRemainingRuntimeRingCapacity];
   slot.published_sequence.store(0, std::memory_order_relaxed);
   slot.record = record;
   slot.published_sequence.store(sequence, std::memory_order_release);
@@ -751,7 +760,7 @@ void remaining_track_committed_lifetime(const CombatCaptureContext &context, con
   capture.runtime_vtable_offset = lifetime.runtime_vtable_offset;
   capture.data_global_id = lifetime.data_after_global_id;
   capture.area_remaining_life_ms = area_remaining_life_ms;
-  if (!remaining_store_lifetime(capture, g_remaining_tracked_lifetimes, g_remaining_tracked_lifetime_lock)) {
+  if (!remaining_store_lifetime(capture, g_remaining_match->tracked_lifetimes, g_remaining_tracked_lifetime_lock)) {
     remaining_reject(&context);
   }
 }
@@ -779,7 +788,7 @@ void remaining_runtime_note_committed_spawn(void *object_manager, void *object, 
     const auto assigned_vtable = remaining_vtable_offset(object);
     const auto assigned_id = read_object_field<std::uint32_t>(object, 0x08);
     remaining_lock(g_remaining_pending_action_spawn_lock);
-    for (auto &pending : g_remaining_pending_action_spawns) {
+    for (auto &pending : g_remaining_match->pending_action_spawns) {
       if (!pending.active || pending.child_pointer != object) continue;
       const bool exact_creation = pending.capture.game_manager == context.game_manager &&
           pending.capture.object_manager == object_manager && pending.capture.generation == context.generation &&
@@ -829,7 +838,7 @@ void remaining_runtime_note_committed_spawn(void *object_manager, void *object, 
   remaining_track_committed_lifetime(context, object, lifetime, exact_area_effect, area_remaining_life_ms);
 
   remaining_lock(g_remaining_pending_spawn_attach_lock);
-  for (RemainingPendingSpawnAttach &pending : g_remaining_pending_spawn_attaches) {
+  for (RemainingPendingSpawnAttach &pending : g_remaining_match->pending_spawn_attaches) {
     if (!pending.active || pending.child_pointer != nullptr || pending.context.generation != context.generation ||
         pending.context.state_epoch != context.state_epoch ||
         pending.child_data_global_id != lifetime.data_after_global_id || context.tick < pending.context.tick ||
@@ -854,7 +863,7 @@ bool remaining_runtime_apply_action_spawn_provenance(void *object_manager, void 
   }
   RemainingPendingActionSpawn pending;
   remaining_lock(g_remaining_pending_action_spawn_lock);
-  for (RemainingPendingActionSpawn &candidate : g_remaining_pending_action_spawns) {
+  for (RemainingPendingActionSpawn &candidate : g_remaining_match->pending_action_spawns) {
     if (!candidate.active || candidate.child_pointer != object || candidate.capture.generation != context.generation ||
         candidate.capture.state_epoch != context.state_epoch) {
       continue;
@@ -1103,13 +1112,13 @@ void remaining_runtime_note_confirmed_remove(const RemainingRemovalCapture &capt
     return;
   }
   if (!absent_after) {
-    if (!remaining_store_lifetime(capture, g_remaining_pending_removals, g_remaining_pending_removal_lock)) {
+    if (!remaining_store_lifetime(capture, g_remaining_match->pending_removals, g_remaining_pending_removal_lock)) {
       remaining_reject(&capture.context);
     }
     return;
   }
-  remaining_clear_lifetime(capture, g_remaining_tracked_lifetimes, g_remaining_tracked_lifetime_lock);
-  remaining_clear_lifetime(capture, g_remaining_pending_removals, g_remaining_pending_removal_lock);
+  remaining_clear_lifetime(capture, g_remaining_match->tracked_lifetimes, g_remaining_tracked_lifetime_lock);
+  remaining_clear_lifetime(capture, g_remaining_match->pending_removals, g_remaining_pending_removal_lock);
   // A cached proof is valid only while both native identities remain live in
   // this epoch. Invalidate every predicate involving the removed object
   // before its address or object ID can be reused.
@@ -1179,11 +1188,11 @@ void remaining_reconcile_lifetimes(const CombatCaptureContext &observation_conte
 }
 
 void remaining_runtime_reconcile_pending_removals(const CombatCaptureContext &context) {
-  remaining_reconcile_lifetimes(context, g_remaining_pending_removals, g_remaining_pending_removal_lock);
+  remaining_reconcile_lifetimes(context, g_remaining_match->pending_removals, g_remaining_pending_removal_lock);
 }
 
 void remaining_runtime_reconcile_tracked_lifetimes(const CombatCaptureContext &context) {
-  remaining_reconcile_lifetimes(context, g_remaining_tracked_lifetimes, g_remaining_tracked_lifetime_lock);
+  remaining_reconcile_lifetimes(context, g_remaining_match->tracked_lifetimes, g_remaining_tracked_lifetime_lock);
 }
 
 void remaining_runtime_reconcile_pending_spawn_attaches(const CombatCaptureContext &observation_context) {
@@ -1194,7 +1203,7 @@ void remaining_runtime_reconcile_pending_spawn_attaches(const CombatCaptureConte
   std::size_t confirmed_count = 0;
   std::size_t rejected_count = 0;
   remaining_lock(g_remaining_pending_spawn_attach_lock);
-  for (RemainingPendingSpawnAttach &pending : g_remaining_pending_spawn_attaches) {
+  for (RemainingPendingSpawnAttach &pending : g_remaining_match->pending_spawn_attaches) {
     if (!pending.active) {
       continue;
     }
@@ -1496,7 +1505,7 @@ extern "C" void remaining_action_spawn_mode1_child_create_bridge(void *object_ma
   pending.child_native_object_id = read_object_field<std::uint32_t>(child, 0x08);
   remaining_lock(g_remaining_pending_action_spawn_lock);
   RemainingPendingActionSpawn *available = nullptr;
-  for (RemainingPendingActionSpawn &candidate : g_remaining_pending_action_spawns) {
+  for (RemainingPendingActionSpawn &candidate : g_remaining_match->pending_action_spawns) {
     if (candidate.active && candidate.capture.generation == current.generation &&
         candidate.capture.state_epoch == current.state_epoch && candidate.child_pointer == child) {
       available = &candidate;
@@ -1582,7 +1591,7 @@ void remaining_pending_object_add_hook(void *object_manager, void *object) {
       pending.child_native_object_id = read_object_field<std::uint32_t>(object, 0x08);
       remaining_lock(g_remaining_pending_action_spawn_lock);
       RemainingPendingActionSpawn *available = nullptr;
-      for (RemainingPendingActionSpawn &candidate : g_remaining_pending_action_spawns) {
+      for (RemainingPendingActionSpawn &candidate : g_remaining_match->pending_action_spawns) {
         if (candidate.active && candidate.capture.generation == pending.capture.generation &&
             candidate.capture.state_epoch == pending.capture.state_epoch && candidate.child_pointer == object) {
           available = &candidate;
@@ -1771,7 +1780,7 @@ extern "C" bool remaining_spawn_helper_begin_bridge(const void *source, const vo
   }
   remaining_lock(g_remaining_pending_spawn_attach_lock);
   RemainingPendingSpawnAttach *available = nullptr;
-  for (RemainingPendingSpawnAttach &pending : g_remaining_pending_spawn_attaches) {
+  for (RemainingPendingSpawnAttach &pending : g_remaining_match->pending_spawn_attaches) {
     if (pending.active && pending.context.generation == context.generation &&
         pending.context.state_epoch == context.state_epoch && pending.source_pointer == source &&
         pending.child_pointer == nullptr && pending.child_data_global_id == child_data_global_id) {
@@ -2093,16 +2102,20 @@ bool append_remaining_runtime_events_json(std::uint64_t generation, std::uint64_
     remaining_runtime_reconcile_pending_spawn_attaches(current_context);
   }
   const bool installed = g_remaining_runtime_hooks_installed.load(std::memory_order_acquire);
-  const bool identity = g_remaining_runtime_generation.load(std::memory_order_acquire) == generation &&
-                        g_remaining_runtime_state_epoch.load(std::memory_order_acquire) == state_epoch;
-  const std::uint64_t next = g_remaining_runtime_next_sequence.load(std::memory_order_acquire);
+  const bool identity = g_remaining_match->generation.load(std::memory_order_acquire) == generation &&
+                        g_remaining_match->state_epoch.load(std::memory_order_acquire) == state_epoch;
+  const std::uint64_t next = g_remaining_match->next_sequence.load(std::memory_order_acquire);
   const std::uint64_t epoch_first =
-      identity ? g_remaining_runtime_epoch_first_sequence.load(std::memory_order_acquire) : next;
+      identity ? g_remaining_match->epoch_first_sequence.load(std::memory_order_acquire) : next;
   const std::uint64_t retained_oldest =
       next > epoch_first + kRemainingRuntimeRingCapacity ? next - kRemainingRuntimeRingCapacity : epoch_first;
-  const std::uint64_t transmit_from = retained_oldest;
-  const std::uint64_t overflow = identity ? g_remaining_runtime_overflow_count.load(std::memory_order_acquire) : 0;
-  const std::uint64_t rejected = identity ? g_remaining_runtime_rejected_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t requested_transmit_from =
+      g_live_capture_delta_active ? g_live_capture_remaining_from_sequence : retained_oldest;
+  const std::uint64_t transmit_from = requested_transmit_from < retained_oldest ? retained_oldest
+                                      : requested_transmit_from > next          ? next
+                                                                                : requested_transmit_from;
+  const std::uint64_t overflow = identity ? g_remaining_match->overflow_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t rejected = identity ? g_remaining_match->rejected_count.load(std::memory_order_acquire) : 0;
   const bool complete = installed && identity && rejected == 0;
   JsonWriter json(response, response_size, used);
   json.begin_object();
@@ -2143,7 +2156,7 @@ bool append_remaining_runtime_events_json(std::uint64_t generation, std::uint64_
   bool first = true;
   if (identity) {
     for (std::uint64_t sequence = transmit_from; sequence < next; ++sequence) {
-      RemainingRingSlot &slot = g_remaining_runtime_ring[(sequence - 1) % kRemainingRuntimeRingCapacity];
+      RemainingRingSlot &slot = g_remaining_match->ring[(sequence - 1) % kRemainingRuntimeRingCapacity];
       if (slot.published_sequence.load(std::memory_order_acquire) != sequence) {
         return false;
       }

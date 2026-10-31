@@ -65,7 +65,7 @@ from native_runner.training.v4.mechanics import EffectSemanticCatalogV1, Mechani
 from native_runner.training.v4.decoding import ShadowCandidateLegality, decode_action_sequence_v4
 from native_runner.training.v4.model import UniversalCardPolicyV4
 from native_runner.training.v4.tensorizer import UniversalObservationTensorizerV4
-from native_runner.training.v4.config import MATCH_SCALAR_NAMES
+from native_runner.training.v4.config import MATCH_SCALAR_NAMES, ModelConfigV4
 from native_runner.training.v4.tensorizer import (
     EVENT_TYPE,
     FORM_EVOLUTION,
@@ -175,10 +175,12 @@ def _tensorizer(
     initial_elixir: dict[int, float] | None = None,
     start: bool = True,
     reject_unknown_public_semantics: bool = False,
+    config: ModelConfigV4 | None = None,
 ) -> UniversalObservationTensorizerV4:
     effects = _semantic_bundle()[4]
     tensorizer = UniversalObservationTensorizerV4(
         actor_owner=0,
+        config=config,
         card_catalog=catalog,
         ability_catalog=abilities,
         entity_archetype_catalog=archetypes,
@@ -2857,3 +2859,48 @@ def test_opaque_causal_handle_never_changes_model_tensors() -> None:
             getattr(first_batch.groups, item.name),
             getattr(second_batch.groups, item.name),
         )
+
+
+def test_own_in_flight_commands_are_exposed_on_their_card_tokens() -> None:
+    from native_runner.contracts import ActionV1, PendingActionV1
+    from native_runner.training.v4.config import CARD_RUNTIME_FEATURE_NAMES
+
+    specs, catalog, abilities, archetypes = _semantic_catalog()
+    tensorizer = _tensorizer(specs, catalog, abilities, archetypes)
+    # The battle executes a touch 20 ticks later; both commands are in flight.
+    card = ActionV1.play(owner=0, hand_slot=1, grid=(8, 10), card_id=STANDARD_DECK[1], action_id="card")
+    ability = ActionV1(owner=0, kind=ActionKind.ACTIVATE_ABILITY, source_entity=501, action_id="ability")
+    observation = replace(
+        _observation(skeleton_count=0),
+        pending_actions=(
+            PendingActionV1(action=card, requested_tick=15, expected_execution_tick=36),
+            PendingActionV1(action=ability, requested_tick=18, expected_execution_tick=38),
+        ),
+    )
+
+    batch = tensorizer.tensorize(observation)
+
+    index = {name: position for position, name in enumerate(CARD_RUNTIME_FEATURE_NAMES)}
+    own = batch.own_cards
+    rows = {int(own.card_vocab_id[0, row]): row for row in range(8)}
+    card_row = rows[tensorizer._vocab_id(STANDARD_DECK[1], context="test")]
+    ability_row = rows[tensorizer._vocab_id(STANDARD_DECK[0], context="test")]
+    features = own.runtime_features[0]
+    model_target = tensorizer.perspective.action_to_model(card).target_grid
+    assert features[card_row, index["pending_execution"]] == 1.0
+    # Neutralised by default (live receipts cannot supply it); the real
+    # countdown is covered in test_training_v4_pending_ticks_neutralized.py.
+    assert float(features[card_row, index["pending_ticks_remaining_over_20"]]) == 0.0
+    assert float(features[card_row, index["pending_target_x_over_board_width"]]) == pytest.approx(model_target[0] / 17)
+    assert float(features[card_row, index["pending_target_y_over_board_height"]]) == pytest.approx(model_target[1] / 31)
+    assert features[card_row, index["ability_pending"]] == 0.0
+    assert features[ability_row, index["ability_pending"]] == 1.0
+    assert float(features[ability_row, index["pending_ticks_remaining_over_20"]]) == 0.0
+    assert features[ability_row, index["pending_execution"]] == 0.0
+    assert int(torch.count_nonzero(features[:, index["pending_execution"]])) == 1
+    assert int(torch.count_nonzero(features[:, index["ability_pending"]])) == 1
+    # Opponent tokens never carry in-flight state: their plays appear on landing.
+    assert int(torch.count_nonzero(batch.opponent_cards.runtime_features[..., 16:])) == 0
+
+    settled = tensorizer.tensorize(_observation(skeleton_count=0))
+    assert int(torch.count_nonzero(settled.own_cards.runtime_features[..., 16:])) == 0

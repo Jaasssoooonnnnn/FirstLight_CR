@@ -18,6 +18,7 @@ from native_runner.arena import (
     world_to_cell,
 )
 from native_runner.battle_env import (
+    _PendingRecord,
     BattleEnvError,
     BattleEnvV1,
     TOWER_LAYOUT,
@@ -28,7 +29,15 @@ from native_runner.contracts import (
     ActionV1,
     ObservationTier,
 )
-from native_runner.cr_native_env import FIRST_PLAYABLE_TICK, HandAction
+from native_runner.cr_native_env import (
+    COMMAND_EXECUTION_DELAY_TICKS,
+    FIRST_PLAYABLE_TICK,
+    LIVE_COMMAND_AGE_TICKS,
+    HandAction,
+    NativeClashEnv,
+    ResidentNativeClashEnv,
+)
+from native_runner.resident_batch_vector import ResidentBatchNativeProxyV1
 from native_runner.match_factory import MatchConfig
 from native_runner.semantic_subset import SEMANTIC_BASELINE_DECK
 from native_runner.timeline import load_game_mode_timeline
@@ -341,7 +350,6 @@ class ArenaCoordinateTests(unittest.TestCase):
 
 
 class BattleEnvironmentTests(unittest.TestCase):
-
     def test_destroyed_tower_position_does_not_rebind_to_a_troop(self) -> None:
         env, native = _make_env()
         _reset(env)
@@ -917,6 +925,134 @@ class BattleEnvironmentTests(unittest.TestCase):
             env.step({0: action, 1: ActionV1.wait(1)})
 
         self.assertEqual(native.queued, [])
+
+
+class CommandExecutionDelayTests(unittest.TestCase):
+    """Online battles execute a touch 20 ticks after it; simulation must too."""
+
+    def _waits(self) -> dict[int, ActionV1]:
+        return {0: ActionV1.wait(0, ticks=5), 1: ActionV1.wait(1, ticks=5)}
+
+    def test_simulated_engines_add_the_execution_delay(self) -> None:
+        self.assertEqual(COMMAND_EXECUTION_DELAY_TICKS, LIVE_COMMAND_AGE_TICKS)
+        self.assertEqual(COMMAND_EXECUTION_DELAY_TICKS, 20)
+        for simulated in (NativeClashEnv, ResidentNativeClashEnv, ResidentBatchNativeProxyV1):
+            self.assertEqual(simulated.simulated_command_delay_ticks, COMMAND_EXECUTION_DELAY_TICKS)
+
+    def test_simulated_card_executes_after_the_delay_and_stays_pending(self) -> None:
+        native = FakeNativeEnv()
+        native.simulated_command_delay_ticks = COMMAND_EXECUTION_DELAY_TICKS  # type: ignore[attr-defined]
+        env, native = _make_env(native)
+        env.simulated_card_delay_jitter_ticks = 0  # explicit PPO fixed-delay mode
+        _reset(env)
+        play = ActionV1.play(
+            owner=0,
+            hand_slot=0,
+            grid=(8, 10),
+            execute_offset_ticks=2,
+            next_decision_ticks=5,
+            action_id="delayed-touch",
+        )
+
+        observations, _, _, _, _ = env.step({0: play, 1: ActionV1.wait(1, ticks=5)})
+
+        actual_offset = env._trace[-1].actions[0].execute_offset_ticks
+        self.assertEqual(actual_offset, 22)
+        execute_tick = FIRST_PLAYABLE_TICK + actual_offset
+        self.assertEqual([item["execute_tick"] for item in native.queued], [execute_tick])
+        card_id = int(observations[0].players[0].hand[0])
+        while observations[0].tick < execute_tick:
+            mask = observations[0].action_mask
+            self.assertEqual(mask.reasons["slots"]["0"], "pending_execution")
+            self.assertEqual(mask.reasons["reserved_elixir"], 3.0)
+            # The policy-features path must also expose the in-flight command,
+            # joined to its card, so PPO sees what IL and live see.
+            pending = env.observe(ObservationTier.FAIR, owner=0, policy_features_only=True).pending_actions
+            self.assertEqual([item.action.card_id for item in pending], [card_id])
+            self.assertEqual([item.expected_execution_tick for item in pending], [execute_tick])
+            observations, _, _, _, _ = env.step(self._waits())
+
+        self.assertEqual(native.queued, [])
+        self.assertEqual(observations[0].action_mask.reasons["reserved_elixir"], 0.0)
+        self.assertNotEqual(observations[0].action_mask.reasons["slots"].get("0"), "pending_execution")
+
+    def test_live_engine_submits_the_policy_touch_tick_unchanged(self) -> None:
+        env, native = _make_env(FakeNativeEnv())
+        _reset(env)
+        play = ActionV1.play(
+            owner=0, hand_slot=0, grid=(8, 10), execute_offset_ticks=2, next_decision_ticks=5, action_id="live"
+        )
+
+        env.step({0: play, 1: ActionV1.wait(1, ticks=5)})
+
+        self.assertEqual(env._trace[-1].actions[0].execute_offset_ticks, 2)
+        self.assertEqual(native.queued, [])
+
+    def test_external_replay_card_is_pending_until_native_executes_it(self) -> None:
+        env, native = _make_env(FakeNativeEnv())
+        _reset(env)
+        player = next(item for item in native.state["players"] if int(item["owner"]) == 0)
+        card = next(item for item in player["hand"] if int(item["handIndex"]) == 0)
+        execute_tick = FIRST_PLAYABLE_TICK + 1 + COMMAND_EXECUTION_DELAY_TICKS
+        expert = ActionV1.play(
+            owner=0, hand_slot=0, grid=(8, 10), card_id=int(card["cardId"]), action_id="royaleapi-expert"
+        )
+
+        wrong_card = ActionV1.play(
+            owner=0, hand_slot=0, grid=(8, 10), card_id=int(card["cardId"]) + 1, action_id="royaleapi-wrong"
+        )
+        self.assertFalse(env.track_external_command(wrong_card, execute_native_tick=execute_tick))
+        self.assertTrue(env.track_external_command(expert, execute_native_tick=execute_tick))
+        # The replay schedule, not BattleEnv, executes the command.
+        native.queue_hand_action_at(HandAction(0, 0, 8_500, 10_500), execute_tick=execute_tick)
+
+        observations, _, _, _, _ = env.step(self._waits())
+        mask = observations[0].action_mask
+        self.assertEqual(mask.reasons["slots"]["0"], "pending_execution")
+        self.assertEqual(mask.reasons["reserved_elixir"], 3.0)
+        while observations[0].tick < execute_tick:
+            observations, _, _, _, _ = env.step(self._waits())
+
+        self.assertEqual(observations[0].action_mask.reasons["reserved_elixir"], 0.0)
+        executed = [
+            event
+            for event in env._events
+            if event.event_type == "action_executed" and event.data.get("action_id") == "royaleapi-expert"
+        ]
+        self.assertEqual(len(executed), 1)
+
+    def test_opponent_in_flight_building_is_invisible_until_it_executes(self) -> None:
+        env, native = _make_env(FakeNativeEnv())
+        _reset(env)
+        cannon = ActionV1.play(owner=1, hand_slot=0, grid=(8, 20), card_id=27000000, action_id="enemy-cannon")
+        env._pending.append(
+            _PendingRecord(
+                action=cannon,
+                card_id=27000000,
+                effective_card_id=27000000,
+                native_effective_card_id=27000000,
+                requested_native_tick=FIRST_PLAYABLE_TICK,
+                expected_native_tick=FIRST_PLAYABLE_TICK + 1 + COMMAND_EXECUTION_DELAY_TICKS,
+                hand_slot=0,
+                card_parameter=0,
+                deck_slot=0,
+                cost=3,
+                form_code=0,
+                native_form_code=0,
+                form_name="Basic",
+                requested_at_ms=0,
+                generated_at_ms=0,
+                inference_end_ms=0,
+            )
+        )
+        raw = native.observe()
+
+        own, _ = env._occupied_building_footprints(raw, pending_owner=1)
+        enemy_view, _ = env._occupied_building_footprints(raw, pending_owner=0)
+
+        self.assertIn("pending-building:27000000:enemy-cannon", [item.source for item in own])
+        self.assertNotIn("pending-building:27000000:enemy-cannon", [item.source for item in enemy_view])
+        self.assertEqual(env.observe(ObservationTier.FAIR, owner=0).pending_actions, ())
 
 
 if __name__ == "__main__":

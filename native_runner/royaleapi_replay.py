@@ -28,11 +28,13 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from .contracts import ActionKind, ActionV1, EpisodeConfigV1, TargetKind, content_hash
+from .cr_native_env import COMMAND_EXECUTION_DELAY_TICKS
 from .normal_form_evidence import NATIVE_CHAMPION_ABILITY_BINDINGS, NATIVE_HERO_FORM_ABILITY_BINDINGS
 from .snapshot import SnapshotOperationV1
 from .training.replay_archive import TrainingReplayV1
 from .paths import WORKSPACE_ROOT
 from .local_config import setting
+from .match_factory import CARD_LEVELS_VERSION
 
 
 DEFAULT_DATASET_ROOT = Path(setting("CR_REPLAY_DATASET_ROOT", str(WORKSPACE_ROOT / "datasets" / "royaleapi")))
@@ -46,15 +48,16 @@ ARENA_GRID_HEIGHT = 32
 NATIVE_DEAL_SEED = 1_784_463_263
 NATIVE_RENDER_RULESET_ID = "royaleapi-native-render-adapter.v3"
 TRUE_SIDE_MAPPING_VERSION = "royaleapi-true-side-data-i.v1"
-# RoyaleAPI's public ``data-t`` marker identifies the source command boundary.
-# ``NativeClashEnv.queue_hand_action_at`` and the absolute ability APIs instead
-# accept the first observable state tick that must include the command. The
-# native engine consumes a command while advancing from boundary N to state
-# N + 1, so collected actions need this explicit one-tick conversion.
-ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS = 1
+# RoyaleAPI's public ``data-t`` marker is the player's touch tick, not the
+# battle's execution tick: the stock battle executes that card or ability
+# COMMAND_EXECUTION_DELAY_TICKS later.  The native schedule APIs accept the
+# first observable state tick that must include the command, and the engine
+# consumes a command while advancing from boundary N to state N + 1.  Expert
+# labels keep the touch tick (``source_command_tick``); only execution moves.
+ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS = COMMAND_EXECUTION_DELAY_TICKS + 1
 POLICY_DEAL_INVARIANCE_VERSION = "royaleapi-policy-selected-deal.v2"
-POLICY_DEAL_COMMAND_BOUNDARY_SEMANTICS = "royaleapi-command-boundary.v1"
-POLICY_ACTION_STREAM_VERSION = "royaleapi-policy-action-stream.v1"
+POLICY_DEAL_COMMAND_BOUNDARY_SEMANTICS = "royaleapi-touch-tick.v2"
+POLICY_ACTION_STREAM_VERSION = "royaleapi-policy-action-stream.v2"
 POLICY_EPISODE_CONFIG_VERSION = "royaleapi-policy-episode-config.v1"
 DEFAULT_NATIVE_GAME_MODE_ID = 72_000_006
 DEFAULT_NATIVE_ARENA_ID = 54_000_001
@@ -104,6 +107,32 @@ ROYALAPI_TOWER_TROOP_IDS: Mapping[str, int] = {
     "dagger-duchess": 159_000_002,
     "royal-chef": 159_000_004,
 }
+# RoyaleAPI ``deck[i].level`` and ``tower_card.level`` are ABSOLUTE levels
+# (1..16, the post-2023 in-game display): no Legendary is ever below 9 or
+# Champion below 11, every rarity reaches 16 in ladder games, and tournament-
+# standard 1v1s show 11 for every rarity.  The payload has no King Tower level;
+# ``final_tower_hitpoints.king`` equals the King Tower's maximum hitpoints when
+# it was never damaged.  Maximum hitpoints by absolute King Tower level on the
+# 15.535 engine (``battle.hbd[owner].kt``):
+KING_TOWER_HITPOINTS_BY_LEVEL: Mapping[int, int] = {
+    1: 2400,
+    2: 2568,
+    3: 2736,
+    4: 2904,
+    5: 3096,
+    6: 3312,
+    7: 3528,
+    8: 3768,
+    9: 4008,
+    10: 4392,
+    11: 4824,
+    12: 5304,
+    13: 5832,
+    14: 6408,
+    15: 7032,
+    16: 7728,
+}
+_KING_TOWER_LEVEL_BY_HITPOINTS = {hitpoints: level for level, hitpoints in KING_TOWER_HITPOINTS_BY_LEVEL.items()}
 
 
 # ``kind == "hero"`` is not a reliable active-ability flag in the shipped
@@ -401,7 +430,7 @@ def _observed_deal_layout(
 
 
 def _episode_match_config(episode: EpisodeConfigV1) -> Any:
-    from .match_factory import MatchConfig, PRINCESS_TOWER_TROOP_ID
+    from .match_factory import MatchConfig, PRINCESS_TOWER_TROOP_ID, match_level_kwargs
 
     tags = episode.tags
     return MatchConfig(
@@ -411,13 +440,11 @@ def _episode_match_config(episode: EpisodeConfigV1) -> Any:
         game_mode=episode.game_mode,
         arena=episode.arena,
         location=int(tags.get("location", DEFAULT_NATIVE_LOCATION_ID)),
-        level_cap=int(tags.get("level_cap", 0)),
-        minimum_card_level=int(tags.get("minimum_card_level", 0)),
+        **match_level_kwargs(episode.deck0, episode.deck1, tags),
         deck0_form_availability=tuple(int(value) for value in tags.get("deck0_form_availability", (0,) * 8)),
         deck1_form_availability=tuple(int(value) for value in tags.get("deck1_form_availability", (0,) * 8)),
         tower_troop0_id=int(tags.get("tower_troop0_id", PRINCESS_TOWER_TROOP_ID)),
         tower_troop1_id=int(tags.get("tower_troop1_id", PRINCESS_TOWER_TROOP_ID)),
-        king_tower_level=(int(tags["king_tower_level"]) if tags.get("king_tower_level") is not None else None),
         owner0_name=str(tags.get("owner0_name", "RoyaleAPI-Team")),
         owner1_name=str(tags.get("owner1_name", "RoyaleAPI-Opponent")),
         end_tick=int(tags.get("end_tick", 7200)),
@@ -1780,6 +1807,77 @@ def _tower_troop(player: Mapping[str, Any], label: str) -> tuple[str, int, bool]
         raise RoyaleAPIReplayError(f"{label} 使用了尚未支持的塔兵 {key!r}；拒绝静默替换成公主塔") from error
 
 
+@dataclass(frozen=True, slots=True)
+class _OwnerLevels:
+    card_levels: tuple[tuple[int, int], ...]
+    tower_troop_level: int
+    king_tower_level: int
+    king_tower_level_source: str
+
+
+def _owner_levels(
+    deck: Sequence[_DeckCard],
+    player: Mapping[str, Any],
+    *,
+    tower_key: str,
+    tower_id: int,
+    fallback_level: int,
+    notes: Counter,
+) -> _OwnerLevels:
+    """Absolute per-card, tower-troop and King Tower levels of one player.
+
+    A missing (or non-positive) payload level falls back to ``fallback_level``
+    (the match's modal level, the previous uniform behaviour). Every level is
+    clamped into the card rarity's native range.
+    """
+
+    from .match_factory import MAX_CARD_LEVEL, rarity_min_level
+
+    def resolve(card_id: int, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) < 1:
+            notes["missing"] += 1
+            level = int(fallback_level)
+        else:
+            level = int(value)
+        if level > MAX_CARD_LEVEL:
+            notes["above_max"] += 1
+            level = MAX_CARD_LEVEL
+        minimum = rarity_min_level(card_id)
+        if level < minimum:
+            notes["below_min"] += 1
+            level = minimum
+        return level
+
+    cards = tuple(sorted((item.info.card_id, resolve(item.info.card_id, item.level)) for item in deck))
+    tower = player.get("tower_card")
+    raw_tower_level = tower.get("level") if isinstance(tower, Mapping) else None
+    tower_level_present = (
+        isinstance(raw_tower_level, (int, float)) and not isinstance(raw_tower_level, bool) and raw_tower_level >= 1
+    )
+    tower_level = resolve(tower_id, raw_tower_level)
+    # King Tower: the undamaged final King Tower hitpoints are exact; otherwise
+    # the Tower Princess level (which tracks the King Tower in the corpus) or,
+    # for other tower troops, the highest card level. A hitpoint match more
+    # than one level away from that proxy is a damaged tower that happens to
+    # land on a table value and is ignored.
+    if tower_key == "tower-princess" and tower_level_present:
+        king_level, source = tower_level, "princess-level"
+    else:
+        king_level, source = max(level for _card_id, level in cards), "max-card-level"
+    final_hitpoints = player.get("final_tower_hitpoints")
+    king_hitpoints = final_hitpoints.get("king") if isinstance(final_hitpoints, Mapping) else None
+    if isinstance(king_hitpoints, (int, float)) and not isinstance(king_hitpoints, bool):
+        observed = _KING_TOWER_LEVEL_BY_HITPOINTS.get(int(king_hitpoints))
+        if observed is not None and abs(observed - king_level) <= 1:
+            king_level, source = observed, "final-king-hitpoints"
+    return _OwnerLevels(
+        card_levels=cards,
+        tower_troop_level=tower_level,
+        king_tower_level=min(max(int(king_level), 1), MAX_CARD_LEVEL),
+        king_tower_level_source=source,
+    )
+
+
 def prepare_collected_replay(
     payload: Mapping[str, Any], *, bottom_player_tag: str | None = None
 ) -> PreparedCollectedReplay:
@@ -2064,11 +2162,43 @@ def prepare_collected_replay(
         warnings.append(
             f"Verified bottom player assertion #{requested_bottom_tag} against the replay true-side marker."
         )
-    if len(level_counts) > 1:
-        warnings.append(f"原局存在不同卡等；当前 native match 只支持统一等级，本次采用众数等级 {selected_level}。")
-    if selected_level > 16:
-        warnings.append("native v15 最高等级为 16，已把显示等级截到 16。")
+    above_max_level = selected_level > 16
     selected_level = min(max(int(selected_level), 1), 16)
+    level_notes: Counter = Counter()
+    levels_by_owner = tuple(
+        _owner_levels(
+            deck_cards_by_owner[owner],
+            player_by_owner[owner],
+            tower_key=tower_key_by_owner[owner],
+            tower_id=tower_id_by_owner[owner],
+            fallback_level=selected_level,
+            notes=level_notes,
+        )
+        for owner in (0, 1)
+    )
+    if level_notes["missing"]:
+        warnings.append(
+            f"原局有 {level_notes['missing']} 个卡牌/塔兵等级字段缺失；缺失项回退为众数等级 {selected_level}。"
+        )
+    if above_max_level or level_notes["above_max"]:
+        warnings.append("native v15 最高等级为 16，已把显示等级截到 16。")
+    if level_notes["below_min"]:
+        warnings.append(f"原局有 {level_notes['below_min']} 个等级低于该稀有度的最低等级，已抬到最低等级。")
+    resolved_levels = {
+        level
+        for item in levels_by_owner
+        for level in (
+            *(card_level for _card_id, card_level in item.card_levels),
+            item.tower_troop_level,
+            item.king_tower_level,
+        )
+    }
+    if len(resolved_levels) > 1:
+        warnings.append(
+            "已按原局逐卡等级配置 native match（lvlcap=0, cardlvlmin=0）；国王塔等级 "
+            f"上方 {levels_by_owner[0].king_tower_level}（{levels_by_owner[0].king_tower_level_source}）/ "
+            f"下方 {levels_by_owner[1].king_tower_level}（{levels_by_owner[1].king_tower_level_source}）。"
+        )
     if team_tower_missing or opponent_tower_missing:
         warnings.append("部分玩家缺少塔兵字段；仅缺失的一方回退为公主塔。")
     configured_towers = f"上方 {tower_key_by_owner[0]} / 下方 {tower_key_by_owner[1]}"
@@ -2112,9 +2242,20 @@ def prepare_collected_replay(
             "tower_troop1_id": tower_id_by_owner[1],
             "tower_troop0_key": tower_key_by_owner[0],
             "tower_troop1_key": tower_key_by_owner[1],
+            # Uniform fallback for readers that predate per-card levels; the
+            # per-card tags below take precedence (match_level_kwargs).
             "level_cap": selected_level,
             "minimum_card_level": selected_level,
             "king_tower_level": selected_level,
+            "card_levels_version": CARD_LEVELS_VERSION,
+            "deck0_card_levels": levels_by_owner[0].card_levels,
+            "deck1_card_levels": levels_by_owner[1].card_levels,
+            "tower_troop0_level": levels_by_owner[0].tower_troop_level,
+            "tower_troop1_level": levels_by_owner[1].tower_troop_level,
+            "king_tower0_level": levels_by_owner[0].king_tower_level,
+            "king_tower1_level": levels_by_owner[1].king_tower_level,
+            "king_tower0_level_source": levels_by_owner[0].king_tower_level_source,
+            "king_tower1_level_source": levels_by_owner[1].king_tower_level_source,
             "owner0_name": _display_name(player_by_owner[0], "RoyaleAPI-Top"),
             "owner1_name": _display_name(player_by_owner[1], "RoyaleAPI-Bottom"),
             "end_tick": native_end_tick,
@@ -2132,7 +2273,7 @@ def prepare_collected_replay(
             "native_arena_profile": native_arena_profile,
             "location": native_location,
             "initial_order_policy": "random-single-compatible.v3",
-            "reconstruction_mode": "royaleapi-public-actions.v3",
+            "reconstruction_mode": "royaleapi-public-actions.v4",
             "source_tick_semantics": POLICY_DEAL_COMMAND_BOUNDARY_SEMANTICS,
             "native_observable_tick_offset": (ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS),
             "policy_deal_invariance_version": (POLICY_DEAL_INVARIANCE_VERSION),

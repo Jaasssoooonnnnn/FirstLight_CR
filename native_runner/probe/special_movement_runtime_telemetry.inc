@@ -38,7 +38,14 @@ struct SpecialMovementRawRecord {
   bool complete_context = false;
 };
 
-EpochRing<SpecialMovementRawRecord, kSpecialMovementRingCapacity> g_special_movement_ring;
+// One match's retained special-movement ring.  Hooks publish into the bound instance
+// (see MatchTelemetry in cr_replay_probe.cpp).
+struct SpecialMovementMatchTelemetry {
+  EpochRing<SpecialMovementRawRecord, kSpecialMovementRingCapacity> ring;
+};
+
+SpecialMovementMatchTelemetry g_special_movement_default_match;
+SpecialMovementMatchTelemetry *g_special_movement_match = &g_special_movement_default_match;
 std::atomic<bool> g_special_movement_hook_attested{false};
 std::atomic<bool> g_special_movement_hook_installed{false};
 
@@ -52,15 +59,15 @@ std::uintptr_t special_movement_caller_offset(const void *address) {
 }
 
 void begin_special_movement_runtime_epoch(std::uint64_t generation, std::uint64_t state_epoch) {
-  g_special_movement_ring.begin(generation, state_epoch);
+  g_special_movement_match->ring.begin(generation, state_epoch);
 }
 
 void reject_special_movement_record(const CombatCaptureContext &context) {
-  g_special_movement_ring.reject(context.generation, context.state_epoch);
+  g_special_movement_match->ring.reject(context.generation, context.state_epoch);
 }
 
 std::uint64_t publish_special_movement_record(SpecialMovementRawRecord record) {
-  return g_special_movement_ring.publish(record);
+  return g_special_movement_match->ring.publish(record);
 }
 
 bool same_special_movement_entity(const CombatEntityFact &before, const CombatEntityFact &after) {
@@ -147,7 +154,7 @@ bool append_special_movement_runtime_events_json(std::uint64_t generation, std::
                                                  std::int32_t observation_tick, char *response,
                                                  std::size_t response_size, std::size_t *used) {
   return append_epoch_ring_events(
-      g_special_movement_ring,
+      g_special_movement_match->ring,
       {cr_special_movement_runtime::kSchema, "caller-filtered-native-special-movement-hook-ring",
        "sha-build-id-prologue-abi-type0-owner-target-identity"},
       generation, state_epoch, observation_tick, g_special_movement_hook_attested.load(std::memory_order_acquire),

@@ -3352,6 +3352,42 @@ def test_live_reset_replays_opponent_card_play_into_public_tracker(
     assert tracker.elixir[1] < 4.0
 
 
+@pytest.mark.parametrize("conflicting_form", (False, True))
+def test_live_public_evolution_uses_public_descriptor_without_private_runtime(catalog, conflicting_form) -> None:
+    ordinary = _ordinary()
+    ordinary["tick"] = 150
+    rich = _rich(ordinary)
+    base_id = 26_000_010  # Skeletons
+    form_id = 203_000_034 if conflicting_form else 202_000_010
+    event = _card_play_combat_event(
+        ordinary, sequence=40, tick=140, owner=1, card_id=SEMANTIC_BASELINE_DECK[0], deployment_sequence=9
+    )
+    event["deploymentContext"].update({
+        "playedCardGlobalId": base_id, "effectiveCardGlobalId": form_id,
+        "formCode": 1, "formName": "EvoForm", "cost": 1,
+        "cardParameter": (1 << 28) | (1 << 22) | 1,
+    })
+    _set_combat_events(rich, epoch_first_sequence=40, events=[event])
+    native = _RichNativeStub(ordinary, rich)
+    native.public_card_play_events_from_combat_ring = True
+    env = _environment(native, catalog)
+    match = MatchConfig(
+        deck0=SEMANTIC_BASELINE_DECK, deck1=(base_id, *SEMANTIC_BASELINE_DECK[:7]),
+        deck1_form_availability=(1, 0, 0, 0, 0, 0, 0, 0),
+    )
+    if conflicting_form:
+        with pytest.raises(BattleEnvError, match="multiple base card identities"):
+            _reset(env, match_config=match)
+        return
+    observations, _ = _reset(env, match_config=match)
+    played = next(e for e in observations[0].events if e.event_type == "action_executed")
+    assert played.card_id == base_id
+    assert played.data["effective_card_id"] == base_id
+    assert played.data["native_effective_card_id"] == form_id
+    assert played.data["played_form"] == "EvoForm"
+    assert "deck_slot" not in played.data
+
+
 def test_rich_binding_preserves_exact_mirror_root_and_effective_identity() -> None:
     ordinary = _ordinary()
     ordinary["tick"] = 150

@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import math
+import random
 import time
 import uuid
 from typing import Any
@@ -72,6 +73,7 @@ from .cr_native_env import (
     HandAction,
     NativeClashEnv,
     RunnerError,
+    _decode_observed_hand_card,
 )
 from .match_factory import (
     DEFAULT_TEMPLATE_PATH,
@@ -79,6 +81,8 @@ from .match_factory import (
     NATIVE_MATCH_END_TICK,
     PRINCESS_TOWER_TROOP_ID,
     MatchConfig,
+    match_level_kwargs,
+    match_level_tags,
 )
 from .normal_form_evidence import NORMAL_MODE_HERO_FORM_TO_BASE_CARD
 from .phase_runtime import PhaseHookEvent
@@ -144,6 +148,16 @@ TOWER_LAYOUT: tuple[tuple[int, int, str, int, int], ...] = (
     (5, 1, "princess_right", 14500, 25500),
 )
 TOWER_BY_POSITION = {(x, y): (entity_id, owner, kind) for entity_id, owner, kind, x, y in TOWER_LAYOUT}
+# Tower-HP shaping knobs that deliberately live OUTSIDE EnvironmentConfigV1 so
+# ruleset/episode/IL-cache hashes stay byte-identical.
+#   legacy          -> Phi king term = w * loss                      (default)
+#   princess_gated  -> Phi king term = w * max(0, loss - baseline), where the
+#                      per-King baseline absorbs every HP loss that King takes
+#                      while BOTH of its own side's Princess Towers stand and
+#                      freezes once either of them falls (the other side's
+#                      towers are irrelevant: that King is still asleep).
+KING_SHAPING_MODES = ("legacy", "princess_gated", "hp_point_weighted")
+DEFAULT_KING_POTENTIAL_WEIGHT = 3.0
 MIRROR_CARD_ID = 28_000_006
 ABILITY_ATTESTATION_MIN_GRACE_TICKS = 40
 ABILITY_ATTESTATION_CAST_MARGIN_TICKS = 20
@@ -359,6 +373,67 @@ def _elixir_generated_raw(start_tick: int, end_tick: int) -> float:
     return generated
 
 
+# Touch-time elixir legality (C1 fix).  A policy decision at native tick d may
+# touch its micro-actions at delay bins k = 0..4 (0..200 ms, one native tick
+# per bin; the engine executes each touch 20 ticks later).  Elixir available
+# to the touch at bin k is
+#
+#     e(k) = max(e0, min(10, e0 + regen(d) * k))      e0 = max(0, raw - reserved)
+#
+# with ``regen(d)`` the ELIXIR_SEGMENTS rate at the decision tick (a segment
+# change inside the 5-tick window is ignored, which is conservative) and
+# ``reserved`` the cost of in-flight own commands.  Touched commands stay
+# reserved until they execute, so a compound decision is legal when, in touch
+# order, every prefix fits: cost_i <= e(k_i) - sum_{j<i} cost_j.  The V4
+# decoder (``training.v4.decoding.ShadowCandidateLegality``) applies the same
+# rule to ``candidates.elixir`` (= e0) and the match multiplier.
+TOUCH_WINDOW_DELAY_BINS = 5
+# Half a raw unit (5e-5 elixir).  Costs and e0 are integral raw units, so this
+# is exact at bin 0 while absorbing the decoder's fp32 rounding near a bin edge
+# (a decoder-legal touch is always environment-legal).
+_TOUCH_AFFORDABLE_TOLERANCE_RAW = 0.5
+
+
+def _touch_window_elixir_raw(native_tick: int, effective_elixir_raw: int) -> tuple[float, ...]:
+    """Raw elixir available at each touch delay bin of the decision at ``native_tick``."""
+
+    start = float(effective_elixir_raw)
+    rate = _elixir_raw_per_tick(native_tick)
+    return tuple(max(start, min(100_000.0, start + rate * k)) for k in range(TOUCH_WINDOW_DELAY_BINS))
+
+
+def _earliest_affordable_bin(
+    cost_raw: int, window: Sequence[float], *, spent_raw: int = 0, first_bin: int = 0
+) -> int | None:
+    """First bin ``>= first_bin`` at which ``cost_raw`` fits after ``spent_raw``; None if none."""
+
+    for k in range(max(0, first_bin), len(window)):
+        if cost_raw <= window[k] - spent_raw + _TOUCH_AFFORDABLE_TOLERANCE_RAW:
+            return k
+    return None
+
+
+def _action_touch_delay_bin(action: ActionV1) -> int:
+    """Touch delay bin (0..4) of a policy command within its decision window.
+
+    V4 policy commands carry ``policy_delay_offset_bin``; live play submits
+    cards at the next tick but keeps the sampled bin in that metadata (its live
+    shadow restricts bins to the 50 ms cap, which the real touch never
+    precedes).  Other commands use ``execute_offset_ticks - base_latency_ticks``
+    (latency 1 unless declared), clamped to the window.
+    """
+
+    metadata = action.metadata
+    declared = metadata.get("policy_delay_offset_bin")
+    if type(declared) is int and 0 <= declared < TOUCH_WINDOW_DELAY_BINS:
+        return declared
+    latency = metadata.get("base_latency_ticks")
+    if type(latency) is not int or latency < 1:
+        latency = 1
+    offset = max(1, int(action.execute_offset_ticks or 1))
+    return min(TOUCH_WINDOW_DELAY_BINS - 1, max(0, offset - latency))
+
+
 class BattleEnvV1:
     """Parallel, two-sided, canonical battle environment.
 
@@ -469,6 +544,9 @@ class BattleEnvV1:
         self.shaping_beta = float(shaping_beta)
         self.shaping_tau_ticks = float(shaping_tau_ticks)
         self.include_native_digest = include_native_digest
+        self.king_shaping_mode = "legacy"
+        self.king_potential_weight = DEFAULT_KING_POTENTIAL_WEIGHT
+        self._king_loss_baseline: dict[int, float] = {0: 0.0, 1: 0.0}
 
         self.agents = list(self.possible_agents)
         self.episode_config: EpisodeConfigV1 | None = None
@@ -495,6 +573,10 @@ class BattleEnvV1:
         self._event_archive: dict[str, dict[str, int]] = {}
         self._pending: list[_PendingRecord] = []
         self._pending_abilities: list[_PendingAbilityRecord] = []
+        # Only PPO training opts into network jitter. Non-training simulated
+        # matches retain their existing fixed server delay; live adds neither.
+        self.simulated_card_delay_jitter_ticks: int | None = None
+        self._command_delay_rng: dict[int, random.Random] = {}
         self._revealed: dict[int, set[int]] = {0: set(), 1: set()}
         self._belief_elixir: dict[int, tuple[float, float]] = {0: (6.0, 6.0), 1: (6.0, 6.0)}
         self._entity_birth: dict[int, int] = {}
@@ -533,6 +615,8 @@ class BattleEnvV1:
         self._ordinary_tower_cache: dict[tuple[int, int, int | None], tuple[TowerStateV1, ...]] = {}
         self._action_mask_cache: dict[tuple[Any, ...], ActionMaskV1] = {}
         self._action_player_runtime_cache: dict[tuple[int, int, int | None, int], Any] = {}
+        self._hand_runtime_cache: dict[tuple[Any, ...], Mapping[str, int | float]] = {}
+        self._event_visibility_cache: dict[tuple[int, int | None], tuple[EventV1, bool]] = {}
         self._public_metadata_static: Mapping[str, Any] | None = None
 
     @property
@@ -642,6 +726,7 @@ class BattleEnvV1:
                 "owner1_name": match.owner1_name,
                 "end_tick": match.end_tick,
                 **({"king_tower_level": match.king_tower_level} if match.king_tower_level is not None else {}),
+                **match_level_tags(match),
             },
         )
 
@@ -732,8 +817,7 @@ class BattleEnvV1:
                 game_mode=config.game_mode,
                 arena=config.arena,
                 location=int(config.tags.get("location", 15000199)),
-                level_cap=int(config.tags.get("level_cap", 0)),
-                minimum_card_level=int(config.tags.get("minimum_card_level", 0)),
+                **match_level_kwargs(config.deck0, config.deck1, config.tags),
                 deck0_form_availability=tuple(
                     int(value) for value in config.tags.get("deck0_form_availability", (0,) * 8)
                 ),
@@ -742,9 +826,6 @@ class BattleEnvV1:
                 ),
                 tower_troop0_id=int(config.tags.get("tower_troop0_id", PRINCESS_TOWER_TROOP_ID)),
                 tower_troop1_id=int(config.tags.get("tower_troop1_id", PRINCESS_TOWER_TROOP_ID)),
-                king_tower_level=(
-                    int(config.tags["king_tower_level"]) if config.tags.get("king_tower_level") is not None else None
-                ),
                 owner0_name=str(config.tags.get("owner0_name", "Policy-0")),
                 owner1_name=str(config.tags.get("owner1_name", "Policy-1")),
                 end_tick=int(config.tags.get("end_tick", 7200)),
@@ -812,12 +893,11 @@ class BattleEnvV1:
             )
 
         try:
-            self.semantic_subset_contract.assert_deck(
-                match.deck0, form_availability=match.deck0_form_availability, label="deck0"
-            )
-            self.semantic_subset_contract.assert_deck(
-                match.deck1, form_availability=match.deck1_form_availability, label="deck1"
-            )
+            for owner in (0, 1):
+                self.semantic_subset_contract.assert_deck(
+                    match.deck0 if owner == 0 else match.deck1,
+                    form_availability=match.deck0_form_availability if owner == 0 else match.deck1_form_availability,
+                    label=f"deck{owner}")
         except SemanticSubsetError as error:
             raise BattleEnvError(str(error)) from error
 
@@ -857,6 +937,12 @@ class BattleEnvV1:
 
         self.match_config = match
         self.episode_config = episode
+        # Independent actor streams keep delay jitter reproducible without
+        # consuming policy/global RNG or the other actor's random draws.
+        self._command_delay_rng = {
+            owner: random.Random(f"command-delay-v1:{match.seed}:{owner}")
+            for owner in self.possible_agents
+        }
         self.episode_id = str(uuid.uuid4())
         self._public_metadata_static = None
         # Native tick zero is the episode clock.  The headless warm-up is part
@@ -867,9 +953,11 @@ class BattleEnvV1:
         self._ordinary_tower_cache.clear()
         self._action_mask_cache.clear()
         self._action_player_runtime_cache.clear()
+        self._hand_runtime_cache.clear()
         if prefetched_rich is not None:
             self._prime_rich_cache(self._raw, prefetched_rich)
         self._events.clear()
+        self._event_visibility_cache.clear()
         self._event_archive.clear()
         self._pending.clear()
         self._pending_abilities.clear()
@@ -938,6 +1026,8 @@ class BattleEnvV1:
         )
         for entity_id in self._previous_entities:
             self._entity_birth[entity_id] = int(self._raw["tick"])
+        self._king_loss_baseline = {0: 0.0, 1: 0.0}
+        self._update_king_loss_baseline(initial_towers)
         self._last_potential = {owner: self._potential(owner, initial_towers) for owner in self.possible_agents}
         self._last_rewards = {0: 0.0, 1: 0.0}
 
@@ -1526,7 +1616,10 @@ class BattleEnvV1:
         if not native_command_available:
             return {}, {"status": "unavailable", "reason": "native_command_api_missing"}
         key_by_canonical_id = {canonical_id: entity_key for entity_key, canonical_id in context.canonical_ids.items()}
-        elixir = float(int(raw_player.get("elixirRaw", 0))) / 10_000.0
+        # Touch-time rule on the raw bar: affordable at some bin of the
+        # decision window.  ``action_mask`` and ``_validate_compound_actions``
+        # then apply the reserved-elixir and per-bin sequential checks.
+        raw_window = _touch_window_elixir_raw(int(source.get("tick", 0)), int(raw_player.get("elixirRaw", 0)))
         candidates: dict[int, tuple[AbilityRuntimeStateV1, EntityKey]] = {}
         reasons: dict[str, str] = {}
         for state in runtime.ability_runtime_states:
@@ -1552,7 +1645,7 @@ class BattleEnvV1:
                 reason = "charges_exhausted"
             elif state.elixir_cost is None:
                 reason = "elixir_cost_unknown"
-            elif state.elixir_cost > elixir:
+            elif _earliest_affordable_bin(int(round(float(state.elixir_cost) * 10_000)), raw_window) is None:
                 reason = "insufficient_elixir"
             elif source_entity in candidates:
                 reason = "duplicate_source_identity"
@@ -1673,11 +1766,181 @@ class BattleEnvV1:
                 )
         return effective_card_id, form_code
 
+    def _ability_runtime_identity(
+        self, action: ActionV1, raw: Mapping[str, Any]
+    ) -> tuple[EntityStateV1, EntityKey, dict[str, Any]]:
+        assert action.source_entity is not None
+        candidates, _reasons = self._ability_action_candidates(action.owner, raw)
+        state, entity_key = candidates[action.source_entity]
+        runtime_identity_fields = {
+            "source_card_id": state.attributes.get("source_card_id"),
+            "controller_slot": state.attributes.get("controller_slot"),
+            "action_data_global_id": state.attributes.get("native_action_data_global_id"),
+            "button_state": state.attributes.get("button_state"),
+            "remaining_charges_raw": state.attributes.get("remaining_charges_raw"),
+            "configured_cooldown_ms": state.cooldown_ms,
+            "max_charges": state.attributes.get("max_charges"),
+        }
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int) for value in runtime_identity_fields.values())
+            or state.remaining_cooldown_ms != 0
+        ):
+            raise BattleEnvError("legal ability source lacks an exact pre-command runtime identity")
+        ability_spec = self.ability_specs[state.ability_id]
+        if int(runtime_identity_fields["configured_cooldown_ms"]) != normalized_ability_cooldown_ms(
+            ability_spec
+        ) or int(runtime_identity_fields["max_charges"]) != int(ability_spec.charges or 0):
+            raise BattleEnvError("legal ability source drifted from its static cooldown/charge contract")
+        return state, entity_key, runtime_identity_fields
+
+    def _pending_ability_record(
+        self,
+        action: ActionV1,
+        state: EntityStateV1,
+        entity_key: EntityKey,
+        runtime_identity_fields: Mapping[str, Any],
+        *,
+        requested_native_tick: int,
+        expected_native_tick: int,
+        now_ms: int,
+    ) -> _PendingAbilityRecord:
+        ability_spec = self.ability_specs[state.ability_id]
+        cast_ticks = int(math.ceil(float(ability_spec.cast_time_ms or 0) / TICK_MS))
+        attestation_grace_ticks = max(
+            ABILITY_ATTESTATION_MIN_GRACE_TICKS, cast_ticks + ABILITY_ATTESTATION_CAST_MARGIN_TICKS
+        )
+        return _PendingAbilityRecord(
+            action=action,
+            ability_id=state.ability_id,
+            source_card_id=int(runtime_identity_fields["source_card_id"]),
+            source_entity_key=entity_key,
+            controller_slot=int(runtime_identity_fields["controller_slot"]),
+            action_data_global_id=int(runtime_identity_fields["action_data_global_id"]),
+            before_button_state=int(runtime_identity_fields["button_state"]),
+            before_remaining_cooldown_ms=0,
+            before_remaining_charges_raw=int(runtime_identity_fields["remaining_charges_raw"]),
+            before_configured_cooldown_ms=int(runtime_identity_fields["configured_cooldown_ms"]),
+            before_max_charges=int(runtime_identity_fields["max_charges"]),
+            requested_native_tick=requested_native_tick,
+            expected_native_tick=expected_native_tick,
+            attestation_deadline_native_tick=(expected_native_tick + attestation_grace_ticks),
+            cost_raw=int(round(float(state.elixir_cost or 0.0) * 10_000)),
+            requested_at_ms=(action.requested_at_ms or now_ms),
+            generated_at_ms=(action.generated_at_ms or now_ms),
+            inference_end_ms=(action.generated_at_ms or now_ms),
+        )
+
+    def track_external_command(self, action: ActionV1, *, execute_native_tick: int) -> bool:
+        """Track an expert command that the native replay schedule will execute.
+
+        IL replays execute expert commands through the probe schedule instead
+        of :meth:`step`.  Recording each one as pending from its decision tick
+        until ``execute_native_tick`` gives the in-flight second the same
+        slot/ability mask, reserved elixir, and pending building footprint as a
+        policy command.  Returns False when the current native state no longer
+        holds the exact hand card or ready ability source.
+        """
+
+        if self._raw is None:
+            raise BattleEnvError("reset must be called before tracking commands")
+        raw = self._raw
+        native_tick = int(raw["tick"])
+        if execute_native_tick <= native_tick:
+            raise ValueError("tracked command must execute after the current native tick")
+        now_ms = int(time.time() * 1000)
+        if action.kind is ActionKind.ACTIVATE_ABILITY:
+            if action.source_entity is None:
+                raise ValueError("tracked ability command lacks its source entity")
+            candidates, _reasons = self._ability_action_candidates(action.owner, raw)
+            if action.source_entity not in candidates:
+                return False
+            try:
+                state, entity_key, fields = self._ability_runtime_identity(action, raw)
+            except BattleEnvError:
+                # Policy dispatch refuses such a source; the replay schedule
+                # resolves its own source at execution, so do not mirror it.
+                return False
+            self._pending_abilities.append(
+                self._pending_ability_record(
+                    action,
+                    state,
+                    entity_key,
+                    fields,
+                    requested_native_tick=native_tick,
+                    expected_native_tick=execute_native_tick,
+                    now_ms=now_ms,
+                )
+            )
+            return True
+        if action.kind is not ActionKind.PLAY_CARD or action.hand_slot is None or action.card_id is None:
+            raise ValueError("tracked command must be an identified card play or ability")
+        player = _player(raw, action.owner)
+        card = next(
+            (
+                item
+                for item in player.get("hand", ())
+                if int(item["handIndex"]) == action.hand_slot and int(item["cardId"]) == action.card_id
+            ),
+            None,
+        )
+        if card is None or card.get("cardParameter") is None or card.get("cost") is None:
+            return False
+        descriptor = _decode_observed_hand_card(card)
+        runtime = self._hand_runtime_contract(
+            card, form_aliases=self._native_form_aliases(self._rich_context(raw)), owner=action.owner
+        )
+        self._pending.append(
+            _PendingRecord(
+                action=action,
+                card_id=int(card["cardId"]),
+                effective_card_id=int(runtime["effective_card_id"]),
+                native_effective_card_id=int(runtime["native_effective_card_id"]),
+                requested_native_tick=native_tick,
+                expected_native_tick=execute_native_tick,
+                hand_slot=action.hand_slot,
+                card_parameter=descriptor.packed,
+                deck_slot=descriptor.deck_slot,
+                cost=descriptor.cost,
+                form_code=int(runtime["form_code"]),
+                native_form_code=int(runtime["native_form_code"]),
+                form_name=descriptor.form_name,
+                requested_at_ms=now_ms,
+                generated_at_ms=now_ms,
+                inference_end_ms=now_ms,
+            )
+        )
+        return True
+
     def _hand_runtime_contract(
         self, card: Mapping[str, Any], *, form_aliases: Mapping[int, int] | None = None, owner: int | None = None
     ) -> Mapping[str, int | float]:
         """Project one private native selection without losing Mirror state."""
 
+        # The projection is a pure function of the exact card fields, aliases and
+        # owner under one episode deck contract (the cache is cleared on reset).
+        # A hand repeats across frames and is projected by both action_mask and
+        # _players.  Only exact-int/None fields are cached, so equal-but-retyped
+        # values (True == 1) still take the validating path; failures never cache.
+        card_items = tuple(card.items())
+        alias_items = None if form_aliases is None else tuple(form_aliases.items())
+        cacheable = all(type(value) is int or value is None for _field, value in card_items) and (
+            alias_items is None
+            or all(type(key) is int and type(value) is int for key, value in alias_items)
+        )
+        if not cacheable:
+            return self._hand_runtime_contract_uncached(card, form_aliases=form_aliases, owner=owner)
+        cache_key = (owner, card_items, alias_items)
+        cached = self._hand_runtime_cache.get(cache_key)
+        if cached is None:
+            cached = self._hand_runtime_contract_uncached(card, form_aliases=form_aliases, owner=owner)
+            if len(self._hand_runtime_cache) >= 256:
+                self._hand_runtime_cache.clear()
+            self._hand_runtime_cache[cache_key] = cached
+        return cached
+
+    def _hand_runtime_contract_uncached(
+        self, card: Mapping[str, Any], *, form_aliases: Mapping[int, int] | None = None, owner: int | None = None
+    ) -> Mapping[str, int | float]:
         if any(
             isinstance(card.get(field), bool) or not isinstance(card.get(field), int)
             for field in ("cardId", "handIndex", "cost")
@@ -1753,6 +2016,25 @@ class BattleEnvV1:
                 if previous is not None and previous != base_card_id:
                     raise BattleEnvError("native form card maps to multiple base card identities")
                 aliases[form_card_id] = base_card_id
+        # Official online clients withhold the opponent's private evolution
+        # runtime. A validated public consume already proves the base/form
+        # join; requiring that private runtime here breaks the first Evo play.
+        envelope = rich_context.snapshot.combat_events
+        for event in (() if envelope is None else envelope.events):
+            deployment = event.deployment_context
+            if event.kind != "card_play" or deployment is None or deployment.form_code != 1:
+                continue
+            form_id = deployment.effective_card_global_id
+            if form_id is None:
+                raise BattleEnvError("public evolution deployment lacks its exact native form identity")
+            base_card_id = int(deployment.played_card_global_id)
+            spec = self.card_specs.get(base_card_id)
+            if spec is None or spec.evolution is None:
+                raise BattleEnvError("public evolution deployment has no policy base-card contract")
+            previous = aliases.get(int(form_id))
+            if previous is not None and previous != base_card_id:
+                raise BattleEnvError("native form card maps to multiple base card identities")
+            aliases[int(form_id)] = base_card_id
         return aliases
 
     @staticmethod
@@ -1770,9 +2052,13 @@ class BattleEnvV1:
         )
 
     def _occupied_building_footprints(
-        self, raw: Mapping[str, Any], rich_context: _RichObservationContext | None = None
+        self, raw: Mapping[str, Any], rich_context: _RichObservationContext | None = None, *, pending_owner: int
     ) -> tuple[tuple[OccupiedFootprintV1, ...], tuple[int, ...]]:
-        """Project live native building roots into exact occupied rectangles."""
+        """Project live native building roots into exact occupied rectangles.
+
+        Only ``pending_owner``'s own in-flight buildings are reserved.  An
+        opponent's command stays invisible until the battle executes it.
+        """
 
         occupied: dict[tuple[int, int, int, int], OccupiedFootprintV1] = {}
         unknown: set[int] = set()
@@ -1818,7 +2104,7 @@ class BattleEnvV1:
                 (f"building:{resolved_card_id}:{int(item.get('objectIndex', item.get('slot', -1)))}"),
             )
         for pending in self._pending:
-            if pending.status != "queued":
+            if pending.status != "queued" or pending.action.owner != pending_owner:
                 continue
             spec = self.card_specs.get(pending.effective_card_id)
             if spec is None or spec.kind.value != "building":
@@ -2032,10 +2318,19 @@ class BattleEnvV1:
         lanes = self._destroyed_enemy_lanes(owner, towers)
         active_tower_footprints = self._active_tower_footprints(towers)
         (occupied_building_footprints, unknown_occupied_building_ids) = self._occupied_building_footprints(
-            source, rich_context
+            source, rich_context, pending_owner=owner
         )
         hand_by_index = {int(card["handIndex"]): card for card in player.get("hand", ())}
+        # Every touch spends ~20 ticks in flight before execution. Block only
+        # its own slot: the stock client and the native probe accept further
+        # touches meanwhile, and reserved elixir already covers their cost.
         pending_hand_slots = {item.hand_slot for item in pending_cards}
+        # Touch-time legality: a card or ability is a candidate when it is
+        # affordable at some delay bin of this decision window; the earliest
+        # such bin (0..4, native hand slot / source entity keys) is exported
+        # in ``reasons["affordable_from_bin"]``.
+        window_elixir_raw = _touch_window_elixir_raw(int(source.get("tick", 0)), effective_elixir_raw)
+        slot_affordable_from_bin: dict[str, int | None] = {}
         slots: list[bool] = []
         masks: dict[str, Any] = {}
         reasons: dict[str, Any] = {}
@@ -2049,12 +2344,18 @@ class BattleEnvV1:
                 reasons[str(slot)] = "pending_execution"
             elif card.get("cardParameter") is None or card.get("cost") is None:
                 reasons[str(slot)] = "native_selection_unavailable"
-            elif int(card["cost"]) * 10_000 > effective_elixir_raw:
-                reasons[str(slot)] = "insufficient_elixir"
-                has_unaffordable = True
             else:
-                legal = True
-                reasons[str(slot)] = "legal"
+                cost_raw = int(card["cost"]) * 10_000
+                # Kept on the decision-tick rule: WAIT_UNTIL_AFFORDABLE waits
+                # for the card to be affordable without regeneration.
+                has_unaffordable |= cost_raw > effective_elixir_raw
+                affordable_from_bin = _earliest_affordable_bin(cost_raw, window_elixir_raw)
+                slot_affordable_from_bin[str(slot)] = affordable_from_bin
+                if affordable_from_bin is None:
+                    reasons[str(slot)] = "insufficient_elixir"
+                else:
+                    legal = True
+                    reasons[str(slot)] = "legal"
             if card is not None:
                 runtime = self._hand_runtime_contract(card, form_aliases=form_aliases, owner=owner)
                 visible_card_id = int(runtime["visible_card_id"])
@@ -2106,12 +2407,22 @@ class BattleEnvV1:
             slots.append(legal)
         ability_candidates, ability_reasons = self._ability_action_candidates(owner, source, rich_context=rich_context)
         pending_ability_sources = {item.action.source_entity for item in pending_abilities}
+        ability_affordable_from_bin = {
+            str(source_entity): _earliest_affordable_bin(
+                int(round(float(candidate[0].elixir_cost) * 10_000)), window_elixir_raw
+            )
+            for source_entity, candidate in ability_candidates.items()
+            if candidate[0].elixir_cost is not None
+        }
         ability_candidates = {
             source_entity: candidate
             for source_entity, candidate in ability_candidates.items()
             if source_entity not in pending_ability_sources
             and candidate[0].elixir_cost is not None
-            and int(round(float(candidate[0].elixir_cost) * 10_000)) <= effective_elixir_raw
+            and ability_affordable_from_bin[str(source_entity)] is not None
+        }
+        ability_affordable_from_bin = {
+            str(source_entity): ability_affordable_from_bin[str(source_entity)] for source_entity in ability_candidates
         }
         if pending_ability_sources:
             ability_reasons = {
@@ -2138,6 +2449,12 @@ class BattleEnvV1:
                 "raw_elixir": elixir_raw / 10_000.0,
                 "reserved_elixir": reserved_elixir_raw / 10_000.0,
                 "effective_elixir": effective_elixir_raw / 10_000.0,
+                "elixir_regen_per_tick": _elixir_raw_per_tick(int(source.get("tick", 0))) / 10_000.0,
+                "touch_window_elixir": tuple(value / 10_000.0 for value in window_elixir_raw),
+                "affordable_from_bin": {
+                    "slots": slot_affordable_from_bin,
+                    "abilities": ability_affordable_from_bin,
+                },
                 "pending_action_count": (len(pending_cards) + len(pending_abilities)),
                 "territory_source": "v15 standard rules + native-probed terrain",
                 "post_tower_pockets": "conservative captured-command bounds",
@@ -2212,7 +2529,7 @@ class BattleEnvV1:
         active_tower_footprints = self._active_tower_footprints(towers)
         placement_rich_context = self._rich_context(raw)
         (occupied_building_footprints, unknown_occupied_building_ids) = self._occupied_building_footprints(
-            raw, placement_rich_context
+            raw, placement_rich_context, pending_owner=action.owner
         )
         placement_profile = building_placement_profile(effective_card_id) if spec.kind.value == "building" else None
         if placement_profile is not None and placement_profile.stationary_collision_rectangle:
@@ -2268,9 +2585,10 @@ class BattleEnvV1:
         hand = {int(item["handIndex"]): item for item in player.get("hand", ())}
         used_slots: set[int] = set()
         ability_count = 0
-        total_cost_raw = 0
+        # (touch delay bin, submission index, cost) for the sequential check.
+        touches: list[tuple[int, int, int]] = []
         planned_buildings: list[OccupiedFootprintV1] = []
-        for action in actions:
+        for index, action in enumerate(actions):
             if action.kind == ActionKind.ACTIVATE_ABILITY:
                 ability_count += 1
                 assert action.source_entity is not None
@@ -2278,7 +2596,9 @@ class BattleEnvV1:
                 state, _key = candidates[action.source_entity]
                 if state.elixir_cost is None:
                     raise BattleEnvError("compound ability has no exact native elixir cost")
-                total_cost_raw += int(round(float(state.elixir_cost) * 10_000))
+                touches.append(
+                    (_action_touch_delay_bin(action), index, int(round(float(state.elixir_cost) * 10_000)))
+                )
                 continue
             if action.kind != ActionKind.PLAY_CARD:
                 continue
@@ -2289,7 +2609,7 @@ class BattleEnvV1:
             selected = hand[action.hand_slot]
             if selected.get("cost") is None:
                 raise BattleEnvError("compound card has no exact native cost")
-            total_cost_raw += int(selected["cost"]) * 10_000
+            touches.append((_action_touch_delay_bin(action), index, int(selected["cost"]) * 10_000))
             card_id = int(selected["cardId"])
             entry = mask.placement_masks[str(action.hand_slot)]
             effective_card_id = int(entry.get("effective_card_id", card_id))
@@ -2315,8 +2635,17 @@ class BattleEnvV1:
             for item in self._pending_abilities
             if item.status in _ABILITY_PENDING_STATUSES and item.action.owner == owner
         )
-        if total_cost_raw > max(0, int(player.get("elixirRaw", 0)) - reserved_cost_raw):
-            raise BattleEnvError("compound decision overspends elixir")
+        # Same accounting as ``action_mask``: e0 = max(0, raw - reserved), then
+        # touch-time regeneration per bin; earlier touches of this decision
+        # stay reserved, so every prefix in touch order must fit.
+        window = _touch_window_elixir_raw(
+            int(raw.get("tick", 0)), max(0, int(player.get("elixirRaw", 0)) - reserved_cost_raw)
+        )
+        spent_raw = 0
+        for touch_bin, _index, cost_raw in sorted(touches):
+            if _earliest_affordable_bin(cost_raw, window, spent_raw=spent_raw, first_bin=touch_bin) != touch_bin:
+                raise BattleEnvError("compound decision overspends elixir")
+            spent_raw += cost_raw
 
     def _world_target(self, action: ActionV1) -> tuple[int, int]:
         assert action.target_grid is not None
@@ -2431,6 +2760,35 @@ class BattleEnvV1:
                 self._validate_compound_actions(owner, group, self._raw)
             normalized[owner] = group
 
+        # Policy offsets name the touch tick. Simulated engines execute the
+        # backdated command immediately, so add the online touch-to-execution
+        # delay here; the trace then records the tick the command really ran.
+        # Earliest card touches execute after 21--24 ticks: one touch tick,
+        # twenty server ticks, and uniform 0--3 tick transport jitter. Cards
+        # in one compound decision share jitter so their order stays intact.
+        command_delay = int(getattr(self.native, "simulated_command_delay_ticks", 0))
+        if command_delay:
+            delayed = {}
+            for owner, group in normalized.items():
+                card_jitter = (
+                    self._command_delay_rng[owner].randrange(self.simulated_card_delay_jitter_ticks + 1)
+                    if self.simulated_card_delay_jitter_ticks is not None
+                    and any(action.kind == ActionKind.PLAY_CARD for action in group) else 0
+                )
+                delayed[owner] = tuple(
+                    replace(
+                        action,
+                        execute_offset_ticks=(
+                            max(1, action.execute_offset_ticks or 1) + command_delay
+                            + (card_jitter if action.kind == ActionKind.PLAY_CARD else 0)
+                        ),
+                    )
+                    if action.kind in {ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY}
+                    else action
+                    for action in group
+                )
+            normalized = delayed
+
         before = self._raw
         diagnostic_action_masks = {
             owner: self.action_mask(owner, before)
@@ -2481,26 +2839,7 @@ class BattleEnvV1:
                 continue
             for compound_index, action in enumerate(normalized[owner]):
                 if action.kind == ActionKind.ACTIVATE_ABILITY:
-                    assert action.source_entity is not None
-                    candidates, _reasons = self._ability_action_candidates(action.owner, before)
-                    state, entity_key = candidates[action.source_entity]
-                    runtime_identity_fields = {
-                        "source_card_id": state.attributes.get("source_card_id"),
-                        "controller_slot": state.attributes.get("controller_slot"),
-                        "action_data_global_id": state.attributes.get("native_action_data_global_id"),
-                        "button_state": state.attributes.get("button_state"),
-                        "remaining_charges_raw": state.attributes.get("remaining_charges_raw"),
-                        "configured_cooldown_ms": state.cooldown_ms,
-                        "max_charges": state.attributes.get("max_charges"),
-                    }
-                    if (
-                        any(
-                            isinstance(value, bool) or not isinstance(value, int)
-                            for value in runtime_identity_fields.values()
-                        )
-                        or state.remaining_cooldown_ms != 0
-                    ):
-                        raise BattleEnvError("legal ability source lacks an exact pre-command runtime identity")
+                    state, entity_key, runtime_identity_fields = self._ability_runtime_identity(action, before)
                     execute_in = max(1, action.execute_offset_ticks or 1)
                     ability_action = AbilityAction(*entity_key)
                     ability_spec = self.ability_specs[state.ability_id]
@@ -2535,30 +2874,15 @@ class BattleEnvV1:
                         )
                         continue
                     expected = int(queued["executeTick"])
-                    cast_ticks = int(math.ceil(float(ability_spec.cast_time_ms or 0) / TICK_MS))
-                    attestation_grace_ticks = max(
-                        ABILITY_ATTESTATION_MIN_GRACE_TICKS, cast_ticks + ABILITY_ATTESTATION_CAST_MARGIN_TICKS
-                    )
                     self._pending_abilities.append(
-                        _PendingAbilityRecord(
-                            action=action,
-                            ability_id=state.ability_id,
-                            source_card_id=int(runtime_identity_fields["source_card_id"]),
-                            source_entity_key=entity_key,
-                            controller_slot=int(runtime_identity_fields["controller_slot"]),
-                            action_data_global_id=int(runtime_identity_fields["action_data_global_id"]),
-                            before_button_state=int(runtime_identity_fields["button_state"]),
-                            before_remaining_cooldown_ms=0,
-                            before_remaining_charges_raw=int(runtime_identity_fields["remaining_charges_raw"]),
-                            before_configured_cooldown_ms=int(runtime_identity_fields["configured_cooldown_ms"]),
-                            before_max_charges=int(runtime_identity_fields["max_charges"]),
+                        self._pending_ability_record(
+                            action,
+                            state,
+                            entity_key,
+                            runtime_identity_fields,
                             requested_native_tick=before_native_tick,
                             expected_native_tick=expected,
-                            attestation_deadline_native_tick=(expected + attestation_grace_ticks),
-                            cost_raw=int(round(float(state.elixir_cost or 0.0) * 10_000)),
-                            requested_at_ms=(action.requested_at_ms or now_ms),
-                            generated_at_ms=(action.generated_at_ms or now_ms),
-                            inference_end_ms=(action.generated_at_ms or now_ms),
+                            now_ms=now_ms,
                         )
                     )
                     self._emit_event(
@@ -2593,7 +2917,9 @@ class BattleEnvV1:
                     action.metadata.get("model_delay_ignored") is True
                     and self.episode_config.render_mode == "native-render"
                 ):
-                    queued = self.native.queue_hand_action_next_tick(hand_action)
+                    # ``execute_in`` already carries the touch-to-execution delay,
+                    # matching the interactive player's own card timing.
+                    queued = self.native.queue_hand_action_next_tick(hand_action, execute_in_ticks=execute_in)
                 elif action.metadata.get("native_command_age_ticks") is not None:
                     # The renderer continues during inference.  Policy offsets
                     # describe time since the decision observation, so do not
@@ -3274,7 +3600,13 @@ class BattleEnvV1:
             if event.sequence < expected:
                 continue
             if kind == "phase":
-                canonical = replace(event, tick=self._canonical_tick(event.tick))
+                canonical_tick = self._canonical_tick(event.tick)
+                # replace() would only rebuild and revalidate an equal event.
+                canonical = (
+                    event
+                    if type(event.tick) is int and canonical_tick == event.tick
+                    else replace(event, tick=canonical_tick)
+                )
                 self._phase_events_by_entity.setdefault(canonical.entity_key, []).append(canonical)
             elif kind == "visibility":
                 self._append_native_visibility_event(event, rich_context, envelope.state_epoch)
@@ -4195,13 +4527,93 @@ class BattleEnvV1:
                 )
         return tuple(resolved)
 
+    def configure_tower_shaping(
+        self, *, king_shaping_mode: str = "legacy", king_potential_weight: float = DEFAULT_KING_POTENTIAL_WEIGHT
+    ) -> None:
+        """Select the King term of the tower potential (PPO-only, hash-neutral).
+
+        Call before ``reset``; the setting persists across episodes.  These knobs
+        are intentionally not EnvironmentConfigV1 fields, so changing them never
+        changes ruleset, episode, or IL-cache identities.
+        """
+        if king_shaping_mode not in KING_SHAPING_MODES:
+            raise ValueError(f"king_shaping_mode must be one of {KING_SHAPING_MODES}")
+        weight = float(king_potential_weight)
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError("king_potential_weight must be finite and nonnegative")
+        if (
+            self.episode_config is not None
+            and not (self._terminated or self._truncated)
+            and (king_shaping_mode, weight) != (self.king_shaping_mode, self.king_potential_weight)
+        ):
+            raise RuntimeError("tower shaping cannot change in the middle of an episode")
+        self.king_shaping_mode = king_shaping_mode
+        self.king_potential_weight = weight
+
+    @staticmethod
+    def _princess_towers_standing(towers: Sequence[TowerStateV1], owner: int) -> bool:
+        """Both of ``owner``'s Princess Towers are alive (the victim side only)."""
+        princesses = [tower for tower in towers if tower.owner == owner and tower.tower_kind.startswith("princess")]
+        return len(princesses) == 2 and all(tower.active and tower.hitpoints > 0 for tower in princesses)
+
+    def _king_loss(self, tower: TowerStateV1) -> float:
+        initial = self._initial_tower_hp.get(tower.entity_id, tower.max_hitpoints)
+        return 1.0 - tower.hitpoints / max(1.0, initial)
+
+    def _update_king_loss_baseline(self, towers: Sequence[TowerStateV1]) -> None:
+        """Absorb a King's HP loss into its baseline while its own side towers stand.
+
+        Each King keeps its own baseline, gated only by the Princess Towers of
+        the King's owner: losing one of MY towers does not wake the enemy King,
+        so chipping it stays excluded.  Once either of the owner's Princess
+        Towers is down that baseline freezes for the rest of the episode, so
+        only later King damage enters the potential.  Phi is then a potential
+        over (state, baselines) -- a deterministic function of the observed
+        history -- so the shaping still telescopes, is zeroed at the terminal
+        state, and stays zero-sum and owner-symmetric.
+        """
+        if self.king_shaping_mode not in ("princess_gated", "hp_point_weighted"):
+            return
+        for tower in towers:
+            if (
+                tower.tower_kind == "king"
+                and tower.owner in self._king_loss_baseline
+                and self._princess_towers_standing(towers, tower.owner)
+            ):
+                self._king_loss_baseline[tower.owner] = max(
+                    self._king_loss_baseline[tower.owner], self._king_loss(tower)
+                )
+
     def _potential(self, owner: int, towers: Sequence[TowerStateV1]) -> float:
         crowns = self._crowns(towers)
         value = float(crowns[owner] - crowns[1 - owner])
+        if self.king_shaping_mode == "hp_point_weighted":
+            # One common HP unit across both owners and tower kinds. Averaging
+            # initial Princess HP also keeps the scale comparable across levels.
+            princess_hp = [self._initial_tower_hp.get(t.entity_id, t.max_hitpoints)
+                           for t in towers if t.tower_kind != "king"]
+            hp_unit = max(1.0, sum(princess_hp) / max(1, len(princess_hp)))
+            for tower in towers:
+                initial = self._initial_tower_hp.get(tower.entity_id, tower.max_hitpoints)
+                loss = self._king_loss(tower)
+                if tower.tower_kind == "king":
+                    # Baseline follows damage while this owner's Princesses
+                    # stand, then freezes. Never reprice old chip at the gate.
+                    early_loss = min(loss, self._king_loss_baseline.get(tower.owner, 0.0))
+                    weighted_hp = initial * (0.2 * early_loss + self.king_potential_weight * (loss - early_loss))
+                else:
+                    weighted_hp = initial * loss
+                value += weighted_hp / hp_unit * (1.0 if tower.owner != owner else -1.0)
+            return value
+        gated = self.king_shaping_mode == "princess_gated"
         for tower in towers:
-            initial = self._initial_tower_hp.get(tower.entity_id, tower.max_hitpoints)
-            loss = 1.0 - tower.hitpoints / max(1.0, initial)
-            weight = 3.0 if tower.tower_kind == "king" else 1.0
+            loss = self._king_loss(tower)
+            if tower.tower_kind == "king":
+                weight = self.king_potential_weight
+                if gated:
+                    loss = max(0.0, loss - self._king_loss_baseline.get(tower.owner, 0.0))
+            else:
+                weight = 1.0
             value += weight * loss * (1.0 if tower.owner != owner else -1.0)
         return value
 
@@ -4210,6 +4622,7 @@ class BattleEnvV1:
     ) -> dict[int, float]:
         result = {0: 0.0, 1: 0.0}
         gamma = math.exp(-delta_ticks / self.shaping_tau_ticks)
+        self._update_king_loss_baseline(after)
         for owner in self.possible_agents:
             # Potential-based shaping preserves the original win/loss task
             # only when terminal states have zero potential.  Carrying the
@@ -4512,13 +4925,34 @@ class BattleEnvV1:
         private_to = event.data.get("private_to")
         return private_to is None or int(private_to) == owner
 
+    def _cached_event_visible_to(
+        self, event: EventV1, owner: int | None, hidden_entity_ids: frozenset[int] = frozenset()
+    ) -> bool:
+        """``_event_visible_to``, memoized per immutable event and owner.
+
+        Both owners rescan the whole retained event window every observation.
+        The entry holds the event, so its id cannot be reused while cached.
+        """
+
+        if hidden_entity_ids or not (owner is None or type(owner) is int):
+            return self._event_visible_to(event, owner, hidden_entity_ids)
+        key = (id(event), owner)
+        cached = self._event_visibility_cache.get(key)
+        if cached is not None and cached[0] is event:
+            return cached[1]
+        visible = self._event_visible_to(event, owner)
+        if len(self._event_visibility_cache) >= 4 * self.event_limit + 64:
+            self._event_visibility_cache.clear()
+        self._event_visibility_cache[key] = (event, visible)
+        return visible
+
     def _events_for(
         self, owner: int | None, tick: int, hidden_entity_ids: frozenset[int] = frozenset()
     ) -> tuple[EventV1, ...]:
         cutoff = max(0, tick - self.event_window_ticks)
         result: list[EventV1] = []
         for event in self._events:
-            if event.tick < cutoff or not self._event_visible_to(event, owner, hidden_entity_ids):
+            if event.tick < cutoff or not self._cached_event_visible_to(event, owner, hidden_entity_ids):
                 continue
             result.append(event)
         return tuple(result)
@@ -4538,7 +4972,7 @@ class BattleEnvV1:
             counts[event_type] = counts.get(event_type, 0) + int(record["count"])
             last_tick[event_type] = max(last_tick.get(event_type, 0), int(record["last_tick"]))
         for event in self._events:
-            if event.tick >= cutoff or not self._event_visible_to(event, owner, hidden_entity_ids):
+            if event.tick >= cutoff or not self._cached_event_visible_to(event, owner, hidden_entity_ids):
                 continue
             counts[event.event_type] = counts.get(event.event_type, 0) + 1
             last_tick[event.event_type] = max(last_tick.get(event.event_type, 0), event.tick)
@@ -4550,9 +4984,15 @@ class BattleEnvV1:
         }
 
     def _pending_for(self, owner: int | None) -> tuple[PendingActionV1, ...]:
+        # Policy card plays name only the hand slot; the tensorizer joins the
+        # in-flight command to its card token by card identity.
         return tuple(
             PendingActionV1(
-                action=item.action,
+                action=(
+                    replace(item.action, card_id=item.card_id)
+                    if isinstance(item, _PendingRecord) and item.action.card_id is None
+                    else item.action
+                ),
                 requested_tick=self._canonical_tick(item.requested_native_tick),
                 expected_execution_tick=self._canonical_tick(item.expected_native_tick),
                 generated_at_ms=item.generated_at_ms,
@@ -4672,7 +5112,7 @@ class BattleEnvV1:
             events=visible_events,
             opponent_belief=(None if policy_features_only or owner is None else self._belief(owner, tick)),
             action_mask=action_mask,
-            pending_actions=(() if policy_features_only else self._pending_for(owner)),
+            pending_actions=self._pending_for(owner),
             terminal=terminal,
             native_digest=None,
             ruleset_id=None if policy_features_only else self.ruleset_id,

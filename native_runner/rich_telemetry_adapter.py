@@ -10,6 +10,7 @@ is available.
 
 from __future__ import annotations
 
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -898,7 +899,129 @@ def _combat_point(value: object, label: str) -> tuple[int, int] | None:
     return (_integer(parts[0], f"{label}[0]"), _integer(parts[1], f"{label}[1]"))
 
 
+_COMBAT_FACT_FIELDS = frozenset(
+    {
+        "validated",
+        "present",
+        "nativeObjectId",
+        "entityKey",
+        "owner",
+        "objectIndex",
+        "secondaryIndex",
+        "cardId",
+        "objectKind",
+        "position",
+        "visibilityValidated",
+        "invisibleCount",
+    }
+)
+_ABSENT_COMBAT_FACT_IDENTITY = (
+    "nativeObjectId",
+    "entityKey",
+    "owner",
+    "objectIndex",
+    "secondaryIndex",
+    "cardId",
+    "objectKind",
+    "position",
+    "invisibleCount",
+)
+
+
+def _absent_combat_fact(validated: bool) -> RichCombatEntityFact:
+    return RichCombatEntityFact(
+        validated=validated,
+        present=False,
+        native_object_id=None,
+        entity_key=None,
+        owner=None,
+        object_index=None,
+        secondary_index=None,
+        card_id=None,
+        object_kind=None,
+        position=None,
+        visibility_validated=False,
+        invisible_count=None,
+    )
+
+
+# Immutable, so absent relations share one instance per ``validated`` value.
+_ABSENT_COMBAT_FACTS = {False: _absent_combat_fact(False), True: _absent_combat_fact(True)}
+
+
+def _json_combat_fact(value: object) -> RichCombatEntityFact | None:
+    """The exact ``_combat_fact`` result for a plain JSON fact that passes all its
+    checks, else None (callers then take the validating path for its error)."""
+
+    if type(value) is not dict or value.keys() != _COMBAT_FACT_FIELDS:
+        return None
+    validated = value["validated"]
+    present = value["present"]
+    visibility_validated = value["visibilityValidated"]
+    if type(validated) is not bool or type(present) is not bool or type(visibility_validated) is not bool:
+        return None
+    if not present:
+        if visibility_validated or any(value[name] is not None for name in _ABSENT_COMBAT_FACT_IDENTITY):
+            return None
+        return _ABSENT_COMBAT_FACTS[validated]
+    native_object_id = value["nativeObjectId"]
+    entity_key = value["entityKey"]
+    owner = value["owner"]
+    object_index = value["objectIndex"]
+    secondary_index = value["secondaryIndex"]
+    card_id = value["cardId"]
+    object_kind = value["objectKind"]
+    position = value["position"]
+    invisible_count = value["invisibleCount"]
+    if not (
+        validated
+        and type(native_object_id) is int
+        and native_object_id >= 1
+        and type(owner) is int
+        and type(object_index) is int
+        and type(secondary_index) is int
+        and type(card_id) is int
+        and type(object_kind) is int
+        and -1 <= object_kind <= 31
+        and type(entity_key) is list
+        and len(entity_key) == 3
+        and all(type(item) is int for item in entity_key)
+        and type(position) is list
+        and len(position) == 2
+        and type(position[0]) is int
+        and type(position[1]) is int
+        and (
+            (type(invisible_count) is int and invisible_count >= 0)
+            if visibility_validated
+            else invisible_count is None
+        )
+    ):
+        return None
+    key = (entity_key[0], entity_key[1], entity_key[2])
+    if key != _expected_native_entity_key(
+        owner=owner, object_index=object_index, secondary_index=secondary_index, native_object_id=native_object_id
+    ):
+        return None
+    return RichCombatEntityFact(
+        validated=True,
+        present=True,
+        native_object_id=native_object_id,
+        entity_key=key,
+        owner=owner,
+        object_index=object_index,
+        secondary_index=secondary_index,
+        card_id=card_id,
+        object_kind=object_kind,
+        position=(position[0], position[1]),
+        visibility_validated=visibility_validated,
+        invisible_count=invisible_count,
+    )
+
+
 def _combat_fact(value: object, label: str) -> RichCombatEntityFact:
+    fast = _json_combat_fact(value)
+    if fast is not None:
+        return fast
     fact = _record(value, label)
     required = {
         "validated",
@@ -1355,6 +1478,101 @@ _PHASE_EVENT_HOOKS = {
     PhaseHookKind.CLASSIC_CHARGE_READY: 0xF23110,
     PhaseHookKind.DEPLOY_SCALE: 0xF5B3C8,
 }
+_PHASE_EVENT_FIELDS = frozenset(
+    {
+        "sequence",
+        "tick",
+        "kind",
+        "hookOffset",
+        "callerOffset",
+        "entity",
+        "targetBefore",
+        "targetAfter",
+        "buffGlobalId",
+        "buffRemainingMs",
+        "speedMultiplier",
+        "hitSpeedMultiplier",
+        "inputStep",
+        "outputStep",
+        "timelineBefore",
+        "timelineAfter",
+        "classicChargeBefore",
+        "classicChargeAfter",
+        "success",
+    }
+)
+_PHASE_HOOK_KINDS = {kind.value: kind for kind in PhaseHookKind}
+
+
+def _json_optional_integer(value: object, minimum: int | None = None, maximum: int | None = None) -> bool:
+    return value is None or (
+        type(value) is int and (minimum is None or value >= minimum) and (maximum is None or value <= maximum)
+    )
+
+
+def _json_phase_hook_event(value: object, *, sequence: int, observation_tick: int) -> PhaseHookEvent | None:
+    """The exact parsed event for a plain JSON phase record that passes every
+    ``_phase_runtime_events`` check, else None (the validating path then raises)."""
+
+    if type(value) is not dict or value.keys() != _PHASE_EVENT_FIELDS:
+        return None
+    event_tick = value["tick"]
+    kind = _PHASE_HOOK_KINDS.get(value["kind"]) if type(value["kind"]) is str else None
+    hook_offset = value["hookOffset"]
+    success = value["success"]
+    if (
+        type(value["sequence"]) is not int
+        or value["sequence"] != sequence
+        or sequence < 1
+        or type(event_tick) is not int
+        or not 0 <= event_tick <= observation_tick
+        or kind is None
+        or type(hook_offset) is not int
+        or hook_offset != _PHASE_EVENT_HOOKS[kind]
+        or type(success) is not bool
+        or not _json_optional_integer(value["callerOffset"], 1)
+        or not _json_optional_integer(value["buffGlobalId"], 1, 4294967295)
+        or not _json_optional_integer(value["buffRemainingMs"], -1)
+        or not _json_optional_integer(value["speedMultiplier"])
+        or not _json_optional_integer(value["hitSpeedMultiplier"])
+        or not _json_optional_integer(value["inputStep"])
+        or not _json_optional_integer(value["outputStep"], 0)
+        or not _json_optional_integer(value["timelineBefore"], 0)
+        or not _json_optional_integer(value["timelineAfter"], 0)
+        or not _json_optional_integer(value["classicChargeBefore"], -1)
+        or not _json_optional_integer(value["classicChargeAfter"], -1)
+    ):
+        return None
+    entity = _json_combat_fact(value["entity"])
+    before = _json_combat_fact(value["targetBefore"])
+    after = _json_combat_fact(value["targetAfter"])
+    if entity is None or before is None or after is None or not entity.present or entity.entity_key is None:
+        return None
+    try:
+        return PhaseHookEvent(
+            sequence=sequence,
+            tick=event_tick,
+            kind=kind,
+            entity_key=entity.entity_key,
+            target_key=(after.entity_key if after.present else before.entity_key if before.present else None),
+            hook_offset=hook_offset,
+            caller_offset=value["callerOffset"],
+            success=success,
+            buff_global_id=value["buffGlobalId"],
+            buff_remaining_ms=value["buffRemainingMs"],
+            speed_multiplier=value["speedMultiplier"],
+            hit_speed_multiplier=value["hitSpeedMultiplier"],
+            input_step=value["inputStep"],
+            output_step=value["outputStep"],
+            timeline_before=value["timelineBefore"],
+            timeline_after=value["timelineAfter"],
+            classic_charge_before=value["classicChargeBefore"],
+            classic_charge_after=value["classicChargeAfter"],
+            target_present_before=before.present,
+            target_present_after=after.present,
+        )
+    except PhaseRuntimeError:
+        return None
 
 
 def _phase_optional_integer(
@@ -1606,6 +1824,10 @@ def _phase_runtime_events(
     }
     parsed: list[PhaseHookEvent] = []
     for index, value_item in enumerate(raw_events[first_index:], start=first_index):
+        fast = _json_phase_hook_event(value_item, sequence=transmit_from + index, observation_tick=observation_tick)
+        if fast is not None:
+            parsed.append(fast)
+            continue
         label = f"rich.phaseRuntime.events[{index}]"
         raw = _record(value_item, label)
         if set(raw) != event_fields:
@@ -1919,6 +2141,7 @@ def _remaining_runtime_events(
         "completeContext",
     }
     resource_edges = {
+        # (producer hook offset, caller return offset, fixed-point scale)
         "periodic": (0xF3BA4C, 0xF1ACD4, 10_000),
         "death_owner": (0xF3BA4C, 0xF63718, 10_000),
         "death_opponent": (0xF3B3D4, 0xF63834, 1),

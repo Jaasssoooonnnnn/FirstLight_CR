@@ -11,7 +11,7 @@ from ...contracts import ActionKind, ActionV1, TargetKind
 from ...perspective import PerspectiveTransformV1
 from ..replay_archive import TrainingReplayV1
 from .config import ModelConfigV4
-from .decoding import ShadowCandidateLegality
+from .decoding import ShadowCandidateLegality, elixir_multiplier_from_match_scalars
 from .tensors import (
     ActionSequenceV4,
     CANDIDATE_ABILITY,
@@ -161,8 +161,16 @@ def build_expert_action_batch(
     perspectives: Sequence[PerspectiveTransformV1],
     config: ModelConfigV4 | None = None,
     validate: bool = True,
+    delay_aware: bool | None = None,
 ) -> ActionSequenceV4:
-    """Align one five-tick expert window per batch row to candidate UIDs."""
+    """Align one five-tick expert window per batch row to candidate UIDs.
+
+    Elixir legality is checked at the touch tick: an action touched at
+    ``d + k`` is accepted when its candidate is affordable at delay bin ``k``
+    under ``ShadowCandidateLegality``'s delay-aware rule (elixir at ``d`` plus
+    regeneration over ``k`` ticks at the row's match multiplier).
+    ``delay_aware=None`` uses ``decoding.DELAY_AWARE_LEGALITY_DEFAULT``.
+    """
 
     actual = config or ModelConfigV4()
     batch_size = batch.batch_size
@@ -302,13 +310,22 @@ def build_expert_action_batch(
     # Validate compound-action shadow legality before the sequence reaches the
     # loss.  This catches duplicate cards, exclusion groups, elixir, and delay
     # ordering at the producer boundary.
-    shadow = ShadowCandidateLegality(candidates, actual)
+    shadow = ShadowCandidateLegality(
+        candidates,
+        actual,
+        elixir_multiplier=elixir_multiplier_from_match_scalars(batch.match_scalars),
+        delay_aware=delay_aware,
+    )
     for step in range(max_micro):
         active = count > step
         selected = candidate_index[:, step].clamp_min(0).to(candidates.mask.device)
         legal = shadow.candidate_mask()
         if torch.any(active.to(legal.device) & ~legal.gather(1, selected[:, None])[:, 0]):
             raise ExpertActionAlignmentError("expert compound action is illegal under V4 shadow state")
+        selected_delay = delay_offset_bin[:, step].clamp_min(0).to(legal.device)
+        delay_legal = shadow.delay_offset_mask(step=step, candidate_index=selected)
+        if torch.any(active.to(legal.device) & ~delay_legal.gather(1, selected_delay[:, None])[:, 0]):
+            raise ExpertActionAlignmentError("expert action is unaffordable at its touch delay bin")
         selected_mode = candidates.target_mode.to(legal.device).gather(1, selected[:, None])[:, 0]
         grid = active.to(legal.device) & (selected_mode == TARGET_GRID)
         selected_target = target_cell[:, step].to(legal.device)

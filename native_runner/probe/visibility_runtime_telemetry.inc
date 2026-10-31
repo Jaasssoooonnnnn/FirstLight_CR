@@ -191,13 +191,20 @@ struct VisibilityRuntimeRingSlot {
   VisibilityRuntimeRawRecord record;
 };
 
-VisibilityRuntimeRingSlot g_visibility_runtime_ring[kVisibilityRuntimeRingCapacity];
-std::atomic<std::uint64_t> g_visibility_runtime_next_sequence{1};
-std::atomic<std::uint64_t> g_visibility_runtime_epoch_first_sequence{1};
-std::atomic<std::uint64_t> g_visibility_runtime_generation{0};
-std::atomic<std::uint64_t> g_visibility_runtime_state_epoch{0};
-std::atomic<std::uint64_t> g_visibility_runtime_overflow_count{0};
-std::atomic<std::uint64_t> g_visibility_runtime_rejected_count{0};
+// One match's retained visibility ring.  Hooks publish into the bound instance
+// (see MatchTelemetry in cr_replay_probe.cpp).
+struct VisibilityMatchTelemetry {
+  VisibilityRuntimeRingSlot ring[kVisibilityRuntimeRingCapacity];
+  std::atomic<std::uint64_t> next_sequence{1};
+  std::atomic<std::uint64_t> epoch_first_sequence{1};
+  std::atomic<std::uint64_t> generation{0};
+  std::atomic<std::uint64_t> state_epoch{0};
+  std::atomic<std::uint64_t> overflow_count{0};
+  std::atomic<std::uint64_t> rejected_count{0};
+};
+
+VisibilityMatchTelemetry g_visibility_default_match;
+VisibilityMatchTelemetry *g_visibility_match = &g_visibility_default_match;
 std::atomic<bool> g_visibility_runtime_hooks_attested{false};
 std::atomic<bool> g_visibility_runtime_shared_add_hook_bound{false};
 std::atomic<bool> g_visibility_runtime_remove_hook_installed{false};
@@ -230,29 +237,29 @@ std::uintptr_t visibility_expected_caller_offset(VisibilityMutationKind kind) {
 }
 
 void visibility_refresh_epoch(const CombatCaptureContext &context) {
-  if (g_visibility_runtime_generation.load(std::memory_order_acquire) == context.generation &&
-      g_visibility_runtime_state_epoch.load(std::memory_order_acquire) == context.state_epoch) {
+  if (g_visibility_match->generation.load(std::memory_order_acquire) == context.generation &&
+      g_visibility_match->state_epoch.load(std::memory_order_acquire) == context.state_epoch) {
     return;
   }
   if (g_visibility_runtime_epoch_lock.test_and_set(std::memory_order_acquire)) {
-    g_visibility_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+    g_visibility_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  if (g_visibility_runtime_generation.load(std::memory_order_relaxed) != context.generation ||
-      g_visibility_runtime_state_epoch.load(std::memory_order_relaxed) != context.state_epoch) {
-    const std::uint64_t first = g_visibility_runtime_next_sequence.load(std::memory_order_acquire);
-    g_visibility_runtime_generation.store(context.generation, std::memory_order_release);
-    g_visibility_runtime_state_epoch.store(context.state_epoch, std::memory_order_release);
-    g_visibility_runtime_epoch_first_sequence.store(first, std::memory_order_release);
-    g_visibility_runtime_overflow_count.store(0, std::memory_order_release);
-    g_visibility_runtime_rejected_count.store(0, std::memory_order_release);
+  if (g_visibility_match->generation.load(std::memory_order_relaxed) != context.generation ||
+      g_visibility_match->state_epoch.load(std::memory_order_relaxed) != context.state_epoch) {
+    const std::uint64_t first = g_visibility_match->next_sequence.load(std::memory_order_acquire);
+    g_visibility_match->generation.store(context.generation, std::memory_order_release);
+    g_visibility_match->state_epoch.store(context.state_epoch, std::memory_order_release);
+    g_visibility_match->epoch_first_sequence.store(first, std::memory_order_release);
+    g_visibility_match->overflow_count.store(0, std::memory_order_release);
+    g_visibility_match->rejected_count.store(0, std::memory_order_release);
   }
   g_visibility_runtime_epoch_lock.clear(std::memory_order_release);
 }
 
 void visibility_reject_capture(const CombatCaptureContext &context) {
   visibility_refresh_epoch(context);
-  g_visibility_runtime_rejected_count.fetch_add(1, std::memory_order_relaxed);
+  g_visibility_match->rejected_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool visibility_subject_is_committed(const void *subject, void *object_manager, bool *object_vector_valid) {
@@ -282,13 +289,13 @@ std::uint64_t publish_visibility_runtime_record(VisibilityRuntimeRawRecord recor
       record.state_epoch,
       record.tick,
   });
-  const std::uint64_t sequence = g_visibility_runtime_next_sequence.fetch_add(1, std::memory_order_acq_rel);
+  const std::uint64_t sequence = g_visibility_match->next_sequence.fetch_add(1, std::memory_order_acq_rel);
   record.sequence = sequence;
-  const std::uint64_t first = g_visibility_runtime_epoch_first_sequence.load(std::memory_order_acquire);
+  const std::uint64_t first = g_visibility_match->epoch_first_sequence.load(std::memory_order_acquire);
   if (sequence >= first + kVisibilityRuntimeRingCapacity) {
-    g_visibility_runtime_overflow_count.fetch_add(1, std::memory_order_relaxed);
+    g_visibility_match->overflow_count.fetch_add(1, std::memory_order_relaxed);
   }
-  VisibilityRuntimeRingSlot &slot = g_visibility_runtime_ring[(sequence - 1) % kVisibilityRuntimeRingCapacity];
+  VisibilityRuntimeRingSlot &slot = g_visibility_match->ring[(sequence - 1) % kVisibilityRuntimeRingCapacity];
   slot.published_sequence.store(0, std::memory_order_relaxed);
   slot.record = record;
   slot.published_sequence.store(sequence, std::memory_order_release);
@@ -369,16 +376,20 @@ bool append_visibility_runtime_events_json(std::uint64_t generation, std::uint64
   observation_context.tick = observation_tick;
   visibility_refresh_epoch(observation_context);
   const bool transition_installed = g_visibility_runtime_transition_hooks_installed.load(std::memory_order_acquire);
-  const bool identity = g_visibility_runtime_generation.load(std::memory_order_acquire) == generation &&
-                        g_visibility_runtime_state_epoch.load(std::memory_order_acquire) == state_epoch;
-  const std::uint64_t next = g_visibility_runtime_next_sequence.load(std::memory_order_acquire);
+  const bool identity = g_visibility_match->generation.load(std::memory_order_acquire) == generation &&
+                        g_visibility_match->state_epoch.load(std::memory_order_acquire) == state_epoch;
+  const std::uint64_t next = g_visibility_match->next_sequence.load(std::memory_order_acquire);
   const std::uint64_t epoch_first =
-      identity ? g_visibility_runtime_epoch_first_sequence.load(std::memory_order_acquire) : next;
+      identity ? g_visibility_match->epoch_first_sequence.load(std::memory_order_acquire) : next;
   const std::uint64_t retained_oldest =
       next > epoch_first + kVisibilityRuntimeRingCapacity ? next - kVisibilityRuntimeRingCapacity : epoch_first;
-  const std::uint64_t transmit_from = retained_oldest;
-  const std::uint64_t overflow = identity ? g_visibility_runtime_overflow_count.load(std::memory_order_acquire) : 0;
-  const std::uint64_t rejected = identity ? g_visibility_runtime_rejected_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t requested_transmit_from =
+      g_live_capture_delta_active ? g_live_capture_visibility_from_sequence : retained_oldest;
+  const std::uint64_t transmit_from = requested_transmit_from < retained_oldest ? retained_oldest
+                                      : requested_transmit_from > next          ? next
+                                                                                : requested_transmit_from;
+  const std::uint64_t overflow = identity ? g_visibility_match->overflow_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t rejected = identity ? g_visibility_match->rejected_count.load(std::memory_order_acquire) : 0;
   const bool complete = transition_installed && identity && rejected == 0;
   if (!append_json(response, response_size, used,
                    "{\"ok\":true,\"schema\":\"%s\","
@@ -423,7 +434,7 @@ bool append_visibility_runtime_events_json(std::uint64_t generation, std::uint64
   bool first = true;
   if (identity) {
     for (std::uint64_t sequence = transmit_from; sequence < next; ++sequence) {
-      VisibilityRuntimeRingSlot &slot = g_visibility_runtime_ring[(sequence - 1) % kVisibilityRuntimeRingCapacity];
+      VisibilityRuntimeRingSlot &slot = g_visibility_match->ring[(sequence - 1) % kVisibilityRuntimeRingCapacity];
       if (slot.published_sequence.load(std::memory_order_acquire) != sequence) {
         return false;
       }

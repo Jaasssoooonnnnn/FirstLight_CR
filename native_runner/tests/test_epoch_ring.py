@@ -30,7 +30,7 @@ def test_epoch_ring_retention_and_original_wire_contract(tmp_path: Path, source:
     # Tower hash uses the private baseline with online delta mode disabled.
     original_hashes = {
         "test_movement_event_json.cpp": "e5901a3f21a248c3eb68744c619748735b4d968ec5bb801ba3076774812d7429",
-        "test_tower_visibility_json.cpp": "77e66d15adc84552e861c2859049e9e5c6adbe7f222311cc2aa9abd27a6adf15",
+        "test_tower_visibility_json.cpp": "b047d8020ef6590ccac06bf46ee2a40217c4f12888e88cd898986d62c64a9b60",
     }
     if source in original_hashes:
         assert hashlib.sha256(output).hexdigest() == original_hashes[source]

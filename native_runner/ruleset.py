@@ -15,6 +15,7 @@ from .competitive_data import DATA_ROOT, _manifest, load_competitive_data
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -382,6 +383,7 @@ def build_ruleset_manifest(
         "runtime_content_version": (runtime_content_version or effective_ruleset_version),
         "runtime_content_manifest_sha1": runtime_content_manifest_sha1,
         "runtime_libg_build_id": runtime_libg_build_id,
+        "runtime_package_name": os.environ.get("CR_NATIVE_PACKAGE", "nullsroyale.rel.free"),
         "effective_timeline": {
             "game_mode_id": standard_mode_timeline.game_mode_id,
             "game_mode_name": standard_mode_timeline.game_mode_name,

@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
-from ...cr_native_env import NativeClashEnv
+from ...cr_native_env import COMMAND_EXECUTION_DELAY_TICKS, NativeClashEnv
 from ...royaleapi_replay import calibrate_collected_replay_deal, prepare_collected_replay
 from .cache import (
     assert_il_sequences_exact,
@@ -520,7 +520,8 @@ def main() -> None:
     )
     config_payload = json.dumps(asdict(ModelConfigV4()), sort_keys=True, separators=(",", ":")).encode()
     shard_contract: dict[str, object] = {
-        "version": "v4-il-cache-contract.v2",
+        "version": "v4-il-cache-contract.v3",
+        "command_execution_delay_ticks": COMMAND_EXECUTION_DELAY_TICKS,
         "datasets": [_dataset_snapshot(path) for path in dataset_roots],
         "runtime_reports": _runtime_reports(args.runtime_report),
         "source_sha256": _source_hashes(),

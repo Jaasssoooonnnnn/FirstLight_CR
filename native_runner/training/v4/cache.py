@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+import ctypes
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from functools import reduce
 import hashlib
 import json
 import os
 from pathlib import Path
 import struct
-from typing import TYPE_CHECKING, Mapping, Sequence, TypeVar, get_type_hints
+import sys
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence, TypeVar, get_type_hints
 
 import torch
 from torch import Tensor
 
-from .imitation import ILSequenceV4, IL_TIME_FIELDS, collate_il_sequences
+from .config import PENDING_TICKS_REMAINING_FEATURE_INDEX, ModelConfigV4
+from .imitation import IL_ANNOTATION_FIELDS, IL_TIME_FIELDS, ILSequenceV4, collate_il_sequences
 from .tensors import ActionSequenceV4, TARGET_GRID, TensorRecordV4, UniversalSemanticBatchV4, concatenate_tensor_records
 
 if TYPE_CHECKING:
@@ -82,6 +86,26 @@ def _upgrade_legacy_bridge_placement(observations: UniversalSemanticBatchV4) -> 
     runtime = candidates.runtime_features.clone()
     runtime[:, :, 1] = placement.to(runtime.dtype).mean(dim=(-2, -1))
     candidates.runtime_features = runtime
+
+
+def _neutralize_pending_ticks_remaining(observations: UniversalSemanticBatchV4) -> bool:
+    """Zero the own-card ``pending_ticks_remaining_over_20`` column in place.
+
+    Caches built before the feature was neutralised carry the decaying
+    in-flight countdown that live play can never observe.  Returns whether any
+    value changed; an already-zero column is left untouched (no copy).
+    """
+
+    own_cards = observations.own_cards
+    runtime = own_cards.runtime_features
+    if runtime.ndim != 3 or int(runtime.shape[-1]) <= PENDING_TICKS_REMAINING_FEATURE_INDEX:
+        raise ValueError("pending-ticks neutralisation requires own-card runtime features [B,N,F]")
+    if not bool(torch.any(runtime[..., PENDING_TICKS_REMAINING_FEATURE_INDEX] != 0)):
+        return False
+    runtime = runtime.clone()
+    runtime[..., PENDING_TICKS_REMAINING_FEATURE_INDEX] = 0
+    own_cards.runtime_features = runtime
+    return True
 
 
 def _sanitize_legacy_illegal_expert_targets(
@@ -155,6 +179,20 @@ class LoadedILBatchV1:
     owner_frames: int
 
 
+@dataclass(slots=True)
+class ILChunkSequenceV4(ILSequenceV4):
+    """An IL chunk plus its host-side plan (``evaluate_recurrent_sequence`` tail compression).
+
+    ``lane_steps[b]``: lane ``b``'s frames at ``t >= lane_steps[b]`` repeat
+    frame ``lane_steps[b] - 1`` exactly (the chunk ran past the lane's end).
+    ``mid_chunk_reset``: ``episode_start[1:].any()`` computed on the host
+    (``None`` = unknown, check on the device).
+    """
+
+    lane_steps: tuple[int, ...] | None = None
+    mid_chunk_reset: bool | None = None
+
+
 _RecordT = TypeVar("_RecordT", bound=TensorRecordV4)
 
 
@@ -187,7 +225,7 @@ def _restore_record(record_type: type[_RecordT], *, prefix: str, tensors: Mappin
     return record_type(**values)
 
 
-def _pad_dim_one(value: Tensor, target: int, padding_value: object) -> Tensor:
+def _pad_dim_one(value: Tensor, target: int, padding_value: object, *, pin_memory: bool = False) -> Tensor:
     """Pad a batch-size-one tensor's variable row dimension canonically."""
 
     if value.ndim < 2:
@@ -199,7 +237,7 @@ def _pad_dim_one(value: Tensor, target: int, padding_value: object) -> Tensor:
         return value
     shape = list(value.shape)
     shape[1] = target
-    padded = torch.full(shape, padding_value, dtype=value.dtype, device=value.device)
+    padded = torch.full(shape, padding_value, dtype=value.dtype, device=value.device, pin_memory=pin_memory)
     padded[:, :current] = value
     return padded
 
@@ -248,6 +286,94 @@ def _pad_dynamic_observation(
             for name, count in zip(_DYNAMIC_COUNTS, counts, strict=True)
         },
     )
+
+
+def _pad_dim_one_concatenated(values: tuple[Tensor, ...], target: int, padding_value: object) -> Tensor:
+    """``torch.cat`` of ``_pad_dim_one`` over ``values``, padding once per shard.
+
+    Frames of equal row width are concatenated together and written into one
+    canonically padded tensor instead of materializing a padded copy per frame.
+    Anything ``torch.cat`` would promote or reject takes the per-frame path.
+    """
+
+    first = values[0]
+    if (
+        not isinstance(first, Tensor)
+        or first.ndim < 2
+        or not all(
+            isinstance(value, Tensor)
+            and value.dtype == first.dtype
+            and value.device == first.device
+            and value.ndim == first.ndim
+            and value.shape[2:] == first.shape[2:]
+            and int(value.shape[1]) <= target
+            for value in values
+        )
+    ):
+        return torch.cat([_pad_dim_one(value, target, padding_value) for value in values], dim=0)
+    rows_by_width: dict[int, tuple[list[Tensor], list[int]]] = {}
+    row = 0
+    for value in values:
+        count = int(value.shape[0])
+        width = int(value.shape[1])
+        if width:
+            tensors, rows = rows_by_width.setdefault(width, ([], []))
+            tensors.append(value)
+            rows.extend(range(row, row + count))
+        row += count
+    output = torch.full((row, target, *first.shape[2:]), padding_value, dtype=first.dtype, device=first.device)
+    for width, (tensors, rows) in rows_by_width.items():
+        output[torch.tensor(rows, dtype=torch.long, device=first.device), :width] = torch.cat(tensors, dim=0)
+    return output
+
+
+def _concatenate_padded_observations(
+    observations: tuple[UniversalSemanticBatchV4, ...],
+    *,
+    active_effect_count: int,
+    relation_edge_count: int,
+    candidate_count: int,
+) -> UniversalSemanticBatchV4:
+    """``concatenate_tensor_records`` of each frame's ``_pad_dynamic_observation``."""
+
+    counts = dict(zip(_DYNAMIC_COUNTS, (active_effect_count, relation_edge_count, candidate_count), strict=True))
+    first = observations[0]
+    if not is_dataclass(first) or not all(type(observation) is type(first) for observation in observations):
+        return concatenate_tensor_records(
+            tuple(
+                _pad_dynamic_observation(
+                    observation,
+                    active_effect_count=active_effect_count,
+                    relation_edge_count=relation_edge_count,
+                    candidate_count=candidate_count,
+                )
+                for observation in observations
+            )
+        )
+    values: dict[str, object] = {}
+    for item in fields(first):
+        children = tuple(getattr(observation, item.name) for observation in observations)
+        target = counts.get(item.name)
+        if target is None:
+            values[item.name] = concatenate_tensor_records(children)
+            continue
+        collection = children[0]
+        if not all(type(child) is type(collection) for child in children):
+            raise TypeError("cannot concatenate different V4 record types")
+        values[item.name] = type(collection)(
+            **{
+                field.name: (
+                    concatenate_tensor_records(tensors)
+                    if field.name == "elixir"
+                    else _pad_dim_one_concatenated(
+                        tensors, target, -1 if field.name in _NEGATIVE_PADDING_FIELDS else 0
+                    )
+                )
+                for field in fields(collection)
+                for tensors in (tuple(getattr(child, field.name) for child in children),)
+            }
+        )
+    return type(first)(**values)
 
 
 def _narrow_dim_one(value: _RecordT, length: int) -> _RecordT:
@@ -404,16 +530,11 @@ def write_il_cache_shard(
     active_effect_capacity = max(active_effect_counts)
     relation_edge_capacity = max(relation_edge_counts)
     candidate_capacity = max(candidate_counts)
-    packed_observations = concatenate_tensor_records(
-        tuple(
-            _pad_dynamic_observation(
-                observation,
-                active_effect_count=active_effect_capacity,
-                relation_edge_count=relation_edge_capacity,
-                candidate_count=candidate_capacity,
-            )
-            for observation in observations
-        )
+    packed_observations = _concatenate_padded_observations(
+        observations,
+        active_effect_count=active_effect_capacity,
+        relation_edge_count=relation_edge_capacity,
+        candidate_count=candidate_capacity,
     )
     packed_actions = concatenate_tensor_records(tuple(action for sequence in sequences for action in sequence.actions))
     if not isinstance(packed_observations, UniversalSemanticBatchV4):
@@ -520,7 +641,9 @@ class ILCacheShardV1:
         manifest: Mapping[str, object],
         tensors: Mapping[str, Tensor],
         summary: Mapping[str, object],
+        config: ModelConfigV4 | None = None,
     ) -> None:
+        self.config = ModelConfigV4() if config is None else config
         raw_descriptors = manifest.get("sequences")
         if not isinstance(raw_descriptors, list):
             raise ValueError("cache manifest has no sequence descriptors")
@@ -540,6 +663,11 @@ class ILCacheShardV1:
         if self.legacy_pocket_migration:
             _upgrade_legacy_pocket_placement(self.observations)
             _upgrade_legacy_bridge_placement(self.observations)
+        # Both ``sequence`` and ``load_batch`` read from ``self.observations``,
+        # so zeroing once here covers every cached-observation consumer.
+        self.pending_ticks_neutralized = bool(self.config.neutralize_pending_ticks_remaining) and (
+            _neutralize_pending_ticks_remaining(self.observations)
+        )
         for name in (
             *IL_TIME_FIELDS,
             "sequence_offsets",
@@ -626,15 +754,10 @@ class ILCacheShardV1:
             natural_time=descriptor.natural_time,
         )
 
-    def load_batch(
-        self,
-        references: Sequence[ILCacheChunkRefV1],
-        *,
-        time_steps: int,
-        device: torch.device | str | None = None,
-        model_float_dtype: torch.dtype = torch.float32,
-    ) -> LoadedILBatchV1:
-        """Materialize one time-major recurrent batch with one tensor gather."""
+    def _chunk_gather(
+        self, references: Sequence[ILCacheChunkRefV1], *, time_steps: int
+    ) -> tuple[Tensor, Tensor, list[ILCacheSequenceDescriptorV1], list[int]]:
+        """Time-major ``[T*B]`` frame indices (short chunks repeat their last frame) and the ``[T,B]`` mask."""
 
         if not references or time_steps <= 0:
             raise ValueError("cache batch needs references and positive time steps")
@@ -653,17 +776,19 @@ class ILCacheShardV1:
             base_offsets.append(descriptor.offset + reference.start)
             valid_steps.append(reference.steps)
             selected_descriptors.append(descriptor)
-        batch_size = len(references)
         bases = torch.tensor(base_offsets, dtype=torch.long)
         steps = torch.arange(time_steps, dtype=torch.long)[:, None]
         available = torch.tensor(valid_steps, dtype=torch.long)[None, :]
         local_steps = torch.minimum(steps, available - 1)
         indices = (bases[None, :] + local_steps).reshape(-1)
         padding_mask = steps < available
+        return indices, padding_mask, selected_descriptors, valid_steps
 
-        observations = self.observations.index_select(indices)
-        actions = self.actions.index_select(indices)
-        time_tensors = {}
+    def _chunk_time_fields(
+        self, indices: Tensor, padding_mask: Tensor, selected_descriptors: Sequence[ILCacheSequenceDescriptorV1]
+    ) -> dict[str, Tensor | None]:
+        time_steps, batch_size = (int(size) for size in padding_mask.shape)
+        time_tensors: dict[str, Tensor | None] = {}
         for name in IL_TIME_FIELDS:
             value = getattr(self, name).index_select(0, indices).reshape(time_steps, batch_size)
             value = (
@@ -673,6 +798,25 @@ class ILCacheShardV1:
                 getattr(item, f"{name}_present") for item in selected_descriptors
             ):
                 value = None
+            time_tensors[name] = value
+        return time_tensors
+
+    def load_batch(
+        self,
+        references: Sequence[ILCacheChunkRefV1],
+        *,
+        time_steps: int,
+        device: torch.device | str | None = None,
+        model_float_dtype: torch.dtype = torch.float32,
+    ) -> LoadedILBatchV1:
+        """Materialize one time-major recurrent batch with one tensor gather."""
+
+        indices, padding_mask, selected_descriptors, valid_steps = self._chunk_gather(references, time_steps=time_steps)
+        batch_size = len(references)
+        observations = self.observations.index_select(indices)
+        actions = self.actions.index_select(indices)
+        time_tensors = {}
+        for name, value in self._chunk_time_fields(indices, padding_mask, selected_descriptors).items():
             time_tensors[name] = value if device is None or value is None else value.to(device)
         if device is not None:
             observations = observations.to_model_input(device, float_dtype=model_float_dtype)
@@ -688,14 +832,204 @@ class ILCacheShardV1:
         return LoadedILBatchV1(sequence=sequence, owner_frames=sum(valid_steps))
 
 
-def load_il_cache_shard(summary_path: str | Path, *, verify: bool = True) -> ILCacheShardV1:
-    """Verify, decompress, and load one shard into CPU memory."""
+# Inflate straight into the destination buffer in slices this large, hashing
+# each slice while it is still cache-hot.  Every zstd/SHA-256 call releases the
+# GIL, so the Python loop around them holds it for microseconds per slice.
+_INFLATE_SLICE_BYTES = 16 << 20
+# Tensor data starts on this boundary inside the shard buffer so every dtype
+# view is aligned (safetensors itself aligns tensor offsets per dtype).
+_PAYLOAD_ALIGNMENT = 64
+_SAFETENSORS_DTYPES: dict[str, torch.dtype] = {
+    name: dtype
+    for name, dtype in (
+        ("F64", torch.float64),
+        ("F32", torch.float32),
+        ("F16", torch.float16),
+        ("BF16", torch.bfloat16),
+        ("I64", torch.int64),
+        ("I32", torch.int32),
+        ("I16", torch.int16),
+        ("I8", torch.int8),
+        ("U8", torch.uint8),
+        ("BOOL", torch.bool),
+        ("U16", getattr(torch, "uint16", None)),
+        ("U32", getattr(torch, "uint32", None)),
+        ("U64", getattr(torch, "uint64", None)),
+        ("F8_E4M3", getattr(torch, "float8_e4m3fn", None)),
+        ("F8_E5M2", getattr(torch, "float8_e5m2", None)),
+    )
+    if dtype is not None
+}
+SHARD_LOAD_MODES = ("process", "thread")
+
+
+def _read_exact(reader: object, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = getattr(reader, "read")(remaining)
+        if not chunk:
+            raise ValueError("cache container is truncated before its manifest")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _byte_view(buffer: Tensor) -> memoryview:
+    """A writable memoryview over a contiguous CPU uint8 tensor (caller keeps ``buffer`` alive)."""
+
+    size = int(buffer.numel())
+    if size == 0:
+        return memoryview(bytearray())
+    return memoryview((ctypes.c_ubyte * size).from_address(buffer.data_ptr())).cast("B")
+
+
+def _private_buffer(size: int) -> Tensor:
+    return torch.empty(size, dtype=torch.uint8)
+
+
+def _shared_buffer(size: int) -> Tensor:
+    """A uint8 tensor allocated directly in shared memory (no copy when sent to another process)."""
+
+    storage = torch.UntypedStorage._new_shared(size)
+    return torch.empty(0, dtype=torch.uint8).set_(storage, 0, (size,), (1,))
+
+
+def _payload_data_offset(compressed: bytes, container_bytes: int) -> int | None:
+    """Container offset of the first tensor byte, read from the first few KiB of the stream.
+
+    Only used to align the destination buffer; any problem here returns
+    ``None`` and the full, verified parse reports it with the usual error.
+    """
 
     try:
         import zstandard
-        from safetensors.torch import load as load_safetensors
+
+        with zstandard.ZstdDecompressor().stream_reader(compressed) as reader:
+            magic, manifest_length = _CONTAINER_HEADER.unpack(_read_exact(reader, _CONTAINER_HEADER.size))
+            if magic != _CONTAINER_MAGIC or manifest_length >= container_bytes:
+                return None
+            _read_exact(reader, manifest_length)
+            (header_length,) = struct.unpack("<Q", _read_exact(reader, 8))
+    except Exception:  # noqa: BLE001 - alignment hint only
+        return None
+    offset = _CONTAINER_HEADER.size + manifest_length + 8 + header_length
+    return offset if offset <= container_bytes else None
+
+
+def _inflate_into(compressed: bytes, destination: memoryview, hasher: object | None) -> None:
+    import zstandard
+
+    size = len(destination)
+    position = 0
+    with zstandard.ZstdDecompressor().stream_reader(compressed) as reader:
+        while position < size:
+            count = reader.readinto(destination[position : min(size, position + _INFLATE_SLICE_BYTES)])
+            if not count:
+                break
+            if hasher is not None:
+                getattr(hasher, "update")(destination[position : position + count])
+            position += count
+        if position != size or reader.read(1):
+            raise ValueError("cache container byte count mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class _ILCacheTensorSpec:
+    name: str
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    offset: int  # absolute byte offset inside the shard buffer
+    nbytes: int
+
+
+def _safetensors_specs(container: memoryview, start: int, base: int) -> tuple[_ILCacheTensorSpec, ...]:
+    """Validate a safetensors payload at ``container[start:]`` like ``safetensors.deserialize``."""
+
+    total = len(container)
+    if total - start < 8:
+        raise ValueError("cache safetensors payload is truncated")
+    (header_length,) = struct.unpack_from("<Q", container, start)
+    data_start = start + 8 + header_length
+    if data_start > total:
+        raise ValueError("cache safetensors header length is invalid")
+    header = json.loads(bytes(container[start + 8 : data_start]))
+    if not isinstance(header, dict):
+        raise ValueError("cache safetensors header is not an object")
+    specs: list[_ILCacheTensorSpec] = []
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(info, dict):
+            raise ValueError(f"cache safetensors entry {name!r} is invalid")
+        dtype = _SAFETENSORS_DTYPES.get(str(info.get("dtype")))
+        if dtype is None:
+            raise ValueError(f"cache safetensors entry {name!r} has unsupported dtype {info.get('dtype')!r}")
+        shape = tuple(int(item) for item in info["shape"])
+        begin, end = (int(item) for item in info["data_offsets"])
+        numel = reduce(lambda left, right: left * right, shape, 1)
+        if begin < 0 or end < begin or end - begin != numel * dtype.itemsize:
+            raise ValueError(f"cache safetensors entry {name!r} has invalid offsets")
+        specs.append(_ILCacheTensorSpec(name, dtype, shape, base + data_start + begin, end - begin))
+    expected = 0
+    for spec in sorted(specs, key=lambda item: item.offset):
+        if spec.offset - base - data_start != expected:
+            raise ValueError("cache safetensors tensors are not contiguous")
+        expected += spec.nbytes
+    if data_start + expected != total:
+        raise ValueError("cache safetensors data length mismatch")
+    return tuple(specs)
+
+
+def _tensor_from_spec(buffer: Tensor, spec: _ILCacheTensorSpec) -> Tensor:
+    if spec.nbytes == 0:
+        return torch.empty(spec.shape, dtype=spec.dtype)
+    view = buffer.narrow(0, spec.offset, spec.nbytes)
+    if spec.offset % spec.dtype.itemsize:
+        view = view.clone()  # unaligned writer: copy once into an aligned allocation
+    return view.view(spec.dtype).view(spec.shape)
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodedILCacheShard:
+    """A verified shard whose tensors all live in one aligned ``uint8`` buffer.
+
+    This is what a loader process returns: one buffer (one shared-memory
+    segment, one fd under the ``file_descriptor`` strategy) plus metadata.
+    """
+
+    data_path: str
+    summary: dict[str, object]
+    manifest: dict[str, object]
+    buffer: Tensor
+    specs: tuple[_ILCacheTensorSpec, ...]
+
+    def build(self, config: ModelConfigV4 | None = None) -> ILCacheShardV1:
+        tensors = {spec.name: _tensor_from_spec(self.buffer, spec) for spec in self.specs}
+        return ILCacheShardV1(
+            path=Path(self.data_path), manifest=self.manifest, tensors=tensors, summary=self.summary, config=config
+        )
+
+
+def _decode_il_cache_shard(
+    summary_path: str | Path, *, verify: bool, allocate: Callable[[int], Tensor] = _private_buffer
+) -> _DecodedILCacheShard:
+    """Verify and inflate one shard without materialising Python ``bytes`` of its payload.
+
+    Same checks, order and error messages as the original reader (inflate to
+    ``bytes``, slice, ``safetensors.torch.load``), whose slice copy and
+    per-tensor ``bytes`` objects held the GIL for ~0.6 s per 1.8 GB shard.
+    Here zstd writes straight into ``allocate``'s buffer and SHA-256 runs over
+    it slice by slice, both with the GIL released, and every tensor is a view
+    into that buffer.  Tensor bytes are identical.
+    """
+
+    try:
+        import zstandard  # noqa: F401
     except ImportError as error:
         raise RuntimeError("V4 IL caching requires safetensors and zstandard") from error
+    if sys.byteorder != "little":
+        raise RuntimeError("V4 IL cache loading requires a little-endian host")
 
     summary_file = Path(summary_path)
     summary = json.loads(summary_file.read_text(encoding="utf-8"))
@@ -708,11 +1042,15 @@ def load_il_cache_shard(summary_path: str | Path, *, verify: bool = True) -> ILC
     compressed = data_path.read_bytes()
     if verify and _sha256(compressed) != summary.get("compressed_sha256"):
         raise ValueError("cache compressed SHA-256 mismatch")
-    decompressor = zstandard.ZstdDecompressor()
-    container = decompressor.decompress(compressed, max_output_size=int(summary["container_bytes"]))
-    if len(container) != int(summary["container_bytes"]):
-        raise ValueError("cache container byte count mismatch")
-    if verify and _sha256(container) != summary.get("container_sha256"):
+    container_bytes = int(summary["container_bytes"])
+    data_offset = _payload_data_offset(compressed, container_bytes)
+    pad = 0 if data_offset is None else -data_offset % _PAYLOAD_ALIGNMENT
+    buffer = allocate(pad + container_bytes)
+    container = _byte_view(buffer)[pad:]
+    hasher = hashlib.sha256() if verify else None
+    _inflate_into(compressed, container, hasher)
+    del compressed
+    if hasher is not None and hasher.hexdigest() != summary.get("container_sha256"):
         raise ValueError("cache container SHA-256 mismatch")
     if len(container) < _CONTAINER_HEADER.size:
         raise ValueError("cache container is truncated")
@@ -723,27 +1061,161 @@ def load_il_cache_shard(summary_path: str | Path, *, verify: bool = True) -> ILC
     manifest_end = manifest_start + manifest_length
     if manifest_end >= len(container):
         raise ValueError("cache manifest length is invalid")
-    manifest = json.loads(container[manifest_start:manifest_end])
+    manifest = json.loads(bytes(container[manifest_start:manifest_end]))
     if not isinstance(manifest, dict) or manifest.get("schema") != IL_CACHE_SHARD_SCHEMA:
         raise ValueError("unsupported V4 IL cache shard")
-    tensors = load_safetensors(container[manifest_end:])
-    return ILCacheShardV1(path=data_path, manifest=manifest, tensors=tensors, summary=summary)
+    specs = _safetensors_specs(container, manifest_end, pad)
+    return _DecodedILCacheShard(
+        data_path=str(data_path), summary=summary, manifest=manifest, buffer=buffer, specs=specs
+    )
+
+
+def load_il_cache_shard(
+    summary_path: str | Path, *, verify: bool = True, config: ModelConfigV4 | None = None
+) -> ILCacheShardV1:
+    """Verify, decompress, and load one shard into CPU memory.
+
+    ``config`` (default ``ModelConfigV4()``) selects observation-contract
+    migrations applied on load, e.g. ``neutralize_pending_ticks_remaining``.
+    The heavy work (zstd, SHA-256) runs with the GIL released and no payload
+    copy is made, so a background thread loading shards barely contends with
+    the training thread.
+    """
+
+    return _decode_il_cache_shard(summary_path, verify=verify).build(config)
+
+
+def _default_sharing_strategy() -> str:
+    """``file_descriptor`` where available and the fd limit is sane, else ``file_system``.
+
+    Each loaded shard is one shared-memory segment, so the descriptor strategy
+    needs one fd per resident shard in this process (plus one transient dup
+    per shard in flight).  A soft ``RLIMIT_NOFILE`` below 4096 is raised toward
+    the hard limit; below 1024 after that, ``file_system`` is used instead.
+    """
+
+    strategies = torch.multiprocessing.get_all_sharing_strategies()
+    if "file_descriptor" not in strategies:
+        return torch.multiprocessing.get_sharing_strategy()
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        wanted = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+        if soft != resource.RLIM_INFINITY and soft < wanted:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+            soft = wanted
+        if soft != resource.RLIM_INFINITY and soft < 1024:
+            return "file_system"
+    except (ImportError, OSError, ValueError):
+        return "file_system"
+    return "file_descriptor"
+
+
+def shared_memory_free_bytes() -> int | None:
+    """Free bytes of ``/dev/shm`` (where both torch sharing strategies allocate); ``None`` if unknown."""
+
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        stats = os.statvfs("/dev/shm")
+    except OSError:
+        return None
+    return int(stats.f_bavail) * int(stats.f_frsize)
+
+
+def _loader_process_init(sharing_strategy: str) -> None:
+    torch.multiprocessing.set_sharing_strategy(sharing_strategy)
+    torch.set_num_threads(1)
+
+
+def _loader_process_ready() -> int:
+    return os.getpid()
+
+
+def _decode_il_cache_shard_shared(summary_path: str, verify: bool) -> _DecodedILCacheShard:
+    return _decode_il_cache_shard(summary_path, verify=verify, allocate=_shared_buffer)
+
+
+class ILCacheProcessLoader:
+    """Decode shards in spawned worker processes into shared memory.
+
+    Workers verify SHA-256 and inflate exactly like ``load_il_cache_shard``,
+    but into a shared-memory buffer that reaches this process without a copy;
+    only the ``ILCacheShardV1`` construction (tensor views) runs here, so no
+    shard-loading work competes for this interpreter's GIL.  ``spawn`` keeps
+    CUDA/NCCL state out of the workers; they start lazily (or via ``warm``)
+    and live until ``close``.
+    """
+
+    def __init__(self, workers: int, *, sharing_strategy: str | None = None, start_method: str = "spawn") -> None:
+        if workers <= 0:
+            raise ValueError("cache loader processes must be positive")
+        self.workers = workers
+        self.sharing_strategy = sharing_strategy or _default_sharing_strategy()
+        self.start_method = start_method
+        self._executor = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=torch.multiprocessing.get_context(start_method),
+            initializer=_loader_process_init,
+            initargs=(self.sharing_strategy,),
+        )
+
+    def warm(self, timeout: float | None = 300.0) -> int:
+        """Start every worker and wait until each answers; returns the distinct worker count."""
+
+        futures = [self._executor.submit(_loader_process_ready) for _ in range(self.workers)]
+        return len({future.result(timeout=timeout) for future in futures})
+
+    def submit(self, summary_path: str | Path, *, verify: bool = True) -> Future[_DecodedILCacheShard]:
+        return self._executor.submit(_decode_il_cache_shard_shared, str(summary_path), verify)
+
+    def load(
+        self, summary_paths: Sequence[str | Path], *, verify: bool = True, config: ModelConfigV4 | None = None
+    ) -> tuple[ILCacheShardV1, ...]:
+        futures = [self.submit(path, verify=verify) for path in summary_paths]
+        try:
+            return tuple(future.result().build(config) for future in futures)
+        finally:
+            for future in futures:
+                future.cancel()
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> ILCacheProcessLoader:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 def load_il_cache_shards(
-    summary_paths: Sequence[str | Path], *, verify: bool = True, workers: int = 1
+    summary_paths: Sequence[str | Path],
+    *,
+    verify: bool = True,
+    workers: int = 1,
+    config: ModelConfigV4 | None = None,
+    process_loader: ILCacheProcessLoader | None = None,
 ) -> tuple[ILCacheShardV1, ...]:
-    """Load independent shards in input order, optionally in parallel."""
+    """Load independent shards in input order, optionally in parallel.
+
+    With ``process_loader`` the shards are decoded by its worker processes
+    (whose pool size then bounds the parallelism); otherwise by up to
+    ``workers`` threads of this process.  Both give byte-identical tensors.
+    """
 
     paths = tuple(summary_paths)
     if not paths:
         raise ValueError("cache shard loading needs at least one summary")
     if workers <= 0:
         raise ValueError("cache shard loading workers must be positive")
+    if process_loader is not None:
+        return process_loader.load(paths, verify=verify, config=config)
     if workers == 1 or len(paths) == 1:
-        return tuple(load_il_cache_shard(path, verify=verify) for path in paths)
+        return tuple(load_il_cache_shard(path, verify=verify, config=config) for path in paths)
     with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as executor:
-        return tuple(executor.map(lambda path: load_il_cache_shard(path, verify=verify), paths))
+        return tuple(executor.map(lambda path: load_il_cache_shard(path, verify=verify, config=config), paths))
 
 
 def load_il_cache_manifest(summary_path: str | Path) -> dict[str, object]:
@@ -768,25 +1240,14 @@ def load_il_cache_manifest(summary_path: str | Path) -> dict[str, object]:
     if not isinstance(data_name, str) or Path(data_name).name != data_name:
         raise ValueError("cache summary data file must be a local basename")
 
-    def read_exact(reader: object, size: int) -> bytes:
-        chunks: list[bytes] = []
-        remaining = size
-        while remaining:
-            chunk = getattr(reader, "read")(remaining)
-            if not chunk:
-                raise ValueError("cache container is truncated before its manifest")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
     data_path = summary_file.parent / data_name
     with data_path.open("rb") as source:
         with zstandard.ZstdDecompressor().stream_reader(source) as reader:
-            header = read_exact(reader, _CONTAINER_HEADER.size)
+            header = _read_exact(reader, _CONTAINER_HEADER.size)
             magic, manifest_length = _CONTAINER_HEADER.unpack(header)
             if magic != _CONTAINER_MAGIC or manifest_length <= 0:
                 raise ValueError("cache container header is invalid")
-            manifest = json.loads(read_exact(reader, manifest_length))
+            manifest = json.loads(_read_exact(reader, manifest_length))
     if not isinstance(manifest, dict) or manifest.get("schema") != IL_CACHE_SHARD_SCHEMA:
         raise ValueError("unsupported V4 IL cache shard")
     return manifest
@@ -811,6 +1272,270 @@ def collate_loaded_il_batches(
     if device is not None:
         sequence = sequence.to(device)
     return LoadedILBatchV1(sequence=sequence, owner_frames=sum(batch.owner_frames for batch in batches))
+
+
+_IL_CHUNK_TENSOR_FIELDS = IL_TIME_FIELDS + IL_ANNOTATION_FIELDS
+
+
+def _map_record_tensors(value: _RecordT, transform: Callable[[Tensor], Tensor]) -> _RecordT:
+    return type(value)(
+        **{
+            item.name: transform(child) if isinstance(child, Tensor) else _map_record_tensors(child, transform)
+            for item in fields(value)
+            for child in (getattr(value, item.name),)
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CollatedILChunkV1:
+    """One cross-shard ``[T,B]`` chunk held as flat time-major ``[T*B]`` records.
+
+    ``sequence()`` returns the ``ILSequenceV4`` whose per-step records are
+    zero-copy views of these records, so moving a chunk to a device costs one
+    copy per field instead of one per field and time step.
+    """
+
+    observations: UniversalSemanticBatchV4
+    actions: ActionSequenceV4
+    time_fields: Mapping[str, Tensor | None]
+    time_steps: int
+    batch_size: int
+    sequence_id: str
+    natural_time: bool
+    owner_frames: int
+    # Host-side chunk plan: per-lane distinct leading frames (``ref.steps``;
+    # later frames repeat the last one) and ``episode_start[1:].any()``.
+    lane_steps: tuple[int, ...] = ()
+    mid_chunk_reset: bool | None = None
+
+    def sequence(self, *, plan: bool = False) -> ILSequenceV4:
+        """The chunk as an ``ILSequenceV4``; ``plan=True`` returns an ``ILChunkSequenceV4`` carrying the host plan."""
+
+        batch_size = self.batch_size
+        observations = tuple(
+            self.observations.narrow_batch(step * batch_size, batch_size) for step in range(self.time_steps)
+        )
+        actions = tuple(self.actions.narrow_batch(step * batch_size, batch_size) for step in range(self.time_steps))
+        if plan:
+            return ILChunkSequenceV4(
+                observations=observations,
+                actions=actions,
+                **self.time_fields,
+                sequence_id=self.sequence_id,
+                natural_time=self.natural_time,
+                lane_steps=self.lane_steps if len(self.lane_steps) == batch_size else None,
+                mid_chunk_reset=self.mid_chunk_reset,
+            )
+        return ILSequenceV4(
+            observations=observations,
+            actions=actions,
+            **self.time_fields,
+            sequence_id=self.sequence_id,
+            natural_time=self.natural_time,
+        )
+
+    def tensors(self) -> tuple[Tensor, ...]:
+        return (
+            *(tensor for _name, tensor in _record_tensor_items(self.observations)),
+            *(tensor for _name, tensor in _record_tensor_items(self.actions)),
+            *(tensor for tensor in self.time_fields.values() if tensor is not None),
+        )
+
+    def to_model_input(
+        self, device: torch.device | str, *, float_dtype: torch.dtype = torch.float32, non_blocking: bool = False
+    ) -> CollatedILChunkV1:
+        """Field-for-field equal to ``sequence().to(device)``.
+
+        Floating observations cross in their storage dtype and are widened on
+        the destination (an exact conversion), so a pinned chunk moves
+        asynchronously at storage width.
+        """
+
+        if not float_dtype.is_floating_point:
+            raise ValueError("V4 model input dtype must be floating point")
+
+        def observation(item: Tensor) -> Tensor:
+            moved = item.to(device, non_blocking=non_blocking)
+            return moved.to(float_dtype) if moved.is_floating_point() else moved
+
+        def plain(item: Tensor) -> Tensor:
+            return item.to(device, non_blocking=non_blocking)
+
+        return replace(
+            self,
+            observations=_map_record_tensors(self.observations, observation),
+            actions=_map_record_tensors(self.actions, plain),
+            time_fields={name: None if value is None else plain(value) for name, value in self.time_fields.items()},
+        )
+
+
+def _gather_rows(source: Tensor, indices: Tensor, *, pin_memory: bool) -> Tensor:
+    if not pin_memory:
+        return source.index_select(0, indices)
+    output = torch.empty((int(indices.numel()), *source.shape[1:]), dtype=source.dtype, pin_memory=True)
+    return torch.index_select(source, 0, indices, out=output)
+
+
+# Observation collections whose padded rows can be cut, and the mask bounding
+# each field's row dimension.  Not trimmed: opponent cards (positional slots),
+# towers/own cards/previous actions (fixed widths) and candidates: the
+# decoder's shadow features average ``used_candidate``/``legal`` over the
+# candidate dimension (``ShadowCandidateLegality.shadow_features``), so the
+# candidate width itself is a model input.
+_TRIMMABLE_COLLECTIONS = ("groups", "active_effects", "events", "relation_edges")
+
+
+def _trim_mask_name(collection: str, field: str) -> str | None:
+    if collection not in _TRIMMABLE_COLLECTIONS or field == "elixir":
+        return None
+    return "child_mask" if collection == "groups" and field.startswith("child_") else "mask"
+
+
+def _trimmed_widths(
+    shards: Sequence[ILCacheShardV1], gathers: Sequence[tuple[Tensor, Tensor, object, object]]
+) -> dict[tuple[str, str], int]:
+    """Per ``(collection, mask)``: 1 + the last row any gathered frame uses (at least 1).
+
+    Every model input past that row is canonical padding behind a false mask
+    in every frame of the chunk, so slicing it off leaves every masked
+    reduction, gather address (rows are referenced only below a set mask bit)
+    and token address (groups are the last token block) unchanged.
+    """
+
+    widths: dict[tuple[str, str], int] = {}
+    for collection in _TRIMMABLE_COLLECTIONS:
+        for mask_name in ("mask", "child_mask") if collection == "groups" else ("mask",):
+            width = 0
+            for shard, (indices, *_rest) in zip(shards, gathers, strict=True):
+                used = getattr(getattr(shard.observations, collection), mask_name).index_select(0, indices).any(dim=0)
+                rows = used.nonzero()
+                if rows.numel():
+                    width = max(width, int(rows[-1, 0]) + 1)
+            widths[(collection, mask_name)] = max(1, width)
+    return widths
+
+
+def collate_il_cache_chunk(
+    shards: Sequence[ILCacheShardV1],
+    references: Sequence[Sequence[ILCacheChunkRefV1]],
+    *,
+    time_steps: int,
+    pin_memory: bool = False,
+    trim_padding: bool = False,
+) -> CollatedILChunkV1:
+    """``collate_loaded_il_batches`` of each shard's ``load_batch``, one gather per field.
+
+    Every field is gathered once per shard and joined lane-wise into one
+    time-major ``[T*B]`` tensor, instead of padding and concatenating every
+    time step of every shard.  Values, dtypes, shapes, lane order and metadata
+    match the two-stage path exactly.  ``pin_memory`` allocates the joined
+    tensors page-locked so ``to_model_input(..., non_blocking=True)`` is
+    asynchronous.
+
+    ``trim_padding`` cuts the padded row dimension of battle groups, children,
+    active effects, events and relation edges to the chunk's widest real use
+    (``_trimmed_widths``) before gathering, so the padding is neither copied
+    nor computed on; model outputs are unchanged up to float rounding.
+    """
+
+    if not shards or len(shards) != len(references):
+        raise ValueError("cross-shard IL collation needs one reference list per shard")
+    gathers = [shard._chunk_gather(refs, time_steps=time_steps) for shard, refs in zip(shards, references, strict=True)]
+    lane_counts = [len(refs) for refs in references]
+    batch_size = sum(lane_counts)
+    single = len(shards) == 1
+    capacities = {
+        name: max(int(getattr(shard.observations, name).mask.shape[1]) for shard in shards) for name in _DYNAMIC_COUNTS
+    }
+    widths = _trimmed_widths(shards, gathers) if trim_padding else {}
+
+    def join(prefix: str, records: Sequence[TensorRecordV4]) -> dict[str, Tensor]:
+        items = [dict(_record_tensor_items(record, prefix=prefix)) for record in records]
+        if any(item.keys() != items[0].keys() for item in items):
+            raise TypeError("cannot concatenate different V4 record types")
+        joined: dict[str, Tensor] = {}
+        for key in items[0]:
+            parts = key.split(".")
+            target = capacities.get(parts[1]) if len(parts) == 3 and parts[2] != "elixir" else None
+            mask_name = (
+                _trim_mask_name(parts[1], parts[2]) if widths and prefix == "observations" and len(parts) == 3 else None
+            )
+            width = None if mask_name is None else widths[(parts[1], mask_name)]
+            if width is not None:
+                target = width
+            padding_value = -1 if parts[-1] in _NEGATIVE_PADDING_FIELDS else 0
+            pieces: list[Tensor] = []
+            for shard_items, (indices, _mask, _descriptors, _steps) in zip(items, gathers, strict=True):
+                source = shard_items[key]
+                if width is not None and source.ndim >= 2 and int(source.shape[1]) > width:
+                    source = source.narrow(1, 0, width)
+                pads = target is not None and source.ndim >= 2 and int(source.shape[1]) < target
+                piece = _gather_rows(source, indices, pin_memory=pin_memory and single and not pads)
+                if target is not None:
+                    piece = _pad_dim_one(piece, target, padding_value, pin_memory=pin_memory and single)
+                pieces.append(piece)
+            if single:
+                joined[key] = pieces[0]
+                continue
+            output = torch.empty(
+                (time_steps, batch_size, *pieces[0].shape[1:]),
+                dtype=reduce(torch.promote_types, (piece.dtype for piece in pieces)),
+                pin_memory=pin_memory,
+            )
+            torch.cat(
+                [
+                    piece.view(time_steps, lanes, *piece.shape[1:])
+                    for piece, lanes in zip(pieces, lane_counts, strict=True)
+                ],
+                dim=1,
+                out=output,
+            )
+            joined[key] = output.view(time_steps * batch_size, *output.shape[2:])
+        return joined
+
+    observation_tensors = join("observations", [shard.observations for shard in shards])
+    observations = _restore_record(type(shards[0].observations), prefix="observations", tensors=observation_tensors)
+    action_tensors = join("actions", [shard.actions for shard in shards])
+    actions = _restore_record(type(shards[0].actions), prefix="actions", tensors=action_tensors)
+    shard_time_fields = [
+        shard._chunk_time_fields(indices, mask, descriptors)
+        for shard, (indices, mask, descriptors, _steps) in zip(shards, gathers, strict=True)
+    ]
+    time_fields: dict[str, Tensor | None] = {}
+    for name in _IL_CHUNK_TENSOR_FIELDS:
+        values = [fields_.get(name) for fields_ in shard_time_fields]
+        if all(value is None for value in values):
+            time_fields[name] = None
+            continue
+        # An absent loss mask means "every valid frame" (as in collate_il_sequences).
+        value = torch.cat(
+            [fields_["valid_mask"] if value is None else value for fields_, value in zip(shard_time_fields, values)],
+            dim=1,
+        )
+        time_fields[name] = value.pin_memory() if pin_memory else value
+    valid = time_fields["valid_mask"]
+    for name in ("gate_loss_mask", "value_loss_mask"):
+        loss_mask = time_fields[name]
+        if loss_mask is not None and valid is not None and torch.any(loss_mask & ~valid):
+            raise ValueError(f"{name} must be a subset of valid frames")
+    returns = time_fields["returns"]
+    if returns is None or not returns.is_floating_point() or not torch.isfinite(returns).all():
+        raise ValueError("IL returns must be finite floating [T,B]")
+    shard_ids = ("+".join(item.sequence_id for item in descriptors) for _indices, _mask, descriptors, _steps in gathers)
+    episode_start = time_fields["episode_start"]
+    return CollatedILChunkV1(
+        observations=observations,
+        actions=actions,
+        time_fields=time_fields,
+        time_steps=time_steps,
+        batch_size=batch_size,
+        sequence_id="+".join(shard_id or f"sequence-{index}" for index, shard_id in enumerate(shard_ids)),
+        natural_time=all(item.natural_time for _indices, _mask, descriptors, _steps in gathers for item in descriptors),
+        owner_frames=sum(sum(steps) for _indices, _mask, _descriptors, steps in gathers),
+        lane_steps=tuple(int(step) for _indices, _mask, _descriptors, steps in gathers for step in steps),
+        mid_chunk_reset=None if episode_start is None else bool(episode_start[1:].any()),
+    )
 
 
 def write_il_cache_index(

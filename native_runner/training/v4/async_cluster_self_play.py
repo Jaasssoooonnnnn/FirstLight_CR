@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait as wait_futures
 import ctypes
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 import math
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
-from typing import Any, Callable, Mapping, Sequence, cast
+from typing import Any, Callable, Iterator, Mapping, Sequence, cast
+import weakref
 
 import torch
 from torch import Tensor
@@ -31,11 +33,16 @@ from .cluster_self_play import (
     build_resident_engine_v4,
     concatenate_padded_tensor_records_v4,
 )
-from .decoding import ShadowCandidateLegality, decode_action_sequence_v4
+from .decoding import ShadowCandidateLegality, decode_action_sequence_v4, elixir_multiplier_from_match_scalars
 from .expert import POLICY_DECISION_TICKS
 from .policy_session import _fixed_cuda_graph_batch_v4
 from .matchmaking import POLICY_IL
-from .king_activation_reward import apply_fireball_king_activation_penalty_v4
+from .king_activation_reward import (
+    apply_fireball_king_activation_penalty_v4,
+    apply_king_activation_reward_v4,
+    configure_king_tower_shaping_v4,
+    validate_king_reward_parameters_v4,
+)
 from .model import UniversalCardPolicyV4
 from .ppo import StoredRolloutV4
 from .ppo_runtime import ppo_environment_config_v4, validate_reward_parameters_v4
@@ -55,6 +62,11 @@ from .tensors import (
 
 _PPO_CUDA_GRAPH_ROW_BUCKET = 32
 _INFERENCE_BATCH_WAIT_SECONDS = 0.002
+# Policies whose rollout graphs replay concurrently need distinct capture
+# streams (cuBLAS bakes the per-(handle, stream) workspace into each graph) and
+# distinct CUDA RNG states (replay refills the state's seed/offset tensors).
+# Policies beyond this many share a slot and therefore one replay stream.
+_ROLLOUT_ISOLATION_SLOTS_V4 = 8
 
 
 def _credit_hog_deployments_v4(
@@ -232,6 +244,56 @@ def _frozen_opponent_opening_force_owner_v4(
     return opponent_owner
 
 
+def _deck_rule_opening_force_owner_v4(
+    *,
+    active_actions: tuple[int, int],
+    deck_average_elixir: tuple[float, float],
+    deck_ids: tuple[str, str],
+    tick: int,
+    force_tick: int | None,
+    already_forced_owner: int | None = None,
+) -> int | None:
+    """Model-blind, role-blind opening force used by head-to-head evaluation.
+
+    Opt-in only (``force_tick=None`` disables it). At or after ``force_tick``,
+    if NEITHER owner has submitted a non-WAIT action, request one ACT from the
+    owner holding the lower-average-elixir deck. Equal averages fall back to
+    the lexicographically smaller deck id, then to owner 0 for a mirror, so the
+    choice depends only on the decks. Because schedules keep decks with seats
+    and swap the models, every model receives every forced deck equally.
+    """
+
+    if force_tick is None:
+        return None
+    if force_tick <= 0 or tick < 0:
+        raise ValueError("deck-rule opening force tick must be positive")
+    if len(active_actions) != 2 or len(deck_average_elixir) != 2 or len(deck_ids) != 2:
+        raise ValueError("deck-rule opening force needs two owners")
+    if any(not math.isfinite(value) or value <= 0.0 for value in deck_average_elixir):
+        raise ValueError("deck-rule opening force needs positive deck average elixir")
+    if already_forced_owner is not None:
+        return None
+    if tick < force_tick or active_actions[0] > 0 or active_actions[1] > 0:
+        return None
+    first, second = (float(value) for value in deck_average_elixir)
+    if abs(first - second) > 1e-9:
+        return 0 if first < second else 1
+    if deck_ids[0] != deck_ids[1]:
+        return 0 if deck_ids[0] < deck_ids[1] else 1
+    return 0
+
+
+def _scaled_terminal_rewards_v4(reward: Mapping[int, float], terminal: Any, scale: float) -> dict[int, float]:
+    """Scale only the terminal outcome; leave potential shaping untouched."""
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("terminal reward scale must be finite and positive")
+    return {
+        owner: float(reward[owner]) + ((scale - 1.) * float(terminal.result_by_owner[owner])
+                                     if terminal.ended else 0.)
+        for owner in (0, 1)
+    }
+
+
 def _elixir_overflow_penalty_transition_v4(
     *,
     personal_wasted_elixir: float,
@@ -294,6 +356,22 @@ def _elixir_overflow_penalty_transition_v4(
         personal_penalty,
         unilateral_penalty,
     )
+
+
+def _await_inference_batch_v4(futures, *, wait_seconds: float, gather_all: bool = False):
+    """Coalesce already in-flight engine frames without dropping or advancing any lane."""
+    ready, _ = wait_futures(tuple(futures), return_when=FIRST_COMPLETED)
+    deadline = time.perf_counter() + wait_seconds
+    while not (gather_all and len(ready) == len(futures)):
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+        extra, _ = wait_futures(tuple(future for future in futures if future not in ready),
+                                timeout=remaining, return_when=FIRST_COMPLETED)
+        if not extra:
+            break
+        ready.update(extra)
+    return ready
 
 
 def _ppo_cuda_graph_row_capacity_v4(rows: int) -> int:
@@ -409,6 +487,45 @@ class _RowPackedTensorRecordV4(ReceivedRowPackedTensorRecord):
         return self
 
 
+def _pad_packed_rollout_tail_v4(
+    storage: _RowPackedTensorRecordV4,
+    last_observation: UniversalSemanticBatchV4,
+    valid_mask: Tensor,
+    *,
+    scratch_bytes: int = 32 * 1024 * 1024,
+) -> bool:
+    """Copy the same final lane rows into padding, using bounded dtype buffers.
+
+    Return False without changing storage if an unexpected schema expansion
+    requires the original per-field scatter. Valid rows are never modified.
+    """
+    if valid_mask.ndim != 2 or valid_mask.dtype != torch.bool or valid_mask.device.type != "cpu":
+        raise ValueError("packed tail padding requires a CPU bool [T,B] mask")
+    if scratch_bytes <= 0:
+        raise ValueError("packed tail scratch budget must be positive")
+    steps, lanes = valid_mask.shape
+    if steps <= 0 or lanes <= 0 or storage.batch_size != steps * lanes:
+        raise ValueError("packed tail storage dimensions differ from mask")
+    missing = (~valid_mask).reshape(-1).nonzero(as_tuple=False).flatten()
+    if not missing.numel():
+        return True
+    # Preserve tensor_padding_value rules for smaller final-row schemas. The
+    # scratch record has the full trajectory schema; every lane is overwritten.
+    scratch = storage.empty_rows(lanes)
+    padded_last = _scatter_storage_rows(
+        scratch.record, last_observation, torch.arange(lanes), total_rows=lanes, clone_previous=False
+    )
+    source = _RowPackedTensorRecordV4(padded_last)
+    if not storage.compatible(source):
+        return False
+    for dtype, target in storage.buffers.items():
+        last = source.buffers[dtype]
+        rows_per_chunk = max(1, scratch_bytes // max(1, last.shape[1] * last.element_size()))
+        for indices in missing.split(rows_per_chunk):
+            target.index_copy_(0, indices, last.index_select(0, indices.remainder(lanes)))
+    return True
+
+
 def _concatenate_row_packed_records_v4(values: Sequence[Any]) -> _RowPackedTensorRecordV4 | None:
     normalized = tuple(values)
     if not normalized or any(not normalized[0].compatible(value) for value in normalized[1:]):
@@ -420,6 +537,64 @@ def _concatenate_row_packed_records_v4(values: Sequence[Any]) -> _RowPackedTenso
             for dtype in normalized[0].source_dtypes
         },
     )
+
+
+class _ModelPackedArenaV4:
+    """Assemble received dtype buffers directly into reusable model partitions.
+
+    No per-packet nested record is reconstructed and no combined batch is
+    gathered a second time by model. Padding repeats row zero, exactly as the
+    legacy graph path does. Callers must copy learner rows before arena reuse.
+    """
+
+    def __init__(self, *, pin_memory: bool = True) -> None:
+        self.pin_memory = pin_memory
+        self.partitions: dict[tuple[str, int], _RowPackedTensorRecordV4] = {}
+
+    def assemble(
+        self, values: Sequence[tuple[Any, int]], rows_by_model: Mapping[str, Sequence[int]],
+    ) -> dict[str, _RowPackedTensorRecordV4] | None:
+        if not values or any(not values[0][0].compatible(value) for value, _ in values[1:]):
+            return None
+        template = values[0][0]
+        source_rows: list[tuple[Any, int]] = []
+        for value, length in values:
+            if length <= 0 or length > value.batch_size:
+                raise ValueError("model partition length is outside the packet")
+            source_rows.extend((value, row) for row in range(length))
+        result: dict[str, _RowPackedTensorRecordV4] = {}
+        for key, rows in rows_by_model.items():
+            if not rows:
+                continue
+            capacity = _ppo_cuda_graph_row_capacity_v4(len(rows))
+            cache_key = (key, capacity)
+            packed = self.partitions.get(cache_key)
+            if packed is None or not packed.compatible(template):
+                packed = _RowPackedTensorRecordV4._from_buffers(template, {
+                    dtype: torch.empty((capacity, buffer.shape[1]), dtype=buffer.dtype,
+                                       pin_memory=self.pin_memory)
+                    for dtype, buffer in template.buffers.items()
+                })
+                self.partitions[cache_key] = packed
+            # Coalesce adjacent rows from the same packet before the dtype cats.
+            spans: list[tuple[Any, int, int]] = []
+            for index in rows:
+                if index < 0 or index >= len(source_rows):
+                    raise ValueError("model partition row is outside the received batch")
+                value, row = source_rows[index]
+                if spans and spans[-1][0] is value and spans[-1][1] + spans[-1][2] == row:
+                    previous, start, count = spans[-1]
+                    spans[-1] = (previous, start, count + 1)
+                else:
+                    spans.append((value, row, 1))
+            for dtype, destination in packed.buffers.items():
+                torch.cat(tuple(value.buffers[dtype].narrow(0, start, count)
+                                for value, start, count in spans), dim=0,
+                          out=destination[:len(rows)])
+                if len(rows) < capacity:
+                    destination[len(rows):].copy_(destination[:1].expand(capacity - len(rows), -1))
+            result[key] = packed
+        return result
 
 
 class _PackedCudaGraphBatchV4:
@@ -435,6 +610,12 @@ class _PackedCudaGraphBatchV4:
 
     def stage(self, source: UniversalSemanticBatchV4, packed_source: _RowPackedTensorRecordV4 | None = None) -> None:
         if packed_source is not None and self.host_packed.compatible(packed_source):
+            # Model-partitioned arenas are already pinned and live until all
+            # model streams finish. Avoid the second host-to-host staging copy.
+            if all(buffer.is_pinned() for buffer in packed_source.buffers.values()):
+                for dtype, buffer in packed_source.buffers.items():
+                    self.device_packed.buffers[dtype].copy_(buffer, non_blocking=True)
+                return
             for dtype, host_buffer in self.host_packed.buffers.items():
                 host_buffer.copy_(packed_source.buffers[dtype])
         else:
@@ -581,6 +762,36 @@ def _pack_action_batch_to_cpu(actions: ActionSequenceV4, length: int) -> tuple[A
     return stored, packed
 
 
+def _pack_model_actions_to_cpu_v4(
+    values: Mapping[str, tuple[ActionSequenceV4, int]],
+) -> dict[str, tuple[ActionSequenceV4, Tensor]]:
+    """One D2H action transfer for all policies, preserving each policy's row order."""
+    matrices: list[Tensor] = []
+    lengths: list[tuple[str, int]] = []
+    for key, (actions, length) in values.items():
+        if length <= 0 or length > actions.gate.shape[0]:
+            raise ValueError("packed action transfer length is outside the batch")
+        matrices.append(torch.cat((
+            actions.gate[:length, None], actions.micro_action_count[:length, None],
+            actions.candidate_index[:length], actions.candidate_uid[:length],
+            actions.target_cell[:length], actions.delay_offset_bin[:length],
+        ), dim=1))
+        lengths.append((key, length))
+    if not matrices:
+        return {}
+    with torch.inference_mode(False):
+        combined = torch.cat(matrices, dim=0).detach().to(device="cpu")
+        if torch.is_inference(combined):
+            combined = combined.clone()
+    result: dict[str, tuple[ActionSequenceV4, Tensor]] = {}
+    offset = 0
+    for key, length in lengths:
+        packed = combined.narrow(0, offset, length)
+        result[key] = (_action_batch_from_packed(packed), packed)
+        offset += length
+    return result
+
+
 def _action_batch_from_packed(value: object) -> ActionSequenceV4:
     if not isinstance(value, Tensor):
         raise TypeError("async packed action payload changed type")
@@ -640,6 +851,30 @@ class AsyncResidentEngineSpecV4:
     segment_decision_steps: int | None = None
     force_frozen_opponent_opening_after_seconds: int | None = None
     force_il_opponent_opening_after_seconds: int | None = None
+    # Training deadline for both owners independently, in all matchup types.
+    force_all_owners_opening_after_seconds: int | None = None
+    # Opt-in evaluation knobs (defaults preserve PPO behaviour exactly).
+    # Absolute tick of the symmetric deck-rule opening force; see
+    # _deck_rule_opening_force_owner_v4. Exclusive with the two fields above.
+    force_deck_rule_opening_tick: int | None = None
+    # Override EnvironmentConfigV1.warmup_ticks (PPO default 130; IL uses 90).
+    environment_warmup_ticks: int | None = None
+    # Skip the per-actor Hog-playability ShadowCandidateLegality pass. Only
+    # allowed when every Hog/first-Hog shaping coefficient is zero.
+    skip_shaping_telemetry: bool = False
+    # Only the PPO trainer opts into simulated online command latency.
+    # Inference / h2h specs leave this None, preserving their own timing.
+    training_command_delay_jitter_ticks: int | None = None
+
+
+def _configure_ppo_training_command_delay_v4(engine: Any, jitter_ticks: int | None) -> None:
+    if jitter_ticks is not None and (
+        isinstance(jitter_ticks, bool) or not isinstance(jitter_ticks, int) or not 0 <= jitter_ticks <= 3
+    ):
+        raise ValueError("PPO command-delay jitter must be None or an integer in [0, 3]")
+    if jitter_ticks is not None:
+        for environment in engine.environments:
+            environment.simulated_card_delay_jitter_ticks = jitter_ticks
 
 
 @dataclass(frozen=True, slots=True)
@@ -656,6 +891,104 @@ def _inference_model_key(actor: _ActorIdentityV4) -> str:
     return actor.model_key
 
 
+def _match_shadow_legality_v4(batch: UniversalSemanticBatchV4, config: Any) -> ShadowCandidateLegality:
+    """Shadow legality at the batch's real elixir regeneration rate (1x/2x/3x)."""
+
+    return ShadowCandidateLegality(
+        batch.candidates, config, elixir_multiplier=elixir_multiplier_from_match_scalars(batch.match_scalars)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RolloutIsolationV4:
+    """Per-policy resources that let its rollout graphs replay concurrently."""
+
+    slot: int
+    capture_stream: torch.cuda.Stream
+    generator: torch.Generator
+
+
+class _RolloutIsolationSlotV4:
+    def __init__(self, capture_stream: torch.cuda.Stream) -> None:
+        self.capture_stream = capture_stream
+        self.owners: weakref.WeakSet[UniversalCardPolicyV4] = weakref.WeakSet()
+
+
+_ROLLOUT_ISOLATION_LOCK_V4 = threading.Lock()
+_ROLLOUT_ISOLATION_SLOT_TABLE_V4: dict[int, list[_RolloutIsolationSlotV4]] = {}
+_ROLLOUT_ISOLATION_GENERATORS_CREATED_V4 = [0]
+
+
+def _cuda_device_index_v4(device: torch.device) -> int:
+    return int(device.index) if device.index is not None else int(torch.cuda.current_device())
+
+
+def _rollout_isolation_v4(model: UniversalCardPolicyV4, device: torch.device) -> _RolloutIsolationV4:
+    """Bind a policy to its own RNG state and a capture stream distinct from other live policies.
+
+    Graphs captured on one stream share that stream's cuBLAS workspace, and graphs
+    sampling from one generator share its seed/offset tensors; replaying such graphs
+    on different streams at once races on both. The binding is permanent for the
+    model object because both resources are baked into its captured graphs.
+    """
+
+    index = _cuda_device_index_v4(device)
+    records = model.__dict__.setdefault("_ppo_rollout_cuda_isolation_v4", {})
+    if not isinstance(records, dict):
+        raise RuntimeError("PPO rollout isolation cache changed type")
+    record = records.get(index)
+    if record is not None:
+        if not isinstance(record, _RolloutIsolationV4):
+            raise RuntimeError("PPO rollout isolation entry changed type")
+        return record
+    with _ROLLOUT_ISOLATION_LOCK_V4:
+        slots = _ROLLOUT_ISOLATION_SLOT_TABLE_V4.setdefault(index, [])
+        free = [slot for slot, entry in enumerate(slots) if not len(entry.owners)]
+        if free:
+            slot = free[0]
+        elif len(slots) < _ROLLOUT_ISOLATION_SLOTS_V4:
+            taken = {entry.capture_stream.cuda_stream for entry in slots}
+            if torch.cuda.graph.default_capture_stream is not None:
+                taken.add(torch.cuda.graph.default_capture_stream.cuda_stream)
+            # The high-priority pool is otherwise unused here; skip handles the
+            # pool's round robin has already handed to another slot.
+            for _ in range(64):
+                stream = torch.cuda.Stream(device=torch.device("cuda", index), priority=-1)
+                if stream.cuda_stream not in taken:
+                    break
+            else:
+                raise RuntimeError("could not reserve a distinct rollout capture stream")
+            slots.append(_RolloutIsolationSlotV4(stream))
+            slot = len(slots) - 1
+        else:
+            slot = min(range(len(slots)), key=lambda item: len(slots[item].owners))
+        slots[slot].owners.add(model)
+        sequence = _ROLLOUT_ISOLATION_GENERATORS_CREATED_V4[0]
+        _ROLLOUT_ISOLATION_GENERATORS_CREATED_V4[0] = sequence + 1
+        base_seed = int(torch.cuda.default_generators[index].initial_seed())
+        generator = torch.Generator(device=torch.device("cuda", index))
+        generator.manual_seed((base_seed + 0x9E37_79B9_7F4A_7C15 * (sequence + 1)) % (1 << 63))
+        record = _RolloutIsolationV4(slot=slot, capture_stream=slots[slot].capture_stream, generator=generator)
+    records[index] = record
+    return record
+
+
+@contextmanager
+def _rollout_rng_scope_v4(device: torch.device, generator: torch.Generator | None) -> Iterator[None]:
+    """Route default-generator sampling (and graph RNG registration) to ``generator``."""
+
+    if generator is None:
+        yield
+        return
+    default = torch.cuda.default_generators[_cuda_device_index_v4(device)]
+    saved = default.graphsafe_get_state()
+    default.graphsafe_set_state(generator)
+    try:
+        yield
+    finally:
+        default.graphsafe_set_state(saved)
+
+
 class _StochasticCudaGraphV4:
     """Fixed-shape PPO sampler whose replay advances CUDA RNG state."""
 
@@ -667,6 +1000,7 @@ class _StochasticCudaGraphV4:
         effect_capacity: int = 512,
         relation_capacity: int = 2048,
         graph_pool: object | None = None,
+        isolation: _RolloutIsolationV4 | None = None,
     ) -> None:
         if effect_capacity <= 0 or relation_capacity <= 0:
             raise ValueError("PPO CUDA Graph capacities must be positive")
@@ -675,6 +1009,9 @@ class _StochasticCudaGraphV4:
         self.effect_capacity = effect_capacity
         self.relation_capacity = relation_capacity
         self.graph_pool = graph_pool
+        # None keeps the process default generator and torch's shared default
+        # capture stream (single-policy collection, bitwise unchanged).
+        self.isolation = isolation
         self.graph: torch.cuda.CUDAGraph | None = None
         self.batch: UniversalSemanticBatchV4 | None = None
         self.packed_batch: _PackedCudaGraphBatchV4 | None = None
@@ -707,22 +1044,36 @@ class _StochasticCudaGraphV4:
         self.batch = self.packed_batch.device_batch
         self.state = RecurrentPolicyStateV4(hidden=state.hidden.detach().clone(), cell=state.cell.detach().clone())
         self.episode_start = episode_start.detach().clone()
-        warmup_stream = torch.cuda.Stream(device=self.device)
-        warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(warmup_stream):
-            with torch.autocast(
-                device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_dtype is not None
+        isolation = self.isolation
+        with _rollout_rng_scope_v4(self.device, None if isolation is None else isolation.generator):
+            warmup_stream = torch.cuda.Stream(device=self.device)
+            warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(warmup_stream):
+                with torch.autocast(
+                    device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_dtype is not None
+                ):
+                    for _ in range(3):
+                        self._sample(model, self.batch, self.state, self.episode_start)
+            torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
+            torch.cuda.synchronize(self.device)
+            self.graph = torch.cuda.CUDAGraph()
+            # capture_begin registers the default generator's *current* state, so
+            # an isolated graph's replays only ever touch its policy's RNG state.
+            with torch.cuda.graph(
+                self.graph,
+                pool=self.graph_pool,
+                stream=None if isolation is None else isolation.capture_stream,
+                capture_error_mode="thread_local",
             ):
-                for _ in range(3):
-                    self._sample(model, self.batch, self.state, self.episode_start)
-        torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
-        torch.cuda.synchronize(self.device)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=self.graph_pool, capture_error_mode="thread_local"):
-            with torch.autocast(
-                device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_dtype is not None
-            ):
-                self.output = self._sample(model, self.batch, self.state, self.episode_start)
+                with torch.autocast(
+                    device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_dtype is not None
+                ):
+                    self.output = self._sample(model, self.batch, self.state, self.episode_start)
+            # capture_begin refilled the RNG state's seed/offset tensors on the
+            # capture stream; order that before this stream's replay refill.
+            capture_stream = torch.cuda.graph.default_capture_stream if isolation is None else isolation.capture_stream
+            if capture_stream is not None:
+                torch.cuda.current_stream(self.device).wait_stream(capture_stream)
         if self.output is None:
             raise RuntimeError("PPO CUDA Graph capture produced no output")
         self.graph.replay()
@@ -756,6 +1107,70 @@ class _StochasticCudaGraphV4:
         return self.output
 
 
+class _IndexedStateCudaGraphV4(_StochasticCudaGraphV4):
+    """Capture recurrent gather/scatter with inference instead of launching it per batch."""
+
+    def __init__(self, device: torch.device, *, state_bank: RecurrentPolicyStateV4,
+                 actor_capacity: int, capacity: int, **kwargs: Any) -> None:
+        super().__init__(device, **kwargs)
+        self.state_bank = state_bank
+        self.actor_capacity = actor_capacity
+        self.capacity = capacity
+        with torch.cuda.device(device):
+            self.host_control = torch.empty((capacity, 3), dtype=torch.long, pin_memory=True)
+        self.device_control = torch.empty((capacity, 3), dtype=torch.long, device=device)
+
+    def prepare(self, rows: Sequence[int], starts: Sequence[bool]) -> None:
+        if not rows or len(rows) != len(starts) or len(rows) > self.capacity:
+            raise ValueError("indexed graph control rows changed shape")
+        if any(row < 0 or row >= self.actor_capacity for row in rows):
+            raise ValueError("indexed graph actor row is outside its state bank")
+        controls = [(row, row, int(start)) for row, start in zip(rows, starts, strict=True)]
+        # Padding reads row zero as before, but writes to distinct scratch rows;
+        # it must never overwrite a real actor's next state.
+        controls += [(rows[0], self.actor_capacity + offset, 0)
+                     for offset in range(self.capacity - len(rows))]
+        self.host_control.copy_(torch.tensor(controls, dtype=torch.long))
+
+    def _sample(self, model, batch, state, episode_start):
+        reads = self.device_control[:, 0]
+        writes = self.device_control[:, 1]
+        selected = self.state_bank.index_select(reads)
+        starts = self.device_control[:, 2] != 0
+        output = super()._sample(model, batch, selected, starts)
+        # Capture records these operations; warmup must not advance the bank.
+        if torch.cuda.is_current_stream_capturing():
+            self.state_bank.hidden.index_copy_(0, writes, output.next_state.hidden.to(self.state_bank.hidden.dtype))
+            self.state_bank.cell.index_copy_(0, writes, output.next_state.cell.to(self.state_bank.cell.dtype))
+        return output
+
+    def run_indexed(self, model, host_batch, packed_host_batch):
+        self.device_control.copy_(self.host_control, non_blocking=True)
+        if self.graph is None:
+            dummy_state = self.state_bank.narrow_batch(0, self.capacity)
+            dummy_start = torch.zeros(self.capacity, device=self.device, dtype=torch.bool)
+            return self._capture(model, host_batch, dummy_state, dummy_start, packed_host_batch)
+        if self.packed_batch is None or self.output is None:
+            raise RuntimeError("indexed graph storage is incomplete")
+        fixed_batch = _fixed_cuda_graph_batch_v4(
+            host_batch, effect_capacity=self.effect_capacity, relation_capacity=self.relation_capacity)
+        self.packed_batch.stage(fixed_batch, packed_host_batch)
+        self.graph.replay()
+        return self.output
+
+
+def _rollout_state_bank_v4(model, key: str, actor_capacity: int, device: torch.device) -> RecurrentPolicyStateV4:
+    banks = model.__dict__.setdefault("_ppo_rollout_state_banks_v4", {})
+    bank_key = (device.index, key, actor_capacity)
+    bank = banks.get(bank_key)
+    if bank is None:
+        bank = model.initial_state(actor_capacity + _ppo_cuda_graph_row_capacity_v4(actor_capacity), device=device)
+        banks[bank_key] = bank
+    bank.hidden.zero_()
+    bank.cell.zero_()
+    return bank
+
+
 def _shared_rollout_graph_pool_v4(model: UniversalCardPolicyV4, device: torch.device) -> object:
     """Share storage between mutually exclusive rollout graph variants."""
 
@@ -778,12 +1193,21 @@ def _persistent_rollout_graph_v4(
     *,
     effect_capacity: int = 512,
     relation_capacity: int = 2048,
+    isolated: bool = False,
+    state_bank: RecurrentPolicyStateV4 | None = None,
+    actor_capacity: int = 0,
+    state_bank_key: str = "",
 ) -> _StochasticCudaGraphV4 | None:
-    """Reuse captured rollout graphs after in-place PPO parameter updates."""
+    """Reuse captured rollout graphs after in-place PPO parameter updates.
+
+    ``isolated`` graphs may replay concurrently with other policies' isolated
+    graphs on other streams; shared (default) graphs must not.
+    """
 
     cache = model.__dict__.setdefault("_ppo_rollout_cuda_graph_cache_v4", {})
     if not isinstance(cache, dict):
         raise RuntimeError("PPO rollout CUDA Graph cache changed type")
+    isolated = bool(isolated) and device.type == "cuda"
     key = (
         device.index,
         int(capacity),
@@ -792,16 +1216,29 @@ def _persistent_rollout_graph_v4(
         float(model.ppo_gate_temperature),
         float(model.ppo_action_temperature),
         float(model.ppo_continue_temperature),
-    )
+    ) + ((True,) if isolated else ())
+    # A captured graph bakes the model's delay policy in (head-to-head sets it
+    # per model); the default ``sample`` keeps the historical key.
+    delay_policy = getattr(model, "delay_policy", "sample")
+    if delay_policy != "sample":
+        key = key + (f"delay_policy={delay_policy}",)
+    if state_bank is not None:
+        key = key + ("indexed-state", state_bank_key, actor_capacity,
+                     state_bank.hidden.data_ptr(), state_bank.cell.data_ptr())
     graph = cache.get(key)
     if graph is None:
         if bool(model.__dict__.get("_ppo_rollout_cuda_graph_cache_frozen_v4", False)):
             return None
-        graph = _StochasticCudaGraphV4(
+        graph_type = _StochasticCudaGraphV4 if state_bank is None else _IndexedStateCudaGraphV4
+        indexed_options = {} if state_bank is None else {
+            "state_bank": state_bank, "actor_capacity": actor_capacity, "capacity": capacity}
+        graph = graph_type(
             device,
             effect_capacity=effect_capacity,
             relation_capacity=relation_capacity,
             graph_pool=(_shared_rollout_graph_pool_v4(model, device) if device.type == "cuda" else None),
+            isolation=_rollout_isolation_v4(model, device) if isolated else None,
+            **indexed_options,
         )
         cache[key] = graph
     if not isinstance(graph, _StochasticCudaGraphV4):
@@ -850,6 +1287,11 @@ def _engine_worker(
     first_hog_deferral_penalty: float = 0.0,
     first_hog_deferral_penalty_episode_cap: float = 0.0,
     fireball_king_activation_penalty: float = 0.0,
+    king_activation_penalty: float = 0.0,
+    king_activation_scope: str = "any",
+    king_shaping_mode: str = "legacy",
+    king_potential_weight: float = 3.0,
+    terminal_reward_scale: float = 1.0,
 ) -> None:
     """Own one native endpoint and all stateful tensorizers on one CPU."""
 
@@ -873,6 +1315,36 @@ def _engine_worker(
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     environment_config = ppo_environment_config_v4(gamma_per_decision=gamma_per_decision, shaping_beta=shaping_beta)
+    if spec.environment_warmup_ticks is not None:
+        if spec.environment_warmup_ticks <= 0:
+            raise ValueError("environment warmup override must be positive")
+        environment_config = replace(environment_config, warmup_ticks=int(spec.environment_warmup_ticks))
+    if spec.force_deck_rule_opening_tick is not None:
+        if spec.force_deck_rule_opening_tick <= 0:
+            raise ValueError("deck-rule opening force tick must be positive")
+        if (
+            spec.force_frozen_opponent_opening_after_seconds is not None
+            or spec.force_il_opponent_opening_after_seconds is not None
+        ):
+            raise ValueError("deck-rule opening force cannot be combined with role-based opening force")
+    if spec.force_all_owners_opening_after_seconds is not None:
+        if spec.force_all_owners_opening_after_seconds <= 0:
+            raise ValueError("all-owner opening timeout must be positive")
+        if any(value is not None for value in (
+            spec.force_deck_rule_opening_tick,
+            spec.force_frozen_opponent_opening_after_seconds,
+            spec.force_il_opponent_opening_after_seconds,
+        )):
+            raise ValueError("all-owner training opening cannot be combined with legacy opening modes")
+    if spec.skip_shaping_telemetry and (
+        hog_deploy_reward
+        or hog_deploy_opening_reward is not None
+        or first_hog_timing_reward_max
+        or first_hog_missed_deadline_penalty
+        or first_hog_deferral_penalty
+        or first_hog_deferral_penalty_episode_cap
+    ):
+        raise ValueError("shaping telemetry can only be skipped when Hog shaping is disabled")
     engine = build_resident_engine_v4(
         spec.engine_index,
         environment_config=environment_config,
@@ -881,6 +1353,16 @@ def _engine_worker(
         lanes=spec.lanes,
         timeout=spec.timeout,
         capture_mode=spec.capture_mode,
+    )
+    _configure_ppo_training_command_delay_v4(engine, spec.training_command_delay_jitter_ticks)
+    validate_king_reward_parameters_v4(
+        king_activation_penalty=king_activation_penalty,
+        king_activation_scope=king_activation_scope,
+        king_shaping_mode=king_shaping_mode,
+        king_potential_weight=king_potential_weight,
+    )
+    configure_king_tower_shaping_v4(
+        engine, king_shaping_mode=king_shaping_mode, king_potential_weight=king_potential_weight
     )
     executor = ThreadPoolExecutor(max_workers=spec.lanes, thread_name_prefix=f"ppo-native-{spec.engine_index}")
     started = time.perf_counter()
@@ -963,6 +1445,24 @@ def _engine_worker(
                     il_after_seconds=(spec.force_il_opponent_opening_after_seconds),
                 )
             )
+            if force_owner is None and not include_segment_boundary:
+                force_owner = _deck_rule_opening_force_owner_v4(
+                    active_actions=runtime.active_actions,
+                    deck_average_elixir=runtime.deck_average_elixir,
+                    deck_ids=(runtime.assignment.matchup.deck0.deck_id, runtime.assignment.matchup.deck1.deck_id),
+                    tick=int(runtime.observations[0].tick),
+                    force_tick=spec.force_deck_rule_opening_tick,
+                    already_forced_owner=runtime.opening_forced_owner,
+                )
+            force_owners = set() if force_owner is None else {force_owner}
+            if spec.force_all_owners_opening_after_seconds is not None and not include_segment_boundary:
+                deadline = spec.force_all_owners_opening_after_seconds * TICKS_PER_SECOND
+                if int(runtime.observations[0].tick) >= deadline:
+                    force_owners.update(
+                        owner for owner in (0, 1)
+                        if runtime.active_actions[owner] == 0
+                        and runtime.opening_forced_ticks_by_owner[owner] is None
+                    )
             for owner in (0, 1):
                 local_actor = match_index * 2 + owner
                 batch = runtime.tensorizers[owner].tensorize(runtime.observations[owner], validate=validate_tensors)
@@ -973,7 +1473,7 @@ def _engine_worker(
                 else:
                     opponent_actor_rows.append(local_actor)
                     opponent_batches.append(batch)
-                if owner == force_owner:
+                if owner in force_owners:
                     force_act_actor_rows.append(local_actor)
         actor_rows = [*current_actor_rows, *opponent_actor_rows]
         batches = [*current_batches, *opponent_batches]
@@ -1131,9 +1631,14 @@ def _engine_worker(
                     deferred = list(runtime.full_elixir_deferred_decision_ticks_before_first_card)
                     deferred[owner] += 1
                     runtime.full_elixir_deferred_decision_ticks_before_first_card = (deferred[0], deferred[1])
-                shadow = ShadowCandidateLegality(batch.candidates, tensorizer.config)
-                playable = shadow.candidate_mask()[0]
-                hog_playable = bool((playable & (batch.candidates.native_visible_card_id[0] == 26000021)).any().item())
+                if spec.skip_shaping_telemetry:
+                    hog_playable = False
+                else:
+                    shadow = _match_shadow_legality_v4(batch, tensorizer.config)
+                    playable = shadow.candidate_mask()[0]
+                    hog_playable = bool(
+                        (playable & (batch.candidates.native_visible_card_id[0] == 26000021)).any().item()
+                    )
                 submitted_hog = any(
                     item.kind == ActionKind.PLAY_CARD and item.card_id == 26000021 for item in identified
                 )
@@ -1174,13 +1679,25 @@ def _engine_worker(
                 counts = list(runtime.active_actions)
                 counts[owner] += sum(item.kind != ActionKind.WAIT for item in identified)
                 runtime.active_actions = (counts[0], counts[1])
+                if int(action.gate[0]) == GATE_ACT:
+                    act_steps = list(runtime.act_steps)
+                    act_steps[owner] += 1
+                    runtime.act_steps = (act_steps[0], act_steps[1])
+                    if int(action.micro_action_count[0]) == 2:
+                        second_steps = list(runtime.second_action_steps)
+                        second_steps[owner] += 1
+                        runtime.second_action_steps = (second_steps[0], second_steps[1])
                 if local_actor in forced_actor_rows:
                     if int(action.gate[0]) != GATE_ACT or not identified:
                         raise RuntimeError("opening force did not produce ACT")
-                    if runtime.opening_forced_owner is not None:
-                        raise RuntimeError("opening ACT was forced more than once")
-                    runtime.opening_forced_owner = owner
-                    runtime.opening_forced_tick = int(runtime.observations[0].tick)
+                    forced_ticks = list(runtime.opening_forced_ticks_by_owner)
+                    if forced_ticks[owner] is not None:
+                        raise RuntimeError("opening ACT was forced more than once for the same owner")
+                    forced_ticks[owner] = int(runtime.observations[0].tick)
+                    runtime.opening_forced_ticks_by_owner = (forced_ticks[0], forced_ticks[1])
+                    if runtime.opening_forced_owner is None:
+                        runtime.opening_forced_owner = owner
+                        runtime.opening_forced_tick = forced_ticks[owner]
 
         for match_index, runtime in enumerate(runtimes):
             if not runtime.active or policy_active[match_index]:
@@ -1260,7 +1777,10 @@ def _engine_worker(
             cumulative_unilateral_wasted = list(runtime.cumulative_unilateral_elixir_overflow_wasted)
             max_continuous_wasted = list(runtime.max_continuous_elixir_overflow_wasted)
             first_overflow_tick = list(runtime.first_elixir_overflow_tick)
-            adjusted_reward = dict(reward)
+            adjusted_reward = (
+                _scaled_terminal_rewards_v4(reward, next_observations[0].terminal, terminal_reward_scale)
+                if terminal_reward_scale != 1.0 else dict(reward)
+            )
             for owner in (0, 1):
                 newly_wasted = _newly_wasted_elixir_v4(
                     before_elixir=before_elixir[owner],
@@ -1364,6 +1884,14 @@ def _engine_worker(
                 runtime.rejected_actions = (counts[0], counts[1])
             apply_fireball_king_activation_penalty_v4(
                 runtime, before_observations, next_observations, adjusted_reward, fireball_king_activation_penalty
+            )
+            apply_king_activation_reward_v4(
+                runtime,
+                before_observations,
+                next_observations,
+                adjusted_reward,
+                king_activation_penalty,
+                king_activation_scope,
             )
             hog_counts = list(runtime.hog_deployments)
             hog_totals = list(runtime.hog_deploy_reward_total)
@@ -1537,6 +2065,9 @@ def _engine_worker(
                 continue
             if packet is None:
                 reports = tuple(_terminal_report(runtime) for runtime in runtimes)
+                for report in reports:
+                    report["terminal_reward_scale"] = terminal_reward_scale
+                    report["terminal_outcome_reward"] = tuple(terminal_reward_scale * v for v in report["result"])
                 connection.send(
                     {
                         "kind": "done",
@@ -1576,6 +2107,8 @@ def _engine_worker(
                     "kind": "error",
                     "engine_index": spec.engine_index,
                     "error": repr(error),
+                    "error_type": type(error).__name__,
+                    "error_message": str(error)[:EPISODE_FAILURE_MESSAGE_CHARS],
                     "traceback": traceback.format_exc(),
                 }
             )
@@ -1586,6 +2119,50 @@ def _engine_worker(
         executor.shutdown(wait=True, cancel_futures=True)
         engine.close()
         connection.close()
+
+
+EPISODE_FAILURE_MESSAGE_CHARS = 300
+
+
+def episode_failure_records_v4(
+    engine_index: int,
+    assignments: Sequence[ClusterMatchAssignmentV4],
+    packet: Mapping[str, object],
+    *,
+    lanes_offset: int = 0,
+) -> tuple[dict[str, object], ...]:
+    """One record per match the failed engine worker was running (single slot: one).
+
+    The worker dies with the exception, so every match it owned is lost.
+    """
+
+    error_type = str(packet.get("error_type") or str(packet.get("error", "")).split("(", 1)[0] or "unknown")
+    message = str(packet.get("error_message") or packet.get("error") or "")[:EPISODE_FAILURE_MESSAGE_CHARS]
+    rows = []
+    for lane, assignment in enumerate(assignments):
+        matchup = assignment.matchup
+        rows.append(
+            {
+                "time": time.time(),
+                "engine_index": int(engine_index),
+                "lane": int(lanes_offset + lane),
+                "error_type": error_type,
+                "error_message": message,
+                "sequence": int(matchup.sequence),
+                "category": str(matchup.category),
+                "policy_matchup": str(matchup.policy_matchup),
+                "current_owners": tuple(int(owner) for owner in matchup.current_owners),
+                "deck0_id": matchup.deck0.deck_id,
+                "deck1_id": matchup.deck1.deck_id,
+                "tower_troop_ids": (int(matchup.deck0.tower_troop_id), int(matchup.deck1.tower_troop_id)),
+                "battle_level": int(matchup.battle_level),
+                "seed": int(matchup.seed),
+                "opponent_checkpoint_id": (
+                    None if assignment.opponent is None else str(assignment.opponent.checkpoint_id)
+                ),
+            }
+        )
+    return tuple(rows)
 
 
 @torch.inference_mode()
@@ -1617,8 +2194,28 @@ def collect_async_cluster_wave_v4(
     first_hog_deferral_penalty: float = 0.0,
     first_hog_deferral_penalty_episode_cap: float = 0.0,
     fireball_king_activation_penalty: float = 0.0,
+    king_activation_penalty: float = 0.0,
+    king_activation_scope: str = "any",
+    king_shaping_mode: str = "legacy",
+    king_potential_weight: float = 3.0,
+    terminal_reward_scale: float = 1.0,
+    indexed_state_graphs: bool = False,
+    adaptive_batching: bool = False,
+    cache_static_memory: bool = False,
+    tolerate_episode_failures: bool = False,
 ) -> ClusterCollectionV4:
-    """Collect recurrent PPO segments from remote resident engines."""
+    """Collect recurrent PPO segments from remote resident engines.
+
+    ``tolerate_episode_failures``: when an engine worker fails (an
+    ``"error"`` packet such as a ``BattleEnvError``, or a lost connection),
+    its matches are dropped instead of failing the wave.  Every learner frame
+    the dropped matches stored in the current segment is invalidated, so the
+    lane disappears from the segment's rollout (``select_lanes``) and no
+    partial episode reaches the learner.  The engine leaves the wave; its
+    lane starts a fresh match with the next wave's assignment.  The records
+    are returned as ``timing["episode_failures"]`` with
+    ``timing["episode_failure_count"]``; the caller enforces a rate limit.
+    """
 
     normalized_specs = tuple(replace(spec, segment_decision_steps=segment_decision_steps) for spec in specs)
     if not normalized_specs or max_decision_steps <= 0 or segment_decision_steps <= 0:
@@ -1649,20 +2246,39 @@ def collect_async_cluster_wave_v4(
     if missing:
         raise ValueError(f"async collection lacks actor models: {sorted(missing)}")
     device = next(current_model.parameters()).device
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     for model in models.values():
         model.eval()
         if next(model.parameters()).device != device:
             raise ValueError("async actor models must share one GPU")
+    if cache_static_memory:
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            for model in dict.fromkeys(models.values()):
+                model.refresh_rollout_static_memory()
     fixed_row = {
         (_inference_model_key(actor), actor.engine_index, actor.local_actor): row
         for key, group in actors_by_key.items()
         for row, actor in enumerate(group)
     }
-    states = {key: models[key].initial_state(len(group), device=device) for key, group in actors_by_key.items()}
+    states = {
+        key: (_rollout_state_bank_v4(models[key], key, len(actors), device) if indexed_state_graphs
+              else models[key].initial_state(len(group), device=device))
+        for key, group in actors_by_key.items()
+    }
     # Preserve the original single-policy fast path. Capture remains serialized
     # by _StochasticCudaGraphV4, while independent policy Graph replays can
-    # overlap once their shapes have been captured.
-    model_streams = {key: torch.cuda.Stream(device=device) for key in actors_by_key} if len(actors_by_key) > 1 else {}
+    # overlap once their shapes have been captured. Overlapping replays are only
+    # safe for isolated graphs (own RNG state and capture stream per policy);
+    # policies that share an isolation slot (or a model object) share a stream.
+    model_streams: dict[str, torch.cuda.Stream] = {}
+    if len(actors_by_key) > 1:
+        slot_streams: dict[int, torch.cuda.Stream] = {}
+        for key in actors_by_key:
+            slot = _rollout_isolation_v4(models[key], device).slot
+            if slot not in slot_streams:
+                slot_streams[slot] = torch.cuda.Stream(device=device)
+            model_streams[key] = slot_streams[slot]
     current_actors = tuple(actor for actor in actors if actor.current)
     initial_state = current_model.initial_state(len(current_actors), device=device).to_storage(
         "cpu", float_dtype=torch.float32
@@ -1696,6 +2312,7 @@ def collect_async_cluster_wave_v4(
         raise ValueError("production PPO requires remote workers for every engine")
     parents: dict[int, Any] = {}
     shared_batches: dict[int, UniversalSemanticBatchV4] = {}
+    model_packed_arena = _ModelPackedArenaV4()
     started = time.perf_counter()
     inference_seconds = 0.0
     assembly_seconds = 0.0
@@ -1709,6 +2326,8 @@ def collect_async_cluster_wave_v4(
     receive_pipeline_thread_seconds = 0.0
     reports: list[dict[str, object]] = []
     timings: list[Mapping[str, float]] = []
+    episode_failures: list[dict[str, object]] = []
+    failed_engines: set[int] = set()
     pending: set[int] = set()
     live_engines: set[int] = set()
     engine_packet_counts = {spec.engine_index: 0 for spec in normalized_specs}
@@ -1724,12 +2343,44 @@ def collect_async_cluster_wave_v4(
     direct_row_packed_batches = 0
     direct_row_packed_fallbacks = 0
     deferred_storage_finalize_seconds = 0.0
+    rollout_finalize_seconds = 0.0
+    packed_tail_padding_seconds = 0.0
     collector_affinity = os.sched_getaffinity(0)
     # Keep exactly one blocking receive outstanding per remote engine. Frames
     # can arrive while the main thread runs GPU inference and rollout storage.
     receive_executor = ThreadPoolExecutor(max_workers=len(normalized_specs), thread_name_prefix="ppo-remote-receive")
 
+    def drop_failed_engine(engine_index: int, packet: Mapping[str, object]) -> None:
+        """Forget every match of a failed engine and every frame it stored this segment."""
+
+        episode_failures.extend(episode_failure_records_v4(engine_index, by_engine[engine_index], packet))
+        failed_engines.add(engine_index)
+        pending.discard(engine_index)
+        live_engines.discard(engine_index)
+        for actor in current_actors:
+            if actor.engine_index != engine_index:
+                continue
+            row = current_row_by_actor[(actor.engine_index, actor.local_actor)]
+            for valid in sync_valid:
+                valid[row] = False
+            for forced in sync_forced_gate:
+                forced[row] = False
+            for started_row in sync_episode_start:
+                started_row[row] = False
+            for terminated_row in sync_terminated:
+                terminated_row[row] = False
+            for truncated_row in sync_truncated:
+                truncated_row[row] = False
+            sync_last_transition[row] = -1
+            sync_boundary_next_value_valid[row] = False
+        try:
+            parents[engine_index].close()
+        except Exception:
+            pass
+
     def apply_reward_updates(engine_index: int, updates: object) -> None:
+        if engine_index in failed_engines:
+            return
         if not isinstance(updates, tuple):
             raise TypeError("async reward update payload changed type")
         for local_actor, reward, terminated, truncated in updates:
@@ -1848,7 +2499,8 @@ def collect_async_cluster_wave_v4(
             sync_truncated[transition][storage_row] = True
 
     def finalize_segment_rollout() -> StoredRolloutV4:
-        nonlocal storage_seconds, deferred_storage_finalize_seconds
+        nonlocal storage_seconds, deferred_storage_finalize_seconds, packed_tail_padding_seconds
+        packed_storage = None
         if deferred_packed_observations:
             finalize_started = time.perf_counter()
             flat_indices = torch.cat(deferred_flat_indices)
@@ -1894,18 +2546,42 @@ def collect_async_cluster_wave_v4(
             storage_seconds += deferred_storage_finalize_seconds
         if not sync_observations:
             raise RuntimeError("rectangular async collection stored no decisions")
-        if any(item is None for item in sync_last_observation_rows) or any(
-            item is None for item in sync_last_action_rows
+        lane_has_data = torch.stack(sync_valid).any(dim=0)
+        if any(
+            (observation_row is None or action_row is None) and bool(lane_has_data[row])
+            for row, (observation_row, action_row) in enumerate(
+                zip(sync_last_observation_rows, sync_last_action_rows, strict=True)
+            )
         ):
             raise RuntimeError("rectangular async collection lacks padding rows")
+        # A dropped (failed) lane may never have stored a frame: pad it with any
+        # stored row; the lane is removed below by ``select_lanes``.
+        fallback_observation_row = next((item for item in sync_last_observation_rows if item is not None), None)
+        fallback_action_row = next((item for item in sync_last_action_rows if item is not None), None)
+        if fallback_observation_row is None or fallback_action_row is None:
+            raise RuntimeError("rectangular async collection lacks padding rows")
         last_observation_rows = tuple(
-            item[0].narrow_batch(item[1], 1) for item in sync_last_observation_rows if item is not None
+            (fallback_observation_row if item is None else item)[0].narrow_batch(
+                (fallback_observation_row if item is None else item)[1], 1
+            )
+            for item in sync_last_observation_rows
         )
-        last_action_rows = tuple(item[0].narrow_batch(item[1], 1) for item in sync_last_action_rows if item is not None)
+        last_action_rows = tuple(
+            (fallback_action_row if item is None else item)[0].narrow_batch(
+                (fallback_action_row if item is None else item)[1], 1
+            )
+            for item in sync_last_action_rows
+        )
         sync_last_observation = cast(
             UniversalSemanticBatchV4, concatenate_padded_tensor_records_v4(last_observation_rows)
         )
         sync_last_action = cast(ActionSequenceV4, concatenate_tensor_records(last_action_rows))
+        valid_mask = torch.stack(sync_valid)
+        tail_started = time.perf_counter()
+        packed_tail_filled = packed_storage is not None and _pad_packed_rollout_tail_v4(
+            packed_storage, sync_last_observation, valid_mask
+        )
+        packed_tail_padding_seconds = time.perf_counter() - tail_started
         final_observations: list[UniversalSemanticBatchV4] = []
         final_actions: list[ActionSequenceV4] = []
         for transition, valid in enumerate(sync_valid):
@@ -1914,7 +2590,7 @@ def collect_async_cluster_wave_v4(
             if observation is None or action is None:
                 raise RuntimeError("rectangular rollout contains an empty step")
             missing_indices = (~valid).nonzero(as_tuple=False).flatten()
-            if missing_indices.numel():
+            if missing_indices.numel() and not packed_tail_filled:
                 observation = cast(
                     UniversalSemanticBatchV4,
                     _scatter_storage_rows(
@@ -1925,6 +2601,7 @@ def collect_async_cluster_wave_v4(
                         clone_previous=False,
                     ),
                 )
+            if missing_indices.numel():
                 action = cast(
                     ActionSequenceV4,
                     _scatter_storage_rows(
@@ -1937,7 +2614,6 @@ def collect_async_cluster_wave_v4(
                 )
             final_observations.append(observation)
             final_actions.append(action)
-        valid_mask = torch.stack(sync_valid)
         behavior_value = torch.stack(sync_values)
         terminated = torch.stack(sync_terminated)
         next_value = torch.zeros_like(behavior_value)
@@ -1952,6 +2628,7 @@ def collect_async_cluster_wave_v4(
                 next_value[transition, row] = sync_boundary_next_value[row]
         rollout = StoredRolloutV4(
             observations=tuple(final_observations),
+            packed_observation_rows=packed_storage,
             actions=tuple(final_actions),
             episode_start=torch.stack(sync_episode_start),
             valid_mask=valid_mask,
@@ -1967,6 +2644,7 @@ def collect_async_cluster_wave_v4(
             action_temperature=current_model.ppo_action_temperature,
             continue_temperature=current_model.ppo_continue_temperature,
             policy_state_id=policy_state_id,
+            lane_keys=tuple((actor.engine_index, actor.local_actor) for actor in current_actors),
         )
         active_lanes = valid_mask.any(dim=0).nonzero(as_tuple=False).flatten()
         if not active_lanes.numel():
@@ -1992,6 +2670,8 @@ def collect_async_cluster_wave_v4(
                 "action_seconds": action_seconds,
                 "storage_seconds": storage_seconds,
                 "deferred_storage_finalize_seconds": (deferred_storage_finalize_seconds),
+                "rollout_finalize_seconds": rollout_finalize_seconds,
+                "packed_tail_padding_seconds": packed_tail_padding_seconds,
                 "packed_relation_capacity": float(packed_relation_capacity),
                 "packed_effect_capacity": float(packed_effect_capacity),
                 "packed_schema_expansions": float(packed_schema_expansions),
@@ -2027,6 +2707,9 @@ def collect_async_cluster_wave_v4(
                 "initial_hidden_abs_max": float(rollout.initial_state.hidden.abs().max()),
                 "live_engines": float(len(live_engines)),
                 "configured_engines": float(len(normalized_specs)),
+                "configured_matches": float(len(assignments)),
+                "episode_failure_count": float(len(episode_failures)),
+                "episode_failures": tuple(dict(row) for row in episode_failures),  # type: ignore[dict-item]
                 "inference_batches": float(inference_batches),
                 "inference_mean_frame_packets": (inference_frame_packets / max(inference_batches, 1)),
                 "inference_mean_actor_rows": (inference_actor_rows / max(inference_batches, 1)),
@@ -2047,6 +2730,7 @@ def collect_async_cluster_wave_v4(
         nonlocal packed_schema_expansions
         nonlocal direct_row_packed_batches, direct_row_packed_fallbacks
         nonlocal deferred_storage_finalize_seconds, segment_episode_start
+        nonlocal rollout_finalize_seconds, packed_tail_padding_seconds
         policy_state_id = next_policy_state_id
         current_state_indices = torch.tensor(
             [fixed_row[("current", actor.engine_index, actor.local_actor)] for actor in current_actors],
@@ -2082,6 +2766,7 @@ def collect_async_cluster_wave_v4(
         }
         reports.clear()
         timings.clear()
+        episode_failures.clear()
         started = time.perf_counter()
         inference_seconds = 0.0
         assembly_seconds = 0.0
@@ -2102,6 +2787,8 @@ def collect_async_cluster_wave_v4(
         direct_row_packed_batches = 0
         direct_row_packed_fallbacks = 0
         deferred_storage_finalize_seconds = 0.0
+        rollout_finalize_seconds = 0.0
+        packed_tail_padding_seconds = 0.0
         for engine_index in engine_packet_counts:
             engine_packet_counts[engine_index] = 0
             engine_actor_rows[engine_index] = 0
@@ -2118,7 +2805,12 @@ def collect_async_cluster_wave_v4(
                     "assignments": by_engine[spec.engine_index],
                     "gamma_per_decision": gamma_per_decision,
                     "shaping_beta": shaping_beta,
+                    "terminal_reward_scale": terminal_reward_scale,
                     "fireball_king_activation_penalty": fireball_king_activation_penalty,
+                    "king_activation_penalty": king_activation_penalty,
+                    "king_activation_scope": king_activation_scope,
+                    "king_shaping_mode": king_shaping_mode,
+                    "king_potential_weight": king_potential_weight,
                     "hog_deploy_reward": hog_deploy_reward,
                     "hog_deploy_reward_episode_cap": hog_deploy_reward_episode_cap,
                     "hog_deploy_opening_reward": hog_deploy_opening_reward,
@@ -2167,24 +2859,36 @@ def collect_async_cluster_wave_v4(
             nonlocal packed_schema_expansions
             while pending:
                 ready_wait_started = time.perf_counter()
-                ready_futures, _unfinished = wait_futures(tuple(receive_futures), return_when=FIRST_COMPLETED)
-                deadline = time.perf_counter() + _INFERENCE_BATCH_WAIT_SECONDS
-                while True:
-                    remaining = deadline - time.perf_counter()
-                    if remaining <= 0:
-                        break
-                    extra, _unfinished = wait_futures(
-                        tuple(future for future in receive_futures if future not in ready_futures),
-                        timeout=remaining,
-                        return_when=FIRST_COMPLETED,
-                    )
-                    if not extra:
-                        break
-                    ready_futures.update(extra)
+                wait_budget = _INFERENCE_BATCH_WAIT_SECONDS
+                if adaptive_batching:
+                    # Spend at most one observed GPU batch's latency waiting
+                    # for a fuller batch, capped at 25 ms. Native time only
+                    # advances after actions, so this changes scheduling alone.
+                    wait_budget = min(0.025, max(wait_budget, model_seconds / max(inference_batches, 1)))
+                ready_futures = _await_inference_batch_v4(
+                    receive_futures, wait_seconds=wait_budget, gather_all=adaptive_batching)
                 ready_wait_seconds += time.perf_counter() - ready_wait_started
 
                 receive_started = time.perf_counter()
-                received_with_durations = tuple(future.result() for future in ready_futures)
+
+                def received_or_failure(future: Any) -> tuple[Any, object, float]:
+                    try:
+                        return future.result()
+                    except Exception as error:
+                        if not tolerate_episode_failures:
+                            raise
+                        return (
+                            receive_futures[future],
+                            {
+                                "kind": "error",
+                                "error": repr(error),
+                                "error_type": type(error).__name__,
+                                "error_message": f"worker connection lost: {error}"[:EPISODE_FAILURE_MESSAGE_CHARS],
+                            },
+                            0.0,
+                        )
+
+                received_with_durations = tuple(received_or_failure(future) for future in ready_futures)
                 for future in ready_futures:
                     del receive_futures[future]
                 received = tuple((connection, packet) for connection, packet, _duration in received_with_durations)
@@ -2202,6 +2906,9 @@ def collect_async_cluster_wave_v4(
                         raise RuntimeError("async worker packet changed type")
                     kind = packet.get("kind")
                     if kind == "error":
+                        if tolerate_episode_failures:
+                            drop_failed_engine(engine_index, packet)
+                            continue
                         raise RuntimeError(
                             f"async engine {engine_index} failed: {packet.get('error')}\n{packet.get('traceback')}"
                         )
@@ -2239,6 +2946,7 @@ def collect_async_cluster_wave_v4(
                 storage_actors: list[_ActorIdentityV4] = []
                 frame_batches: list[UniversalSemanticBatchV4] = []
                 frame_packed_batches: list[Any] = []
+                frame_lengths: list[int] = []
                 for engine_index, packet in frames:
                     actor_rows = packet.get("actor_rows")
                     storage_actor_rows = packet.get("storage_actor_rows")
@@ -2270,15 +2978,44 @@ def collect_async_cluster_wave_v4(
                     storage_actors.extend(
                         actor_by_engine_local[(engine_index, int(local_actor))] for local_actor in storage_actor_rows
                     )
-                    frame_batches.append(
-                        batch
-                        if len(actor_rows) == batch.batch_size
-                        else cast(UniversalSemanticBatchV4, batch.narrow_batch(0, len(actor_rows)))
-                    )
+                    frame_batches.append(batch)
+                    frame_lengths.append(len(actor_rows))
                     if row_packed_batch is not None:
                         if not hasattr(row_packed_batch, "narrow_rows"):
                             raise RuntimeError("async row-packed frame changed type")
-                        frame_packed_batches.append(row_packed_batch.narrow_rows(0, len(actor_rows)))
+                        frame_packed_batches.append(row_packed_batch)
+
+                entries_by_model: dict[str, list[_ActorIdentityV4]] = {key: [] for key in actors_by_key}
+                source_rows_by_model: dict[str, list[int]] = {key: [] for key in actors_by_key}
+                for source_row, actor in enumerate(active_actors):
+                    inference_key = _inference_model_key(actor)
+                    entries_by_model[inference_key].append(actor)
+                    source_rows_by_model[inference_key].append(source_row)
+                if storage_actors != entries_by_model.get("current", []):
+                    raise RuntimeError("async current-policy storage row order changed")
+
+                with torch.inference_mode(False):
+                    model_packed_batches = (
+                        model_packed_arena.assemble(tuple(zip(frame_packed_batches, frame_lengths)), source_rows_by_model)
+                        if len(frame_packed_batches) == len(frame_batches) else None
+                    )
+                if model_packed_batches is not None:
+                    direct_row_packed_batches += 1
+                    assembly_seconds += time.perf_counter() - assembly_started
+                    return {
+                        "frames": frames, "deferred_reward_updates": deferred_reward_updates,
+                        "active_packed_batch": None, "model_packed_batches": model_packed_batches,
+                        "entries_by_model": entries_by_model, "source_rows_by_model": source_rows_by_model,
+                        "active_force_flags": active_force_flags, "actor_rows": len(active_actors),
+                    }
+
+                frame_batches = [
+                    batch if length == batch.batch_size else batch.narrow_batch(0, length)
+                    for batch, length in zip(frame_batches, frame_lengths)
+                ]
+                frame_packed_batches = [
+                    batch.narrow_rows(0, length) for batch, length in zip(frame_packed_batches, frame_lengths)
+                ] if len(frame_packed_batches) == len(frame_lengths) else []
 
                 with torch.inference_mode(False):
                     direct_packed_batch = (
@@ -2343,7 +3080,9 @@ def collect_async_cluster_wave_v4(
         while pending or bool(sync_valid):
             if not pending:
                 segment_elapsed = time.perf_counter() - started
+                finalize_started = time.perf_counter()
                 segment_rollout = finalize_segment_rollout()
+                rollout_finalize_seconds = time.perf_counter() - finalize_started
                 final_segment_collection = build_segment_collection(segment_rollout, elapsed_seconds=segment_elapsed)
                 next_policy_state_id = segment_callback(final_segment_collection)
                 if next_policy_state_id is None or not live_engines:
@@ -2377,6 +3116,7 @@ def collect_async_cluster_wave_v4(
             inference_actor_rows += int(prepared["actor_rows"])
             inference_started = time.perf_counter()
             active_packed_batch = cast(_RowPackedTensorRecordV4, prepared["active_packed_batch"])
+            model_packed_batches = prepared.get("model_packed_batches")
             entries_by_model = cast(dict[str, list[_ActorIdentityV4]], prepared["entries_by_model"])
             source_rows_by_model = cast(dict[str, list[int]], prepared["source_rows_by_model"])
             active_force_flags = cast(list[bool], prepared["active_force_flags"])
@@ -2393,18 +3133,31 @@ def collect_async_cluster_wave_v4(
             for key, entries in entries_by_model.items():
                 if not entries:
                     continue
-                active_batch_indices = torch.tensor(source_rows_by_model[key], dtype=torch.long)
                 with torch.inference_mode(False):
-                    active_model_packed = active_packed_batch.index_select(active_batch_indices)
+                    if model_packed_batches is not None:
+                        partition = model_packed_batches[key]
+                        # Rollout storage retains observations until the update;
+                        # own these rows before commands can overwrite receive buffers.
+                        if key == "current":
+                            active_model_packed = _RowPackedTensorRecordV4._from_buffers(partition, {
+                                dtype: buffer[:len(entries)].clone() for dtype, buffer in partition.buffers.items()
+                            })
+                        else:
+                            active_model_packed = partition.narrow_rows(0, len(entries))
+                    else:
+                        active_batch_indices = torch.tensor(source_rows_by_model[key], dtype=torch.long)
+                        active_model_packed = active_packed_batch.index_select(active_batch_indices)
                     active_model_batch = active_model_packed.record
                     if key == "current":
                         current_storage_packed = active_model_packed
-                active_indices = torch.tensor(
-                    [fixed_row[(key, actor.engine_index, actor.local_actor)] for actor in entries],
-                    dtype=torch.long,
-                    device=device,
-                )
-                active_state = states[key].index_select(active_indices)
+                state_rows = [fixed_row[(key, actor.engine_index, actor.local_actor)] for actor in entries]
+                start_rows = [(actor.engine_index, actor.local_actor) not in actor_started for actor in entries]
+                has_force_request = any(active_force_flags[row] for row in source_rows_by_model[key])
+                active_indices = None
+                active_state = None
+                if not indexed_state_graphs or has_force_request:
+                    active_indices = torch.tensor(state_rows, dtype=torch.long, pin_memory=True).to(device, non_blocking=True)
+                    active_state = states[key].index_select(active_indices)
                 model_capacity = _ppo_cuda_graph_row_capacity_v4(len(entries))
                 if len(entries) < model_capacity:
                     pad_rows = torch.cat(
@@ -2413,48 +3166,61 @@ def collect_async_cluster_wave_v4(
                             torch.zeros(model_capacity - len(entries), dtype=torch.long),
                         )
                     )
-                    packed_batch = active_model_packed.index_select(pad_rows)
-                    batch = packed_batch.record
-                    state_pad = torch.cat(
-                        (
-                            torch.arange(len(entries), device=device),
-                            torch.zeros(model_capacity - len(entries), dtype=torch.long, device=device),
-                        )
+                    packed_batch = (
+                        model_packed_batches[key] if model_packed_batches is not None
+                        else active_model_packed.index_select(pad_rows)
                     )
-                    model_state = active_state.index_select(state_pad)
+                    batch = packed_batch.record
+                    model_state = None
+                    if not indexed_state_graphs:
+                        state_pad = torch.cat(
+                            (torch.arange(len(entries), device=device),
+                             torch.zeros(model_capacity - len(entries), dtype=torch.long, device=device)))
+                        model_state = active_state.index_select(state_pad)
                 else:
-                    batch = active_model_batch
-                    packed_batch = active_model_packed
+                    packed_batch = model_packed_batches[key] if model_packed_batches is not None else active_model_packed
+                    batch = packed_batch.record
                     model_state = active_state
-                episode_start = torch.tensor(
-                    [(actor.engine_index, actor.local_actor) not in actor_started for actor in entries]
-                    + [False] * (model_capacity - len(entries)),
-                    dtype=torch.bool,
-                    device=device,
-                )
+                episode_start = None
+                if not indexed_state_graphs or has_force_request:
+                    episode_start = torch.tensor(
+                        start_rows + [False] * (model_capacity - len(entries)),
+                        dtype=torch.bool, pin_memory=True).to(device, non_blocking=True)
                 graph = _persistent_rollout_graph_v4(
                     models[key],
                     device,
                     model_capacity,
                     effect_capacity=int(batch.active_effects.mask.shape[1]),
                     relation_capacity=int(batch.relation_edges.mask.shape[1]),
+                    isolated=bool(model_streams),
+                    state_bank=states[key] if indexed_state_graphs else None,
+                    actor_capacity=len(actors) if indexed_state_graphs else 0,
+                    state_bank_key=key,
                 )
                 if graph is None:
                     raise RuntimeError("production rollout CUDA graph is unavailable")
+                if indexed_state_graphs:
+                    if not isinstance(graph, _IndexedStateCudaGraphV4):
+                        raise RuntimeError("indexed rollout graph changed type")
+                    graph.prepare(state_rows, start_rows)
                 model_stream = model_streams.get(key)
                 if model_stream is not None:
                     if coordinator_stream is None:
                         raise RuntimeError("parallel model coordinator is unavailable")
                     model_stream.wait_stream(coordinator_stream)
                 with torch.cuda.stream(model_stream) if model_stream is not None else nullcontext():
-                    output = graph.run(models[key], batch, model_state, episode_start, packed_batch)
-                    selected_next = cast(RecurrentPolicyStateV4, output.next_state.narrow_batch(0, len(entries)))
-                    selected_next = RecurrentPolicyStateV4(
-                        hidden=selected_next.hidden.to(dtype=states[key].hidden.dtype),
-                        cell=selected_next.cell.to(dtype=states[key].cell.dtype),
-                    )
-                    states[key].hidden.index_copy_(0, active_indices, selected_next.hidden)
-                    states[key].cell.index_copy_(0, active_indices, selected_next.cell)
+                    if indexed_state_graphs:
+                        output = graph.run_indexed(models[key], batch, packed_batch)
+                        selected_next = None
+                    else:
+                        output = graph.run(models[key], batch, model_state, episode_start, packed_batch)
+                        selected_next = cast(RecurrentPolicyStateV4, output.next_state.narrow_batch(0, len(entries)))
+                        selected_next = RecurrentPolicyStateV4(
+                            hidden=selected_next.hidden.to(dtype=states[key].hidden.dtype),
+                            cell=selected_next.cell.to(dtype=states[key].cell.dtype),
+                        )
+                        states[key].hidden.index_copy_(0, active_indices, selected_next.hidden)
+                        states[key].cell.index_copy_(0, active_indices, selected_next.cell)
                 if model_stream is not None:
                     # Coordinator-owned scratch tensors must outlive asynchronous
                     # consumption on the model stream; otherwise the CUDA allocator
@@ -2470,12 +3236,14 @@ def collect_async_cluster_wave_v4(
                 )
                 if requested_force.any():
                     legal_force = (
-                        ShadowCandidateLegality(active_model_batch.candidates, models[key].config)
+                        _match_shadow_legality_v4(active_model_batch, models[key].config)
                         .candidate_mask()
                         .any(dim=-1)
                     )
                     requested_force &= legal_force.cpu()
                 if requested_force.any():
+                    if active_state is None or episode_start is None:
+                        raise RuntimeError("forced ACT lost its pre-inference recurrent state")
                     force_context_by_key[key] = (
                         active_model_batch,
                         active_state,
@@ -2528,10 +3296,13 @@ def collect_async_cluster_wave_v4(
             command_forced_actor_rows: dict[int, list[int]] = {engine_index: [] for engine_index, _packet in frames}
             stored_actions_by_key: dict[str, ActionSequenceV4] = {}
             stored_forced_gate_by_key: dict[str, Tensor] = {}
+            host_actions_by_key = _pack_model_actions_to_cpu_v4({
+                key: (outputs[key].actions, len(entries)) for key, entries in entries_by_model.items() if entries
+            })
             for key, entries in entries_by_model.items():
                 if not entries:
                     continue
-                stored_actions, packed_actions = _pack_action_batch_to_cpu(outputs[key].actions, len(entries))
+                stored_actions, packed_actions = host_actions_by_key[key]
                 stored_actions_by_key[key] = stored_actions
                 forced_rows = set(int(value) for value in forced_rows_by_key.get(key, torch.empty(0, dtype=torch.long)))
                 stored_forced_gate = torch.zeros(len(entries), dtype=torch.bool)

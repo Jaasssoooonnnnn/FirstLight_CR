@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from .learning import generalized_advantage_estimate
+from .remote_worker_transport import ReceivedRowPackedTensorRecord
 from .tensors import ActionSequenceV4, GATE_ACT, RecurrentPolicyStateV4, UniversalSemanticBatchV4
 
 
@@ -41,6 +42,12 @@ class StoredRolloutV4:
     continue_temperature: float
     policy_state_id: str
     forced_gate_mask: Tensor | None = None
+    # Optional time-major row buffers backing observations, owned by this
+    # rollout. Legacy collectors need not supply them.
+    packed_observation_rows: object | None = None
+    # Stable (engine index, local actor) keys across segments of one resident
+    # session; select_lanes keeps these aligned when failed lanes disappear.
+    lane_keys: tuple[tuple[int, int], ...] | None = None
 
     @property
     def time_steps(self) -> int:
@@ -58,6 +65,10 @@ class StoredRolloutV4:
         if any(item.batch_size != batch_size for item in self.observations):
             raise ValueError("rollout observation batch size changed over time")
         shape = (time_steps, batch_size)
+        if self.lane_keys is not None and (
+            len(self.lane_keys) != batch_size or len(set(self.lane_keys)) != batch_size
+        ):
+            raise ValueError("rollout lane keys must uniquely identify each lane")
         for value, label in (
             (self.episode_start, "episode_start"),
             (self.valid_mask, "valid_mask"),
@@ -110,11 +121,29 @@ class StoredRolloutV4:
         def select_time(value: Tensor) -> Tensor:
             return value.index_select(1, indices.to(value.device))
 
+        packed = None
+        if isinstance(self.packed_observation_rows, ReceivedRowPackedTensorRecord) and indices.numel():
+            source = self.packed_observation_rows
+            if source.batch_size != self.time_steps * self.batch_size:
+                raise ValueError("packed rollout dimensions do not match T*B")
+            # Failed episodes are removed here. Preserve the dtype-packed fast
+            # path for all surviving lanes instead of falling back for the
+            # entire rank. index_select also checks the original lane bounds.
+            selected = torch.arange(self.batch_size).index_select(0, indices.cpu())
+            rows = (torch.arange(self.time_steps)[:, None] * self.batch_size + selected[None, :]).reshape(-1)
+            packed = source.index_select(rows)
+            observations = tuple(
+                packed.narrow_rows(step * len(selected), len(selected)).record for step in range(self.time_steps)
+            )
+        else:
+            observations = tuple(item.index_select(indices.to(item.match_scalars.device)) for item in self.observations)
         return replace(
             self,
-            observations=tuple(item.index_select(indices.to(item.match_scalars.device)) for item in self.observations),
+            packed_observation_rows=packed,
+            observations=observations,
             actions=tuple(item.index_select(indices.to(item.gate.device)) for item in self.actions),
             initial_state=self.initial_state.index_select(indices.to(self.initial_state.hidden.device)),
+            lane_keys=(None if self.lane_keys is None else tuple(self.lane_keys[i] for i in indices.cpu().tolist())),
             **{
                 name: select_time(value)
                 for name, value in ((item.name, getattr(self, item.name)) for item in fields(self))

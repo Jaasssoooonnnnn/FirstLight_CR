@@ -203,24 +203,33 @@ struct CombatCaptureContext {
   std::int32_t tick = -1;
 };
 
-CombatRingSlot g_combat_event_ring[kCombatEventRingCapacity];
-CombatCausalMarker g_combat_death_markers[kCombatCausalMarkerCapacity];
-CombatCausalMarker g_combat_terminal_markers[kCombatCausalMarkerCapacity];
-std::atomic<std::uint64_t> g_combat_next_sequence{1};
-std::atomic<std::uint64_t> g_combat_next_deployment_sequence{1};
-std::atomic<std::uint64_t> g_combat_epoch_first_sequence{1};
-std::atomic<std::uint64_t> g_combat_overflow_count{0};
-std::atomic<std::uint64_t> g_combat_rejected_capture_count{0};
-std::atomic<void *> g_combat_game_manager{nullptr};
-std::atomic<void *> g_combat_object_manager{nullptr};
-std::atomic<std::uint64_t> g_combat_generation{0};
-std::atomic<std::uint64_t> g_combat_state_epoch{0};
-std::atomic<bool> g_combat_epoch_active{false};
+// Everything combat capture retains for one match between native steps: the
+// retained ring, its sequence/epoch identity and the causal markers that join a
+// later death or despawn to the event that caused it. Hooks publish into the
+// bound instance (see MatchTelemetry in cr_replay_probe.cpp).
+struct CombatMatchTelemetry {
+  cr_combat_deployment::QueuedMirrorProofStore queued_mirror_proofs;
+  CombatRingSlot event_ring[kCombatEventRingCapacity];
+  CombatCausalMarker death_markers[kCombatCausalMarkerCapacity];
+  CombatCausalMarker terminal_markers[kCombatCausalMarkerCapacity];
+  std::atomic<std::uint64_t> next_sequence{1};
+  std::atomic<std::uint64_t> next_deployment_sequence{1};
+  std::atomic<std::uint64_t> epoch_first_sequence{1};
+  std::atomic<std::uint64_t> overflow_count{0};
+  std::atomic<std::uint64_t> rejected_capture_count{0};
+  std::atomic<void *> game_manager{nullptr};
+  std::atomic<void *> object_manager{nullptr};
+  std::atomic<std::uint64_t> generation{0};
+  std::atomic<std::uint64_t> state_epoch{0};
+  std::atomic<bool> epoch_active{false};
+};
+
+CombatMatchTelemetry g_combat_default_match;
+CombatMatchTelemetry *g_combat_match = &g_combat_default_match;
 std::atomic<bool> g_combat_hooks_attested{false};
 std::atomic<bool> g_combat_hooks_installed{false};
 std::atomic<bool> g_combat_hooks_enabled{false};
 thread_local CombatDeploymentContext g_combat_active_deployment;
-cr_combat_deployment::QueuedMirrorProofStore g_combat_queued_mirror_proofs;
 thread_local CombatDeploymentContext g_combat_pending_deployments[kPlayerCount];
 
 using CombatDamageFunction = std::int32_t (*)(void *, std::int32_t, std::int32_t, std::int32_t, void *, std::int32_t,
@@ -372,13 +381,13 @@ void *combat_object_manager_from_game_manager(void *game_manager) {
 }
 
 void reset_combat_causal_state() {
-  for (CombatCausalMarker &marker : g_combat_death_markers) {
+  for (CombatCausalMarker &marker : g_combat_match->death_markers) {
     marker = {};
   }
-  for (CombatCausalMarker &marker : g_combat_terminal_markers) {
+  for (CombatCausalMarker &marker : g_combat_match->terminal_markers) {
     marker = {};
   }
-  g_combat_queued_mirror_proofs.clear();
+  g_combat_match->queued_mirror_proofs.clear();
   g_combat_active_deployment = {};
   for (CombatDeploymentContext &pending : g_combat_pending_deployments) {
     pending = {};
@@ -386,24 +395,24 @@ void reset_combat_causal_state() {
 }
 
 void begin_combat_event_epoch(void *game_manager, std::uint64_t generation, std::uint64_t state_epoch) {
-  g_combat_epoch_active.store(false, std::memory_order_release);
-  g_combat_game_manager.store(game_manager, std::memory_order_release);
-  g_combat_object_manager.store(nullptr, std::memory_order_release);
-  g_combat_generation.store(generation, std::memory_order_release);
-  g_combat_state_epoch.store(state_epoch, std::memory_order_release);
+  g_combat_match->epoch_active.store(false, std::memory_order_release);
+  g_combat_match->game_manager.store(game_manager, std::memory_order_release);
+  g_combat_match->object_manager.store(nullptr, std::memory_order_release);
+  g_combat_match->generation.store(generation, std::memory_order_release);
+  g_combat_match->state_epoch.store(state_epoch, std::memory_order_release);
   reset_combat_causal_state();
-  for (CombatRingSlot &slot : g_combat_event_ring) {
+  for (CombatRingSlot &slot : g_combat_match->event_ring) {
     slot.published_sequence.store(0, std::memory_order_release);
   }
-  const std::uint64_t first = g_combat_next_sequence.load(std::memory_order_acquire);
-  g_combat_epoch_first_sequence.store(first, std::memory_order_release);
-  g_combat_overflow_count.store(0, std::memory_order_release);
-  g_combat_rejected_capture_count.store(0, std::memory_order_release);
-  g_combat_epoch_active.store(game_manager != nullptr, std::memory_order_release);
+  const std::uint64_t first = g_combat_match->next_sequence.load(std::memory_order_acquire);
+  g_combat_match->epoch_first_sequence.store(first, std::memory_order_release);
+  g_combat_match->overflow_count.store(0, std::memory_order_release);
+  g_combat_match->rejected_capture_count.store(0, std::memory_order_release);
+  g_combat_match->epoch_active.store(game_manager != nullptr, std::memory_order_release);
 }
 
 void bind_combat_event_object_manager(void *game_manager) {
-  if (game_manager == nullptr || g_combat_game_manager.load(std::memory_order_acquire) != game_manager) {
+  if (game_manager == nullptr || g_combat_match->game_manager.load(std::memory_order_acquire) != game_manager) {
     return;
   }
   void *const object_manager = combat_object_manager_from_game_manager(game_manager);
@@ -412,35 +421,35 @@ void bind_combat_event_object_manager(void *game_manager) {
   if (read_combat_object_vector(object_manager, &objects, &count)) {
     (void)objects;
     (void)count;
-    g_combat_object_manager.store(object_manager, std::memory_order_release);
+    g_combat_match->object_manager.store(object_manager, std::memory_order_release);
   }
 }
 
 void end_combat_event_epoch(void *game_manager) {
-  if (game_manager != nullptr && g_combat_game_manager.load(std::memory_order_acquire) != game_manager) {
+  if (game_manager != nullptr && g_combat_match->game_manager.load(std::memory_order_acquire) != game_manager) {
     return;
   }
-  g_combat_epoch_active.store(false, std::memory_order_release);
-  g_combat_object_manager.store(nullptr, std::memory_order_release);
-  g_combat_game_manager.store(nullptr, std::memory_order_release);
+  g_combat_match->epoch_active.store(false, std::memory_order_release);
+  g_combat_match->object_manager.store(nullptr, std::memory_order_release);
+  g_combat_match->game_manager.store(nullptr, std::memory_order_release);
 }
 
 bool current_combat_capture_context(CombatCaptureContext *result) {
   if (result == nullptr || !g_combat_hooks_enabled.load(std::memory_order_acquire) ||
-      !g_combat_epoch_active.load(std::memory_order_acquire)) {
+      !g_combat_match->epoch_active.load(std::memory_order_acquire)) {
     return false;
   }
   for (int attempt = 0; attempt < 2; ++attempt) {
-    const std::uint64_t epoch_before = g_combat_state_epoch.load(std::memory_order_acquire);
+    const std::uint64_t epoch_before = g_combat_match->state_epoch.load(std::memory_order_acquire);
     CombatCaptureContext value;
-    value.game_manager = g_combat_game_manager.load(std::memory_order_acquire);
-    value.object_manager = g_combat_object_manager.load(std::memory_order_acquire);
-    value.generation = g_combat_generation.load(std::memory_order_acquire);
+    value.game_manager = g_combat_match->game_manager.load(std::memory_order_acquire);
+    value.object_manager = g_combat_match->object_manager.load(std::memory_order_acquire);
+    value.generation = g_combat_match->generation.load(std::memory_order_acquire);
     value.state_epoch = epoch_before;
     if (value.object_manager == nullptr && value.game_manager != nullptr) {
       value.object_manager = combat_object_manager_from_game_manager(value.game_manager);
     }
-    const std::uint64_t epoch_after = g_combat_state_epoch.load(std::memory_order_acquire);
+    const std::uint64_t epoch_after = g_combat_match->state_epoch.load(std::memory_order_acquire);
     if (epoch_before != epoch_after || value.game_manager == nullptr || value.generation == 0 ||
         value.state_epoch == 0) {
       continue;
@@ -575,11 +584,12 @@ bool capture_combat_deployment(const CombatCaptureContext &capture, void *owner_
     };
     exact_mirror_descriptor = cr_combat_deployment::exact_mirror_descriptor_match(
         static_cast<std::uint32_t>(card.card_id), consumed_identity, rebuilt_identity);
+
   }
   const cr_combat_deployment::DescriptorIdentity consumed_for_queue{
       reinterpret_cast<std::uintptr_t>(selection.card_data),
       reinterpret_cast<std::uintptr_t>(selection.secondary_data), selection.packed};
-  const bool queued_mirror = g_combat_queued_mirror_proofs.consume(
+  const bool queued_mirror = g_combat_match->queued_mirror_proofs.consume(
       static_cast<std::uint32_t>(card.card_id), reinterpret_cast<std::uintptr_t>(card.card_data),
       consumed_for_queue, capture.generation, capture.state_epoch, owner, deck_slot, capture.tick);
   exact_mirror_descriptor = exact_mirror_descriptor || queued_mirror;
@@ -658,7 +668,7 @@ bool capture_combat_deployment(const CombatCaptureContext &capture, void *owner_
   result->validated = true;
   result->generation = capture.generation;
   result->state_epoch = capture.state_epoch;
-  result->deployment_sequence = g_combat_next_deployment_sequence.fetch_add(1, std::memory_order_acq_rel);
+  result->deployment_sequence = g_combat_match->next_deployment_sequence.fetch_add(1, std::memory_order_acq_rel);
   result->owner = owner;
   result->played_card_global_id = played_card_global_id;
   result->effective_card_global_id = effective_card_global_id;
@@ -919,12 +929,12 @@ CombatRawRecord combat_base_record(const CombatCaptureContext &context, CombatRa
 }
 
 std::uint64_t publish_combat_record(CombatRawRecord record) {
-  const std::uint64_t sequence = g_combat_next_sequence.fetch_add(1, std::memory_order_acq_rel);
+  const std::uint64_t sequence = g_combat_match->next_sequence.fetch_add(1, std::memory_order_acq_rel);
   record.sequence = sequence;
-  CombatRingSlot &slot = g_combat_event_ring[(sequence - 1) % kCombatEventRingCapacity];
+  CombatRingSlot &slot = g_combat_match->event_ring[(sequence - 1) % kCombatEventRingCapacity];
   const std::uint64_t replaced = slot.published_sequence.exchange(0, std::memory_order_acq_rel);
   if (replaced != 0) {
-    g_combat_overflow_count.fetch_add(1, std::memory_order_relaxed);
+    g_combat_match->overflow_count.fetch_add(1, std::memory_order_relaxed);
   }
   slot.record = record;
   slot.published_sequence.store(sequence, std::memory_order_release);
@@ -951,7 +961,7 @@ void store_combat_marker(CombatCausalMarker *markers, std::uint64_t state_epoch,
     LOGE("combat capture rejected reason=causal-marker-capacity "
          "epoch=%llu nativeObjectId=%u sequence=%llu",
          static_cast<unsigned long long>(state_epoch), native_object_id, static_cast<unsigned long long>(sequence));
-    g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+    g_combat_match->rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   selected->used = true;
@@ -1013,7 +1023,7 @@ std::int32_t combat_damage_hook(void *component, std::int32_t requested, std::in
     LOGE("combat capture rejected reason=damage-post-state tick=%d "
          "targetNativeObjectId=%u",
          context.tick, record.target.native_object_id);
-    g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+    g_combat_match->rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
     return lethal;
   }
   record.requested_amount = requested;
@@ -1056,7 +1066,7 @@ std::int32_t combat_damage_hook(void *component, std::int32_t requested, std::in
          context.tick, record.target.native_object_id, requested, native_actual, expected_actual, record.pre_hp,
          record.post_hp, record.pre_builtin_shield, record.post_builtin_shield, record.pre_buff_shield,
          record.post_buff_shield, record.lethal ? 1 : 0);
-    g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+    g_combat_match->rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
     return lethal;
   }
   record.actual_amount = native_actual;
@@ -1083,7 +1093,7 @@ std::int32_t combat_damage_hook(void *component, std::int32_t requested, std::in
     death.kind = CombatRawKind::Death;
     death.cause_sequence = damage_sequence;
     const std::uint64_t death_sequence = publish_combat_record(death);
-    store_combat_marker(g_combat_death_markers, context.state_epoch, record.target.native_object_id, death_sequence);
+    store_combat_marker(g_combat_match->death_markers, context.state_epoch, record.target.native_object_id, death_sequence);
   }
   return lethal;
 }
@@ -1170,14 +1180,14 @@ extern "C" void cr_combat_heal_bridge(void *component, std::int32_t requested, s
              component_vector_valid ? 1 : 0, type_two_present ? 1 : 0, requested, modifier, record.pre_hp,
              record.post_hp, live_maximum_hp, record.pre_builtin_shield, record.post_builtin_shield,
              live_maximum_shield);
-        g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+        g_combat_match->rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
         return;
       }
     } else {
       LOGE("combat capture rejected reason=heal-post-state tick=%d "
            "targetNativeObjectId=%u membershipKnown=%d memberAfter=%d",
            context.tick, record.target.native_object_id, membership_known ? 1 : 0, member_after ? 1 : 0);
-      g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+      g_combat_match->rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
       return;
     }
   }
@@ -1203,7 +1213,7 @@ void combat_consume_card_hook(void *owner_root, const NativeCardSelection *descr
   const bool deployment_valid =
       capture_active && capture_combat_deployment(capture, owner_root, descriptor, &deployment);
   if (capture_active && !deployment_valid) {
-    g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+    g_combat_match->rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
   }
   g_combat_active_deployment = deployment_valid ? deployment : CombatDeploymentContext{};
   if (deployment_valid && deployment.owner >= 0 && deployment.owner < kPlayerCount) {
@@ -1232,7 +1242,7 @@ void combat_spawn_hook(void *object_manager, void *object, std::int32_t option, 
     return;
   }
   if (context.object_manager == nullptr) {
-    g_combat_object_manager.store(object_manager, std::memory_order_release);
+    g_combat_match->object_manager.store(object_manager, std::memory_order_release);
     context.object_manager = object_manager;
   }
   if (context.object_manager != object_manager) {
@@ -1327,9 +1337,9 @@ void combat_remove_hook(void *object_manager, void *object) {
     return;
   }
   const CombatCausalMarker death =
-      consume_combat_marker(g_combat_death_markers, context.state_epoch, record.target.native_object_id);
+      consume_combat_marker(g_combat_match->death_markers, context.state_epoch, record.target.native_object_id);
   const CombatCausalMarker terminal =
-      consume_combat_marker(g_combat_terminal_markers, context.state_epoch, record.target.native_object_id);
+      consume_combat_marker(g_combat_match->terminal_markers, context.state_epoch, record.target.native_object_id);
   if (death.used) {
     record.cause_sequence = death.sequence;
   } else if (terminal.used) {
@@ -1408,12 +1418,12 @@ std::int32_t combat_impact_hook(void *projectile, void *candidate, std::int32_t 
          context.tick, record.projectile.native_object_id, record.target.native_object_id, pre_count, pre_capacity,
          post_count, post_capacity, processed_readable ? 1 : 0, static_cast<std::int32_t>(target_decision),
          last_processed, result);
-    g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+    g_combat_match->rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
     return result;
   }
   const std::uint64_t sequence = publish_combat_record(record);
   if (read_object_field<std::uint8_t>(projectile, 0x170) != 0) {
-    store_combat_marker(g_combat_terminal_markers, context.state_epoch, record.projectile.native_object_id, sequence,
+    store_combat_marker(g_combat_match->terminal_markers, context.state_epoch, record.projectile.native_object_id, sequence,
                         CombatTerminalReason::ObjectImpact);
   }
   return result;
@@ -1457,7 +1467,7 @@ void combat_terminal_hook(void *projectile) {
     record.destination_after_x = read_object_field<std::int32_t>(projectile, 0x120);
     record.destination_after_y = read_object_field<std::int32_t>(projectile, 0x124);
     const std::uint64_t sequence = publish_combat_record(record);
-    store_combat_marker(g_combat_terminal_markers, context.state_epoch, record.projectile.native_object_id, sequence,
+    store_combat_marker(g_combat_match->terminal_markers, context.state_epoch, record.projectile.native_object_id, sequence,
                         record.terminal_reason);
   }
 }
@@ -1588,18 +1598,22 @@ bool append_combat_events_json(void *manager, std::uint64_t generation, std::uin
     return false;
   }
   const bool installed = g_combat_hooks_installed.load(std::memory_order_acquire);
-  const bool identity_matches = installed && g_combat_epoch_active.load(std::memory_order_acquire) &&
-                                g_combat_game_manager.load(std::memory_order_acquire) == manager &&
-                                g_combat_generation.load(std::memory_order_acquire) == generation &&
-                                g_combat_state_epoch.load(std::memory_order_acquire) == state_epoch;
-  const std::uint64_t next_sequence = g_combat_next_sequence.load(std::memory_order_acquire);
+  const bool identity_matches = installed && g_combat_match->epoch_active.load(std::memory_order_acquire) &&
+                                g_combat_match->game_manager.load(std::memory_order_acquire) == manager &&
+                                g_combat_match->generation.load(std::memory_order_acquire) == generation &&
+                                g_combat_match->state_epoch.load(std::memory_order_acquire) == state_epoch;
+  const std::uint64_t next_sequence = g_combat_match->next_sequence.load(std::memory_order_acquire);
   const std::uint64_t epoch_first =
-      identity_matches ? g_combat_epoch_first_sequence.load(std::memory_order_acquire) : next_sequence;
+      identity_matches ? g_combat_match->epoch_first_sequence.load(std::memory_order_acquire) : next_sequence;
   const std::uint64_t retained_oldest =
       next_sequence > epoch_first + kCombatEventRingCapacity ? next_sequence - kCombatEventRingCapacity : epoch_first;
-  const std::uint64_t transmit_from = retained_oldest;
-  const std::uint64_t overflow = identity_matches ? g_combat_overflow_count.load(std::memory_order_acquire) : 0;
-  const std::uint64_t rejected = identity_matches ? g_combat_rejected_capture_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t requested_transmit_from =
+      g_live_capture_delta_active ? g_live_capture_combat_from_sequence : retained_oldest;
+  const std::uint64_t transmit_from = requested_transmit_from < retained_oldest ? retained_oldest
+                                      : requested_transmit_from > next_sequence ? next_sequence
+                                                                                : requested_transmit_from;
+  const std::uint64_t overflow = identity_matches ? g_combat_match->overflow_count.load(std::memory_order_acquire) : 0;
+  const std::uint64_t rejected = identity_matches ? g_combat_match->rejected_capture_count.load(std::memory_order_acquire) : 0;
   JsonWriter json(response, response_size, used);
   json.begin_object();
   json.field("ok", true);
@@ -1632,7 +1646,7 @@ bool append_combat_events_json(void *manager, std::uint64_t generation, std::uin
   if (identity_matches) {
     bool first = true;
     for (std::uint64_t sequence = transmit_from; sequence < next_sequence; ++sequence) {
-      CombatRingSlot &slot = g_combat_event_ring[(sequence - 1) % kCombatEventRingCapacity];
+      CombatRingSlot &slot = g_combat_match->event_ring[(sequence - 1) % kCombatEventRingCapacity];
       if (slot.published_sequence.load(std::memory_order_acquire) != sequence) {
         LOGE("combat JSON ring mismatch sequence=%llu published=%llu", static_cast<unsigned long long>(sequence),
              static_cast<unsigned long long>(slot.published_sequence.load(std::memory_order_relaxed)));

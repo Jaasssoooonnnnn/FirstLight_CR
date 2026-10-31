@@ -1071,8 +1071,8 @@ class NativeOverlayApp:
 
         hand_action = HandAction(owner=selection.owner, hand_index=selection.hand_index, x=world_x, y=world_y)
         if self.owner is not None:
-            # Human vs AI: target the same next-tick input plus 20-tick native
-            # command interval used for the model's immediate play.
+            # Human vs AI: the card executes 20 ticks after the touch, the same
+            # delay BattleEnv gives the model's cards.
             self.env.queue_hand_action_at(
                 hand_action,
                 execute_tick=int(before["tick"]) + COMMAND_CONSUMPTION_STEPS,
@@ -1141,7 +1141,11 @@ class NativeOverlayApp:
         if self.owner is not None and owner != self.owner:
             raise RunnerError("这一方由模型控制")
         action = AbilityAction(*control.source_entity_key)
-        result = self.env.activate_ability(action)
+        if self.owner is not None:
+            # Human vs AI: the same touch-to-execution delay as cards and the model.
+            result = self.env.queue_ability_action_at(action, execute_in_ticks=COMMAND_CONSUMPTION_STEPS)
+        else:
+            result = self.env.activate_ability(action)
         return {**result, "owner": owner, "abilityName": control.ability_name}
 
     def _consume_action(self) -> None:

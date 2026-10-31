@@ -29,11 +29,16 @@
 
 ## 预训练模型
 
-**General 是较强的通用模型；作者使用 2.6 速猪专精模型打上了名人堂。**
+这个分支提供 **Everlight** 模型。训练前，对局环境改了两处：
 
-[训练历程](docs/training_history.md)记录了模型的训练过程和评测结果。
+- 下牌和放技能后要过 20 tick（1 秒）才生效，与真实游戏一致。回放重建、IL、PPO 和对战界面都按这个延迟执行；在对战界面里，玩家和模型都有这个延迟。
+- 模型能看到自己已经下出、但还没到场的牌。
 
-想尝试不同卡组，选择 **General**；想体验 2.6 速猪，选择 **Hog 2.6 specialist**。两个模型均在仓库中；文件用途与评测方法见[模型说明](checkpoints/README.md)。
+Everlight 的网络也更大：空间 CNN 为 128 通道、5 个残差块（原为 64 通道、3 个），LSTM 为 768 维（原为 512）。模型先经过模仿学习，再经过 PPO 自博弈训练，随附的是 PPO 第 80 次更新的 checkpoint。
+
+之前的五个模型（General、IL、Active IL 和两个 2.6 速猪专精模型）在 [`main`](https://github.com/Jaasssoooonnnnn/FirstLight_CR/tree/main) 分支。它们按旧时序训练，在这个分支上无法加载。
+
+加载与评测方法见[模型说明](checkpoints/README.md)。
 
 ## 主要功能
 
@@ -44,7 +49,7 @@
 - **本地对战与回放界面。** 支持模型对战、双边手动控制、训练回放与采集回放，共用一个离线 VM。
 - **项目源码。** 包含 probe、APK 构建工具、对局环境和训练代码。
 
-**122 张支持卡牌 · 5 个随附模型 · 252,238 场回放 · 17,836,160 条动作**
+**122 张支持卡牌 · 1 个随附模型 · 252,238 场回放 · 17,836,160 条动作**
 
 各版本支持的卡牌和形态见[兼容性说明](native_runner/data/competitive/README.md)。回放数据集在 [Hugging Face](https://huggingface.co/datasets/VanguardX101/IL_Replay) 下载。
 
@@ -98,13 +103,13 @@ Copy-Item .env.example .env
 
 使用 [IL_Replay](https://huggingface.co/datasets/VanguardX101/IL_Replay) 开始模仿学习，也可以先执行 `python tools/make_demo_data.py` 生成小规模流程样例。[训练指南](docs/training.md)覆盖缓存生成、IL、引擎集群、Linux AVD 准备及分布式 PPO。
 
-比较两个随附模型时，先停止控制台任务，再执行：
+比较两个模型时，先停止控制台任务，再运行评测器。下面的例子让 Everlight 和自己对战，用来快速检查流程：
 
 ```powershell
 ./native_runner/start_offline.ps1
 .\.venv\Scripts\python.exe -m native_runner.training.v4.evaluate `
-  --checkpoint-a ./checkpoints/General/checkpoint-step-00000460.pt `
-  --checkpoint-b ./checkpoints/IL/checkpoint-step-00029396.pt `
+  --checkpoint-a ./checkpoints/Everlight/v15-general-il100-kl5e-2-v80.pt `
+  --checkpoint-b ./checkpoints/Everlight/v15-general-il100-kl5e-2-v80.pt `
   --games 2 --output ./evaluations/comparison
 ```
 
