@@ -243,7 +243,9 @@ def test_tower_troop_identity_is_owner_exact_and_competitive_only() -> None:
         )
 
 
-def _special_tower_rich(ordinary: dict[str, object]) -> dict[str, object]:
+def _special_tower_rich(
+    ordinary: dict[str, object], *, chef_target: int = 5_000_006
+) -> dict[str, object]:
     rich = _rich(ordinary)
     dagger = {
         "schema": "native-tower-troop-runtime.v1",
@@ -268,7 +270,7 @@ def _special_tower_rich(ordinary: dict[str, object]) -> dict[str, object]:
                 "cookingContribution": 345_000,
                 "contributionNeeded": 460_000,
                 "throwDelayRemainingMs": 100,
-                "targetNativeObjectId": 5_000_006,
+                "targetNativeObjectId": chef_target,
             },
         },
     )
@@ -371,6 +373,33 @@ def test_royal_chef_runtime_can_end_after_both_side_towers_fall() -> None:
                 tower_troop1_id=159_000_004,
             ),
         )
+
+
+def test_royal_chef_target_that_died_this_tick_becomes_targetless_throw() -> None:
+    ordinary = _ordinary()
+    rich = _special_tower_rich(ordinary, chef_target=5_999_999)
+    native = _TransitionNativeStub(ordinary, rich, ordinary, rich)
+    env = _environment(native, build_card_catalog())
+
+    observations, _ = _reset_rich(
+        env,
+        match_config=MatchConfig(
+            deck0=SEMANTIC_BASELINE_DECK,
+            deck1=SEMANTIC_BASELINE_DECK,
+            tower_troop0_id=159_000_002,
+            tower_troop1_id=159_000_004,
+        ),
+    )
+
+    for observation in observations.values():
+        chef_king = next(
+            tower
+            for tower in observation.towers
+            if tower.owner == 1 and tower.tower_kind == "king"
+        )
+        assert isinstance(chef_king.tower_troop_runtime, RoyalChefRuntimeStateV1)
+        assert chef_king.tower_troop_runtime.throw_delay_remaining_ms == 100
+        assert chef_king.tower_troop_runtime.target_entity is None
 
 
 def test_exact_tower_activation_sets_public_status_from_native_event() -> None:

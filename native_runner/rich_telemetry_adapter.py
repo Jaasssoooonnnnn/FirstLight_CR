@@ -3131,12 +3131,12 @@ def bind_rich_telemetry(
         if tower_runtime is not None:
             if tower_troop_runtime is None or not tower_troop_runtime.complete or tower_runtime.observed_tick > tick:
                 raise RichTelemetryMergeError(f"slot {item.slot} tower-troop runtime lacks a complete envelope")
-            if isinstance(tower_runtime, RichRoyalChefRuntimeTelemetry):
-                target_native_id = tower_runtime.target_native_object_id
-                if target_native_id is not None and target_native_id not in by_native_object_id:
-                    raise RichTelemetryMergeError(
-                        f"slot {item.slot} Royal Chef target identity is outside the current object vector"
-                    )
+            # A Royal Chef target is deliberately not joined against this
+            # vector.  The probe validates the recipient when the Chef ticks,
+            # but that recipient can die later in the same tick and leave the
+            # object map while the throw delay is still pending; the native
+            # throw then lands in empty space.  BattleEnv maps such an absent
+            # target to a targetless pending throw.
 
     ordinary_player_values = _items(ordinary.get("players"), "ordinary.players")
     rich_player_values = _items(rich.get("players"), "rich.players")

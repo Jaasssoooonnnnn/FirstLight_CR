@@ -1716,6 +1716,42 @@ def test_adapter_preserves_royal_chef_wasted_throw() -> None:
     assert chef.tower_troop_runtime.target_native_object_id is None
 
 
+def test_adapter_accepts_royal_chef_target_that_left_the_object_vector() -> None:
+    ordinary = _ordinary()
+    rich = _rich(ordinary)
+    departed_target = 5_999_999
+    assert all(
+        item["nativeObjectId"] != departed_target  # type: ignore[index]
+        for item in ordinary["objects"]  # type: ignore[union-attr]
+    )
+    _set_tower_troop_runtime(
+        rich,
+        by_slot={
+            3: {
+                "schema": "native-tower-troop-runtime.v1",
+                "kind": "royal_chef",
+                "observedTick": 20,
+                "startDelayRemainingMs": 0,
+                "startDelayDurationMs": 7_000,
+                "cookingContribution": 460_460,
+                "contributionNeeded": 460_000,
+                "throwDelayRemainingMs": 50,
+                "targetNativeObjectId": departed_target,
+            },
+        },
+    )
+
+    snapshot = bind_rich_telemetry(ordinary, rich)
+
+    chef = snapshot.objects[3]
+    assert chef is not None and isinstance(
+        chef.tower_troop_runtime,
+        RichRoyalChefRuntimeTelemetry,
+    )
+    assert chef.tower_troop_runtime.target_native_object_id == departed_target
+    assert departed_target not in snapshot.objects_by_native_object_id
+
+
 def test_adapter_binds_typed_special_movement_runtime() -> None:
     ordinary = _ordinary()
     rich = _rich(ordinary)
