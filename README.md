@@ -30,6 +30,8 @@
 
 ## Pretrained models
 
+A newer model, Everlight, is on the [`yes-delay`](https://github.com/Jaasssoooonnnnn/FirstLight_CR/tree/yes-delay) branch. It has a larger network and plays with the real game's timing: a card takes effect 20 ticks (1 second) after it is played.
+
 **General is a strong model across decks. The author used the Hog 2.6 specialist to reach Hall of Fame.**
 
 The [training history](docs/training_history.md) covers how the models were trained and evaluated.

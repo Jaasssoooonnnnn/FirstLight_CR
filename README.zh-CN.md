@@ -29,6 +29,8 @@
 
 ## 预训练模型
 
+新模型 Everlight 在 [`yes-delay`](https://github.com/Jaasssoooonnnnn/FirstLight_CR/tree/yes-delay) 分支。它的网络更大，并且和真实游戏一样，下牌后 20 tick（1 秒）才生效。
+
 **General 是较强的通用模型；作者使用 2.6 速猪专精模型打上了名人堂。**
 
 [训练历程](docs/training_history.md)记录了模型的训练过程和评测结果。
