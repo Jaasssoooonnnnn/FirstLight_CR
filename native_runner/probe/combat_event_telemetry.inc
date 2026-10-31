@@ -220,6 +220,7 @@ std::atomic<bool> g_combat_hooks_attested{false};
 std::atomic<bool> g_combat_hooks_installed{false};
 std::atomic<bool> g_combat_hooks_enabled{false};
 thread_local CombatDeploymentContext g_combat_active_deployment;
+cr_combat_deployment::QueuedMirrorProofStore g_combat_queued_mirror_proofs;
 thread_local CombatDeploymentContext g_combat_pending_deployments[kPlayerCount];
 
 using CombatDamageFunction = std::int32_t (*)(void *, std::int32_t, std::int32_t, std::int32_t, void *, std::int32_t,
@@ -377,6 +378,7 @@ void reset_combat_causal_state() {
   for (CombatCausalMarker &marker : g_combat_terminal_markers) {
     marker = {};
   }
+  g_combat_queued_mirror_proofs.clear();
   g_combat_active_deployment = {};
   for (CombatDeploymentContext &pending : g_combat_pending_deployments) {
     pending = {};
@@ -574,6 +576,13 @@ bool capture_combat_deployment(const CombatCaptureContext &capture, void *owner_
     exact_mirror_descriptor = cr_combat_deployment::exact_mirror_descriptor_match(
         static_cast<std::uint32_t>(card.card_id), consumed_identity, rebuilt_identity);
   }
+  const cr_combat_deployment::DescriptorIdentity consumed_for_queue{
+      reinterpret_cast<std::uintptr_t>(selection.card_data),
+      reinterpret_cast<std::uintptr_t>(selection.secondary_data), selection.packed};
+  const bool queued_mirror = g_combat_queued_mirror_proofs.consume(
+      static_cast<std::uint32_t>(card.card_id), reinterpret_cast<std::uintptr_t>(card.card_data),
+      consumed_for_queue, capture.generation, capture.state_epoch, owner, deck_slot, capture.tick);
+  exact_mirror_descriptor = exact_mirror_descriptor || queued_mirror;
   if (card.card_data != selection.card_data && !exact_mirror_descriptor) {
     const std::int32_t selection_card_id = process_range_is_readable(selection.card_data, 0x44)
                                                ? read_object_field<std::int32_t>(selection.card_data, 0x40)
@@ -1212,11 +1221,11 @@ void combat_consume_card_hook(void *owner_root, const NativeCardSelection *descr
 void combat_spawn_hook(void *object_manager, void *object, std::int32_t option, std::int32_t commit_to_live) {
   const void *const caller_return = __builtin_return_address(0);
   g_original_combat_spawn(object_manager, object, option, commit_to_live);
-  if (commit_to_live == 0) {
-    return;
-  }
   if (g_combat_remaining_spawn_observer != nullptr) {
     g_combat_remaining_spawn_observer(object_manager, object, commit_to_live);
+  }
+  if (commit_to_live == 0) {
+    return;
   }
   CombatCaptureContext context;
   if (!current_combat_capture_context(&context)) {

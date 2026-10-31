@@ -176,6 +176,8 @@ struct RemainingPendingActionSpawn {
   std::int32_t source_data_global_id = kRemainingRuntimeGlobalIdUnset;
   std::int32_t action_data_global_id = kRemainingRuntimeGlobalIdUnset;
   const void *child_pointer = nullptr;
+  cr_remaining_runtime::PendingSpawnChildIdentity child_identity;
+  std::uint32_t child_native_object_id = 0;
 };
 
 RemainingRingSlot g_remaining_runtime_ring[kRemainingRuntimeRingCapacity];
@@ -755,13 +757,6 @@ void remaining_track_committed_lifetime(const CombatCaptureContext &context, con
 }
 
 void remaining_runtime_note_committed_spawn(void *object_manager, void *object, std::int32_t commit_to_live) {
-  if (commit_to_live == 0) {
-    return;
-  }
-  // The exact shared spawn hook calls this immediately after committing the
-  // object. Clear any prior proof for the address before it can represent a
-  // recycled object with the same native ID.
-  remaining_area_eligibility_cache_invalidate_pointer(object);
   CombatCaptureContext context;
   if (!current_combat_capture_context(&context)) {
     return;
@@ -770,9 +765,36 @@ void remaining_runtime_note_committed_spawn(void *object_manager, void *object, 
     context.object_manager = object_manager;
   }
   if (object_manager == nullptr || context.object_manager != object_manager) {
-    remaining_reject(&context);
+    if (commit_to_live != 0) remaining_reject(&context);
     return;
   }
+  // Exact 15.535 f25b8c assigns object+0x08 even when commit_to_live=0
+  // (f25bc8..f25bdc, before the f25c04 live-vector branch). The mode-1
+  // producer hook ran BEFORE that assignment. Bind the assigned lifetime ID
+  // now, without pretending the child is already in the live object vector.
+  const void *const assigned_data = remaining_object_data(object);
+  if (assigned_data != nullptr) {
+    std::int32_t assigned_data_id = kRemainingRuntimeGlobalIdUnset;
+    (void)remaining_data_global_id(assigned_data, &assigned_data_id);
+    const auto assigned_vtable = remaining_vtable_offset(object);
+    const auto assigned_id = read_object_field<std::uint32_t>(object, 0x08);
+    remaining_lock(g_remaining_pending_action_spawn_lock);
+    for (auto &pending : g_remaining_pending_action_spawns) {
+      if (!pending.active || pending.child_pointer != object) continue;
+      const bool exact_creation = pending.capture.game_manager == context.game_manager &&
+          pending.capture.object_manager == object_manager && pending.capture.generation == context.generation &&
+          pending.capture.state_epoch == context.state_epoch && pending.capture.tick == context.tick &&
+          pending.child_identity.data_pointer == reinterpret_cast<std::uintptr_t>(assigned_data) &&
+          pending.child_identity.data_global_id == assigned_data_id &&
+          pending.child_identity.vtable_offset == assigned_vtable;
+      pending.child_native_object_id = cr_remaining_runtime::bind_pending_spawn_native_id(
+          pending.child_native_object_id, assigned_id, exact_creation);
+    }
+    remaining_unlock(g_remaining_pending_action_spawn_lock);
+  }
+  if (commit_to_live == 0) return;
+  // Only committed objects invalidate live eligibility and publish lifetimes.
+  remaining_area_eligibility_cache_invalidate_pointer(object);
   RemainingRawRecord lifetime =
       remaining_base_record(context, RemainingRawKind::LifetimeSpawn, cr_remaining_runtime::kCombatSpawnOffset);
   capture_combat_entity(object, object_manager, &lifetime.entity);
@@ -837,6 +859,33 @@ bool remaining_runtime_apply_action_spawn_provenance(void *object_manager, void 
         candidate.capture.state_epoch != context.state_epoch) {
       continue;
     }
+    const void *const current_data = remaining_object_data(object);
+    std::int32_t current_data_id = kRemainingRuntimeGlobalIdUnset;
+    (void)remaining_data_global_id(current_data, &current_data_id);
+    const cr_remaining_runtime::PendingSpawnChildIdentity current_identity{
+        reinterpret_cast<std::uintptr_t>(current_data), remaining_vtable_offset(object), current_data_id};
+    const auto current_native_id = read_object_field<std::uint32_t>(object, 0x08);
+    if (cr_remaining_runtime::pending_spawn_native_id_reused(candidate.child_native_object_id, current_native_id)) {
+      LOGI("discarded-reused-action-spawn-id engine=%d tick=%d captureTick=%d child=%p createdId=%u currentId=%u createdVtable=%llx currentVtable=%llx createdData=%d currentData=%d",
+           g_engine_instance_id, context.tick, candidate.capture.tick, object,
+           candidate.child_native_object_id, current_native_id,
+           static_cast<unsigned long long>(candidate.child_identity.vtable_offset),
+           static_cast<unsigned long long>(current_identity.vtable_offset),
+           candidate.child_identity.data_global_id, current_identity.data_global_id);
+      candidate = {};
+      continue;
+    }
+    if (cr_remaining_runtime::pending_spawn_address_reused(candidate.child_identity, current_identity,
+                                                           candidate.capture.tick, context.tick)) {
+      LOGI("discarded-stale-action-spawn engine=%d tick=%d captureTick=%d child=%p "
+           "createdVtable=%llx currentVtable=%llx createdData=%d currentData=%d",
+           g_engine_instance_id, context.tick, candidate.capture.tick, object,
+           static_cast<unsigned long long>(candidate.child_identity.vtable_offset),
+           static_cast<unsigned long long>(current_identity.vtable_offset),
+           candidate.child_identity.data_global_id, current_identity.data_global_id);
+      candidate = {};
+      continue;
+    }
     pending = candidate;
     candidate = {};
     break;
@@ -868,6 +917,10 @@ bool remaining_runtime_apply_action_spawn_provenance(void *object_manager, void 
       pending.source.native_object_id == pending.source_native_object_id &&
       pending.source.native_object_id != combat_record->target.native_object_id && pending.source_vtable_offset != 0;
   if (!stored_source_exact || (!live_source_absent && !live_source_identity_exact)) {
+    LOGE("remaining action-spawn child lifetime engine=%d createdId=%u currentId=%u createdData=%d createdVtable=%llx",
+         g_engine_instance_id, pending.child_native_object_id,
+         read_object_field<std::uint32_t>(object, 0x08), pending.child_identity.data_global_id,
+         static_cast<unsigned long long>(pending.child_identity.vtable_offset));
     LOGE("remaining action-spawn provenance source invalid tick=%d "
          "sourceValidated=%d sourcePresent=%d capturedSourceId=%u "
          "expectedSourceId=%u targetId=%u samePointer=%d "
@@ -1438,6 +1491,9 @@ extern "C" void remaining_action_spawn_mode1_child_create_bridge(void *object_ma
   pending.source_data_global_id = source->source_data_global_id;
   pending.action_data_global_id = source->action_data_global_id;
   pending.child_pointer = child;
+  pending.child_identity = {reinterpret_cast<std::uintptr_t>(child_data), remaining_vtable_offset(child),
+                            child_data_global_id};
+  pending.child_native_object_id = read_object_field<std::uint32_t>(child, 0x08);
   remaining_lock(g_remaining_pending_action_spawn_lock);
   RemainingPendingActionSpawn *available = nullptr;
   for (RemainingPendingActionSpawn &candidate : g_remaining_pending_action_spawns) {
@@ -1518,6 +1574,12 @@ void remaining_pending_object_add_hook(void *object_manager, void *object) {
       pending.source_data_global_id = context.source_data_global_id;
       pending.action_data_global_id = context.action_data_global_id;
       pending.child_pointer = object;
+      const void *const child_data = remaining_object_data(object);
+      std::int32_t child_data_id = kRemainingRuntimeGlobalIdUnset;
+      (void)remaining_data_global_id(child_data, &child_data_id);
+      pending.child_identity = {reinterpret_cast<std::uintptr_t>(child_data), remaining_vtable_offset(object),
+                                child_data_id};
+      pending.child_native_object_id = read_object_field<std::uint32_t>(object, 0x08);
       remaining_lock(g_remaining_pending_action_spawn_lock);
       RemainingPendingActionSpawn *available = nullptr;
       for (RemainingPendingActionSpawn &candidate : g_remaining_pending_action_spawns) {

@@ -4,6 +4,24 @@
 
 int main() {
     using namespace cr_remaining_runtime;
+    assert(bind_pending_spawn_native_id(0, 5000208, true) == 5000208);
+    assert(bind_pending_spawn_native_id(0, 5000208, false) == 0);
+    assert(bind_pending_spawn_native_id(0, 0, true) == 0);
+    assert(bind_pending_spawn_native_id(5000208, 5000230, true) == 5000208);
+    assert(pending_spawn_native_id_reused(5000208, 5000230));
+    assert(!pending_spawn_native_id_reused(0, 5000230));
+    assert(!pending_spawn_native_id_reused(5000208, 0));
+    assert(!pending_spawn_native_id_reused(5000208, 5000208));
+    constexpr PendingSpawnChildIdentity skeleton{0x1000, 0x189c4e8, -1600853732};
+    constexpr PendingSpawnChildIdentity projectile{0x2000, 0x189cc28, 142000000};
+    assert(pending_spawn_address_reused(skeleton, projectile, 2691, 2694));
+    assert(!pending_spawn_address_reused(skeleton, skeleton, 2691, 2808));
+    assert(!pending_spawn_address_reused(skeleton, projectile, 2691, 2691));
+    assert(!pending_spawn_address_reused(skeleton, projectile, 2691, 2690));
+    assert(!pending_spawn_address_reused(skeleton, {0x2000, skeleton.vtable_offset, 142000000}, 2691, 2808));
+    assert(!pending_spawn_address_reused(skeleton, {0x1000, projectile.vtable_offset, skeleton.data_global_id}, 2691, 2808));
+    assert(!pending_spawn_address_reused({}, projectile, 2691, 2808));
+    assert(!pending_spawn_address_reused(skeleton, {}, 2691, 2808));
 
     static_assert(
         classify_resource_delta(

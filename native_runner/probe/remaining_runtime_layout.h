@@ -237,4 +237,34 @@ static_assert(requested_resource_delta_fixed(ResourceDeltaCause::Periodic, 1) ==
 static_assert(exact_area_effect_object(3, 0x0189c2e8));
 static_assert(exact_spawn_attach_path(kCharacterSpawnHelperOffset, kSpawnAttachHelperReturnOffset));
 
+struct PendingSpawnChildIdentity {
+  std::uintptr_t data_pointer = 0;
+  std::uintptr_t vtable_offset = 0;
+  std::int32_t data_global_id = 0;
+};
+
+constexpr std::uint32_t bind_pending_spawn_native_id(std::uint32_t stored, std::uint32_t observed,
+                                                    bool exact_creation) {
+  return stored == 0 && exact_creation ? observed : stored;
+}
+
+constexpr bool pending_spawn_native_id_reused(std::uint32_t created, std::uint32_t current) {
+  return created != 0 && current != 0 && created != current;
+}
+
+// A deferred proof does not own its native allocation. An uncommitted child
+// can be destroyed and its address reused by another concrete object type.
+// Data alone is insufficient (native character transforms can change it):
+// require a later tick, a different concrete vtable AND different data.
+// Same-type reuse and genuine late commits retain the existing strict check.
+constexpr bool pending_spawn_address_reused(const PendingSpawnChildIdentity &created,
+                                            const PendingSpawnChildIdentity &current,
+                                            std::int32_t created_tick, std::int32_t current_tick) {
+  return created_tick >= 0 && current_tick > created_tick && created.data_pointer != 0 &&
+         current.data_pointer != 0 && created.vtable_offset != 0 && current.vtable_offset != 0 &&
+         created.data_global_id != 0 && current.data_global_id != 0 &&
+         created.vtable_offset != current.vtable_offset && created.data_pointer != current.data_pointer &&
+         created.data_global_id != current.data_global_id;
+}
+
 } // namespace cr_remaining_runtime

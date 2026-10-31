@@ -1675,6 +1675,8 @@ bool parse_logic_command(void *manager, const char *command_json, void **logic_c
   return logic_command != nullptr;
 }
 
+void remember_enqueued_mirror_descriptor(void *manager, const char *command_json);
+
 bool inject_logic_command(void *manager, const char *command_json) {
   if (manager == nullptr || g_logic_command_append == nullptr) {
     return false;
@@ -1687,6 +1689,7 @@ bool inject_logic_command(void *manager, const char *command_json) {
   if (succeeded) {
     // LogicCommandQueue::append consumes the command owner.
     g_logic_command_append(command_queue, &logic_command);
+    remember_enqueued_mirror_descriptor(manager, command_json);
   }
   void *command_context = nullptr;
   std::memcpy(&command_context, static_cast<std::uint8_t *>(manager) + 0x208, sizeof(command_context));
@@ -5824,6 +5827,53 @@ bool resolve_ready_ability_request(void *manager, std::int32_t owner, std::int32
 
 
 
+
+void remember_enqueued_mirror_descriptor(void *manager, const char *command_json) {
+  // Recognize the canonical commands emitted by format_deploy_command only.
+  // Successful native queue insertion precedes this call. Other command kinds
+  // and unproven descriptors continue to use the existing strict validation.
+  int command_tick = 0, command_tick2 = 0, px = 0, py = 0, consumed_chars = 0;
+  unsigned int account_high = 0, effective_card = 0, packed = 0;
+  unsigned long long account_low = 0;
+  const int fields = std::sscanf(command_json,
+      "{\"ct\":86,\"c\":{\"t\":%d,\"t2\":%d,\"idHi\":%u,\"idLo\":%llu,"
+      "\"px\":%d,\"py\":%d,\"sid\":-1,\"sel\":{\"os\":%u,\"pd\":%u}}}%n",
+      &command_tick, &command_tick2, &account_high, &account_low, &px, &py,
+      &effective_card, &packed, &consumed_chars);
+  if (fields != 8 || consumed_chars <= 0 || command_json[consumed_chars] != '\0') return;
+  const int deck_slot = static_cast<int>((packed >> 22) & 0x3fU) - 1;
+  if (deck_slot < 0 || deck_slot >= kCombatMaxDeckSlots || (packed & 0x0fU) != 0) return;
+  CombatCaptureContext capture;
+  if (!current_combat_capture_context(&capture) || capture.game_manager != manager) return;
+  void *world = read_object_field<void *>(manager, 0xa8);
+  for (int owner = 0; owner < kPlayerCount; ++owner) {
+    PlayerStateView player{};
+    if (!read_player_state(world, owner, &player) || player.account_id_high != account_high ||
+        player.account_id_low != account_low) continue;
+    CardStateView card{};
+    if (!read_card_state(player, deck_slot, false, &card) ||
+        static_cast<std::uint32_t>(card.card_id) != cr_combat_deployment::kMirrorCardGlobalId ||
+        card.battle_deck_slot == nullptr || g_card_selection_build == nullptr) return;
+    NativeCardSelection descriptor;
+    cr_call_card_selection_build(card.battle_deck_slot, player.player, 0, &descriptor, g_card_selection_build);
+    if (descriptor.card_data != card.card_data || descriptor.packed != packed ||
+        !process_range_is_readable(descriptor.secondary_data, 0x44) ||
+        read_object_field<std::uint32_t>(descriptor.secondary_data, 0x40) != effective_card) return;
+    cr_combat_deployment::QueuedMirrorProof proof;
+    proof.generation = capture.generation;
+    proof.state_epoch = capture.state_epoch;
+    proof.owner = owner;
+    proof.deck_slot = deck_slot;
+    proof.registered_tick = capture.tick;
+    proof.descriptor = {reinterpret_cast<std::uintptr_t>(descriptor.card_data),
+                        reinterpret_cast<std::uintptr_t>(descriptor.secondary_data), descriptor.packed};
+    if (!g_combat_queued_mirror_proofs.remember(proof)) {
+      LOGE("combat capture rejected reason=queued-mirror-proof-capacity tick=%d owner=%d", capture.tick, owner);
+      g_combat_rejected_capture_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    return;
+  }
+}
 
 bool format_deploy_command(const DeployRequest &request, std::int32_t command_tick, char *command_json,
                            std::size_t command_json_size) {

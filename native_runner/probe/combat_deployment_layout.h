@@ -5,6 +5,7 @@
 // associated/effective data at +0x08, and the packed descriptor at +0x10.
 
 #include <cstdint>
+#include <array>
 
 namespace cr_combat_deployment {
 
@@ -45,5 +46,52 @@ constexpr bool exact_mirror_descriptor_match(std::uint32_t root_card_global_id, 
 }
 
 static_assert(form_code(0x51502802U) == kHeroFormCode);
+
+// A queued Mirror command retains its original native descriptor even if a
+// subsequent card play changes the live Mirror selection before consumption.
+struct QueuedMirrorProof {
+  bool active = false;
+  std::uint64_t generation = 0;
+  std::uint64_t state_epoch = 0;
+  std::int32_t owner = -1;
+  std::int32_t deck_slot = -1;
+  std::int32_t registered_tick = -1;
+  DescriptorIdentity descriptor{};
+};
+
+class QueuedMirrorProofStore {
+ public:
+  static constexpr std::size_t capacity = 64;
+  constexpr void clear() { proofs_ = {}; }
+  constexpr bool remember(QueuedMirrorProof proof) {
+    for (auto &entry : proofs_) {
+      if (!entry.active) {
+        proof.active = true;
+        entry = proof;
+        return true;
+      }
+    }
+    return false;
+  }
+  constexpr bool consume(std::uint32_t root_card_id, std::uintptr_t root_data,
+                         const DescriptorIdentity &consumed, std::uint64_t generation,
+                         std::uint64_t state_epoch, std::int32_t owner,
+                         std::int32_t deck_slot, std::int32_t tick) {
+    for (auto &entry : proofs_) {
+      if (entry.active && owner >= 0 && owner < 2 && deck_slot >= 0 && deck_slot < 8 &&
+          entry.generation == generation && entry.state_epoch == state_epoch &&
+          entry.owner == owner && entry.deck_slot == deck_slot &&
+          entry.registered_tick >= 0 && tick >= entry.registered_tick &&
+          entry.descriptor.base_data == root_data &&
+          exact_mirror_descriptor_match(root_card_id, consumed, entry.descriptor)) {
+        entry.active = false;
+        return true;
+      }
+    }
+    return false;
+  }
+ private:
+  std::array<QueuedMirrorProof, capacity> proofs_{};
+};
 
 } // namespace cr_combat_deployment
