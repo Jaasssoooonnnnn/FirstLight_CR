@@ -161,4 +161,3 @@ def test_complete_interface_builds_without_starting_workers(tk_root, monkeypatch
     assert len(app.deck_editors) == 6
     assert app.duel_mode_box.get()
     assert callable(app.apply_duel_preset)
-

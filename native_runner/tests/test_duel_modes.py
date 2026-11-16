@@ -74,4 +74,3 @@ def test_unverified_chef_is_rejected_instead_of_replaced():
         validate_mode_towers(DUEL_MODES[1], 159000004)
     validate_mode_towers(DUEL_MODES[0], 159000004)
     validate_mode_towers(DUEL_MODES[1], 159000000, 159000001)
-
