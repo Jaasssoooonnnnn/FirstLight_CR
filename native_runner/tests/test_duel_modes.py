@@ -4,7 +4,7 @@ import pytest
 
 from native_runner.competitive_data import load_competitive_data
 from native_runner.cr_native_env import NativeClashEnv, RunnerError
-from native_runner.duel_modes import DUEL_MODES, resolve_duel_mode
+from native_runner.duel_modes import DUEL_MODES, resolve_duel_mode, validate_mode_towers
 from native_runner.match_factory import MatchConfig
 from native_runner.training.v4.factory import deck_roles_from_form_availability
 
@@ -67,3 +67,11 @@ def test_initial_observation_wait_is_bounded(monkeypatch):
     monkeypatch.setattr("native_runner.cr_native_env.time.monotonic", lambda: next(times))
     with pytest.raises(RunnerError, match="not ready"):
         NativeClashEnv.create_native_match(fake, MatchConfig(), wait_timeout=1.0)
+
+
+def test_unverified_chef_is_rejected_instead_of_replaced():
+    with pytest.raises(ValueError, match="皇家大厨"):
+        validate_mode_towers(DUEL_MODES[1], 159000004)
+    validate_mode_towers(DUEL_MODES[0], 159000004)
+    validate_mode_towers(DUEL_MODES[1], 159000000, 159000001)
+

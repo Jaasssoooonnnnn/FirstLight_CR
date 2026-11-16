@@ -724,7 +724,7 @@ def test_ai_duel_game_modes(monkeypatch, tmp_path: Path, mode_name: str, expecte
     monkeypatch.setattr(interface, "REPOSITORY_ROOT", tmp_path)
     monkeypatch.setattr(interface, "_new_match_seed", lambda: 34567)
     app = object.__new__(interface.CRHarnessInterface)
-    app._append_log = lambda _message: None
+    app._append_log = lambda _: None
     app.busy = False
     app.owns_native_session = True
     app.duel_checkpoint0_var = _FakeVar(str(checkpoints[0]))
@@ -741,7 +741,7 @@ def test_ai_duel_game_modes(monkeypatch, tmp_path: Path, mode_name: str, expecte
     )
     app.duel_deck1_editor = SimpleNamespace(
         values=app.duel_deck0_editor.values,
-        tower_troop_id=lambda: 159_000_004,
+        tower_troop_id=lambda: 159_000_000 if expected_mode_id == 72000232 else 159_000_004,
     )
     app.duel_status_var = _FakeVar()
     app._confirm_replace_owned_session = lambda _kind: True
@@ -766,6 +766,7 @@ def test_ai_duel_game_modes(monkeypatch, tmp_path: Path, mode_name: str, expecte
         # In all evolution, cards with evo support should have bit 0 set
         for f in config["deck0_form_availability"][:2]:
             assert f & 1 == 1
+
 
 
 

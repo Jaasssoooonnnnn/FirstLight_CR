@@ -30,7 +30,7 @@ from .paths import REPOSITORY_ROOT, WORKSPACE_ROOT
 from .card_names import CARD_NAMES
 from .contracts import COMPETITIVE_TOWER_TROOP_IDS
 from .local_config import setting
-from .duel_modes import DUEL_MODES, resolve_duel_mode
+from .duel_modes import DUEL_MODES, resolve_duel_mode, validate_mode_towers
 from .visual_deck import VisualDeckMixin, scrollable_tab
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -894,11 +894,12 @@ class DeckEditor(VisualDeckMixin):
         tower.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 6))
         ttk.Label(tower, text="塔楼兵种").pack(side="left", padx=(0, 8))
         self.tower_troop_var = tk.StringVar(value=TOWER_TROOP_OPTIONS[0][0])
-        ttk.Combobox(
+        self.tower_box = ttk.Combobox(
             tower, textvariable=self.tower_troop_var,
             values=tuple(name for name, _card_id in TOWER_TROOP_OPTIONS),
             state="readonly", width=27,
-        ).pack(side="left", fill="x", expand=True)
+        )
+        self.tower_box.pack(side="left", fill="x", expand=True)
         self.tower_ids = dict(TOWER_TROOP_BY_NAME)
         self.tower_preview = ttk.Button(tower, text="看图选择", compound="left", command=self.open_tower_palette)
         self.tower_preview.pack(side="left", padx=4)
@@ -1256,6 +1257,8 @@ class CRHarnessInterface:
             return
         for editor in (self.duel_deck0_editor, self.duel_deck1_editor):
             editor.experimental = mode.evolutions
+            editor.disallowed_towers = {tower: "七倍玩法尚未验证皇家大厨，请选择其他塔兵。" for tower in mode.blocked_towers}
+            editor.tower_box.configure(values=tuple(name for name, tower in editor.tower_ids.items() if tower not in mode.blocked_towers))
             if mode.evolutions and not mode.random_decks:
                 for i, variable in enumerate(editor.card_vars):
                     option = editor.by_display.get(variable.get())
@@ -1579,11 +1582,7 @@ class CRHarnessInterface:
                 validate_model_deck_roles(forms1)
             tower_troop0 = self.duel_deck0_editor.tower_troop_id()
             tower_troop1 = self.duel_deck1_editor.tower_troop_id()
-            if is_7x:
-                if tower_troop0 == 159_000_004:
-                    tower_troop0 = 159_000_000
-                if tower_troop1 == 159_000_004:
-                    tower_troop1 = 159_000_000
+            validate_mode_towers(mode, tower_troop0, tower_troop1)
             config = MatchConfig(
                 deck0=deck0, deck1=deck1,
                 deck0_form_availability=forms0, deck1_form_availability=forms1,
@@ -1653,6 +1652,7 @@ class CRHarnessInterface:
             self._after_model_stopped()
 
         self._background("offline-duel", run, lambda result: self._model_finished(*result), failed)
+
 
 
     def start_model_match(self) -> None:

@@ -7,16 +7,8 @@ from native_runner.visual_deck import filter_cards, deck_summary
 
 
 @pytest.fixture(scope="module")
-def tk_root():
-    try:
-        root = tk.Tk()
-    except tk.TclError as error:
-        if "display" in str(error).lower():
-            pytest.skip("A desktop display is required for Tk widget tests")
-        raise
-    root.withdraw()
-    yield root
-    root.destroy()
+def tk_root(desktop_root):
+    return desktop_root
 
 
 @pytest.fixture
@@ -68,7 +60,7 @@ def test_palette_replaces_only_selected_slot_and_blocks_duplicates(editor):
     editor.active_slot = None
     editor.choose_card(replacement)
     assert editor.values()[0][0] == replacement.card_id
-    assert len(editor.palette_grid.winfo_children()) == len(editor.options)
+    assert len(editor.palette_card_buttons) == len(editor.options)
 
 
 def test_empty_summary_has_no_fake_average():
@@ -86,6 +78,81 @@ def test_role_limit_marks_slots_and_experimental_mode_warns(editor):
     assert "实验玩法" in editor.validation_var.get()
 
 
+def test_palette_debounces_search_reuses_cards_and_keeps_empty_state(editor, monkeypatch, tk_root):
+    editor.palette_preferences = {"query": "", "kind": "全部", "cost": "全部"}
+    monkeypatch.setattr(editor, "_photo", lambda *args, **kwargs: None)
+    editor.open_palette()
+    editor.palette.withdraw()
+    tk_root.update_idletasks()
+    card_id = editor.options[0].card_id
+    button = editor.palette_card_buttons[card_id]
+    scheduled = []
+    monkeypatch.setattr(editor.palette, "after", lambda delay, callback: scheduled.append((delay, callback)) or "search")
+    assert button.cget("image") == ""
+    assert button.cget("text")
+
+    editor.search_var.set("not a real card")
+    assert scheduled[-1][0] == 150
+    assert "找到 0 张" not in editor.palette_hint.get()
+    assert editor.palette_preferences["query"] == "not a real card"
+    scheduled[-1][1]()
+
+    assert editor.palette_hint.get().startswith("找到 0 张")
+    assert editor.palette_empty_label.winfo_manager() == "grid"
+    assert editor.palette_card_buttons[card_id] is button
+    assert button.cget("text")
+
+
+def test_palette_preserves_scroll_for_selection_and_slot_changes(editor, tk_root):
+    editor.open_palette()
+    editor.palette.withdraw()
+    tk_root.update_idletasks()
+    canvas = editor.palette_canvas
+    canvas.yview_moveto(0.55)
+    tk_root.update_idletasks()
+    before = canvas.yview()[0]
+    assert before > 0.1
+    selected_card_button = editor.palette_card_buttons[editor.options[0].card_id]
+
+    editor.choose_card(editor.options[0])
+    tk_root.update_idletasks()
+    after_choose = canvas.yview()[0]
+    assert abs(after_choose - before) < 0.05
+    assert editor.palette_card_buttons[editor.options[0].card_id] is selected_card_button
+
+    editor._select_palette_slot(4)
+    tk_root.update_idletasks()
+    assert abs(canvas.yview()[0] - after_choose) < 0.05
+
+    editor.kind_var.set("建筑")
+    tk_root.update_idletasks()
+    assert canvas.yview()[0] == 0
+
+
+def test_disallowed_tower_stays_selected_with_reason(editor):
+    tower_name, tower_id = next(iter(editor.tower_ids.items()))
+    reason = "该塔兵尚未验证，请选择其他塔兵。"
+    editor.disallowed_towers = {tower_id: reason}
+    editor.tower_troop_var.set(tower_name)
+    editor.refresh_visuals()
+    assert editor.tower_troop_var.get() == tower_name
+    assert editor.validation_var.get() == reason
+
+
+def test_disallowed_tower_palette_button_is_disabled_with_reason(editor, tk_root):
+    _, tower_id = next(iter(editor.tower_ids.items()))
+    reason = "该塔兵尚未验证，请选择其他塔兵。"
+    editor.disallowed_towers = {tower_id: reason}
+    editor.open_tower_palette()
+    palette = next(w for w in editor.frame.winfo_children()
+                   if isinstance(w, tk.Toplevel) and w.title() == "选择塔楼兵种")
+    button = palette.grid_slaves(row=0, column=0)[0]
+    label = palette.grid_slaves(row=1, column=0)[0]
+    assert str(button.cget("state")) == "disabled"
+    assert label.cget("text") == reason
+    palette.destroy()
+
+
 def test_complete_interface_builds_without_starting_workers(tk_root, monkeypatch, tmp_path):
     from native_runner.user_interface import CRHarnessInterface
     monkeypatch.setattr(CRHarnessInterface, "_background", lambda *a, **k: None)
@@ -94,3 +161,4 @@ def test_complete_interface_builds_without_starting_workers(tk_root, monkeypatch
     assert len(app.deck_editors) == 6
     assert app.duel_mode_box.get()
     assert callable(app.apply_duel_preset)
+

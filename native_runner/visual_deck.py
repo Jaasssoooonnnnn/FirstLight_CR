@@ -68,11 +68,16 @@ class VisualDeckMixin:
         top.title("选择塔楼兵种")
         top.transient(self.frame.winfo_toplevel())
         for i, (name, cid) in enumerate(self.tower_ids.items()):
+            reason = getattr(self, "disallowed_towers", {}).get(cid)
             def choose(value=name):
                 self.tower_troop_var.set(value)
                 top.destroy()
             ttk.Button(top, text=name.replace(" / ", "\n"), image=self._photo(cid, size=(80, 96)) or "",
-                       compound="top", command=choose).grid(row=0, column=i, padx=8, pady=16)
+                       compound="top", command=choose, state="disabled" if reason else "normal").grid(
+                           row=0, column=i, padx=8, pady=(16, 4 if reason else 16))
+            if reason:
+                ttk.Label(top, text=reason, wraplength=150, foreground="#b91c1c").grid(
+                    row=1, column=i, sticky="n", padx=8, pady=(0, 12))
 
     def _photo(self, card_id, form=0, size=(64, 80)):
         from PIL import Image, ImageTk
@@ -153,8 +158,12 @@ class VisualDeckMixin:
             "实验玩法：超额觉醒角色超出模型训练范围。" if over and self.experimental else
             "普通模式最多两张觉醒、两张英雄，合计三张。" if over else
             "点击卡槽替换卡牌；下方切换普通、觉醒或英雄形态。")
+        tower_id = self.tower_ids.get(self.tower_troop_var.get()) if hasattr(self, "tower_troop_var") else None
+        tower_reason = getattr(self, "disallowed_towers", {}).get(tower_id)
+        if tower_reason:
+            message = tower_reason
         self.validation_var.set(message)
-        self.validation_label.configure(foreground="#b91c1c" if duplicate_ids or over else "#5d6b7b")
+        self.validation_label.configure(foreground="#b91c1c" if duplicate_ids or over or tower_reason else "#5d6b7b")
         if hasattr(self, "tower_preview"):
             cid = self.tower_ids.get(self.tower_troop_var.get())
             photo = self._photo(cid, size=(32, 40)) if cid else None
@@ -196,6 +205,17 @@ class VisualDeckMixin:
             self.palette.lift()
             self._render_palette()
             return
+        self._cancel_palette_search()
+        preferences = getattr(self, "palette_preferences", None)
+        if not isinstance(preferences, dict):
+            preferences = self.palette_preferences = {"query": "", "kind": "全部", "cost": "全部"}
+        preferences.setdefault("query", "")
+        preferences.setdefault("kind", "全部")
+        preferences.setdefault("cost", "全部")
+        if preferences["kind"] not in KINDS:
+            preferences["kind"] = "全部"
+        if preferences["cost"] not in ("全部", "1", "2", "3", "4", "5", "6", "7+"):
+            preferences["cost"] = "全部"
         top = self.palette = tk.Toplevel(self.frame)
         top.title("卡牌图鉴 · 点击卡牌加入或替换")
         top.geometry("860x680")
@@ -206,19 +226,23 @@ class VisualDeckMixin:
         self.palette_slots.pack(fill="x")
         self.palette_slot_buttons = []
         for i in range(8):
-            b = ttk.Button(self.palette_slots, width=11, command=lambda j=i: self._select_palette_slot(j))
-            b.pack(side="left", fill="x", expand=True, padx=2)
+            b = ttk.Button(self.palette_slots, width=18, command=lambda j=i: self._select_palette_slot(j))
+            b.grid(row=i // 4, column=i % 4, sticky="ew", padx=2, pady=2)
+            self.palette_slots.columnconfigure(i % 4, weight=1, uniform="palette-slots")
             self.palette_slot_buttons.append(b)
         controls = ttk.Frame(top, padding=(12, 0))
         controls.pack(fill="x")
-        self.search_var, self.kind_var, self.cost_var = tk.StringVar(), tk.StringVar(value="全部"), tk.StringVar(value="全部")
+        self.search_var = tk.StringVar(value=preferences["query"])
+        self.kind_var = tk.StringVar(value=preferences["kind"])
+        self.cost_var = tk.StringVar(value=preferences["cost"])
+        self._palette_applied_query = self.search_var.get()
         ttk.Label(controls, text="搜索").pack(side="left")
         entry = ttk.Entry(controls, textvariable=self.search_var, width=24)
         entry.pack(side="left", fill="x", expand=True, padx=8)
         for var, choices in ((self.kind_var, tuple(KINDS)), (self.cost_var, ("全部", "1", "2", "3", "4", "5", "6", "7+"))):
             ttk.Combobox(controls, textvariable=var, values=choices, state="readonly", width=8).pack(side="left", padx=4)
-            var.trace_add("write", lambda *_: self._render_palette())
-        self.search_var.trace_add("write", lambda *_: self._render_palette())
+            var.trace_add("write", lambda *_: self._palette_filter_changed())
+        self.search_var.trace_add("write", lambda *_: self._palette_search_changed())
         ttk.Label(top, textvariable=self.palette_hint, padding=12).pack(fill="x")
         body = ttk.Frame(top)
         body.pack(fill="both", expand=True, padx=12)
@@ -228,40 +252,82 @@ class VisualDeckMixin:
         canvas.pack(side="left", fill="both", expand=True)
         canvas.configure(yscrollcommand=scroll.set)
         self.palette_grid = ttk.Frame(canvas)
+        self.palette_card_buttons = {}
+        self.palette_empty_label = ttk.Label(
+            self.palette_grid,
+            text="没有匹配的卡牌，请换个关键词或筛选条件。",
+            padding=24,
+        )
+        self.palette_empty_label.grid_remove()
         window = canvas.create_window((0, 0), window=self.palette_grid, anchor="nw")
         self.palette_grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
         top.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
         ttk.Button(top, text="完成配置", command=top.destroy).pack(anchor="e", padx=12, pady=8)
         top.bind("<Escape>", lambda e: top.destroy())
-        self._render_palette()
+        self._render_palette(reset_scroll=True)
         entry.focus_set()
+
+    def _cancel_palette_search(self):
+        after_id = getattr(self, "_palette_search_after_id", None)
+        if after_id is not None:
+            try:
+                self.palette.after_cancel(after_id)
+            except (tk.TclError, AttributeError):
+                pass
+            self._palette_search_after_id = None
+
+    def _palette_search_changed(self):
+        self.palette_preferences["query"] = self.search_var.get()
+        self._cancel_palette_search()
+        self._palette_search_after_id = self.palette.after(150, self._apply_palette_search)
+
+    def _apply_palette_search(self):
+        self._palette_search_after_id = None
+        self._palette_applied_query = self.search_var.get()
+        self._render_palette(reset_scroll=True)
+
+    def _palette_filter_changed(self):
+        self.palette_preferences["kind"] = self.kind_var.get()
+        self.palette_preferences["cost"] = self.cost_var.get()
+        self._render_palette(reset_scroll=True)
 
     def _select_palette_slot(self, slot):
         self.active_slot = slot
         self.refresh_visuals()
         self._render_palette()
 
-    def _render_palette(self):
+    def _render_palette(self, reset_scroll=False):
         if self.palette is None or not self.palette.winfo_exists():
             return
+        scroll_position = 0 if reset_scroll else self.palette_canvas.yview()[0]
         selected = {o.card_id for v in self.card_vars if (o := self.by_display.get(v.get()))}
         for i, button in enumerate(self.palette_slot_buttons):
             option = self.by_display.get(self.card_vars[i].get())
             button.configure(text=f"{'▸' if i == self.active_slot else ''}{i+1} {CARD_NAMES[option.card_id][0] if option else '空位'}")
-        for widget in self.palette_grid.winfo_children():
-            widget.destroy()
-        cards = filter_cards(self.options, self.search_var.get(), KINDS[self.kind_var.get()], self.cost_var.get())
+        cards = filter_cards(self.options, self._palette_applied_query, KINDS[self.kind_var.get()], self.cost_var.get())
         self.palette_hint.set(f"找到 {len(cards)} 张卡牌 · " + (f"正在替换第 {self.active_slot+1} 槽" if self.active_slot is not None else "点击卡牌填入空位"))
         if not cards:
-            ttk.Label(self.palette_grid, text="没有匹配的卡牌，请换个关键词或筛选条件。", padding=24).pack()
+            self.palette_empty_label.grid(row=0, column=0, columnspan=6, sticky="nsew")
+        else:
+            self.palette_empty_label.grid_remove()
+        visible_ids = {option.card_id for option in cards}
+        for card_id, button in self.palette_card_buttons.items():
+            if card_id not in visible_ids and button.winfo_manager():
+                button.grid_remove()
         for i, option in enumerate(cards):
             cost = card_metadata()[option.card_id].get("elixir_cost")
-            button = tk.Button(self.palette_grid, image=self._photo(option.card_id) or "", compound="top",
-                               text=f"{'已选 · ' if option.card_id in selected else ''}{CARD_NAMES[option.card_id][0]}\n{cost:g} 圣水",
-                               wraplength=112, bg="#dbeafe" if option.card_id in selected else "#ffffff",
-                               relief="flat", highlightthickness=1, highlightbackground="#dbe3ed",
-                               command=lambda o=option: self.choose_card(o))
+            button = self.palette_card_buttons.get(option.card_id)
+            if button is None:
+                button = tk.Button(self.palette_grid, compound="top", wraplength=112,
+                                   relief="flat", highlightthickness=1, highlightbackground="#dbe3ed",
+                                   command=lambda o=option: self.choose_card(o))
+                self.palette_card_buttons[option.card_id] = button
+            image = self._photo(option.card_id)
+            button.configure(image=image or "",
+                             text=f"{'已选 · ' if option.card_id in selected else ''}{CARD_NAMES[option.card_id][0]}\n{cost:g} 圣水",
+                             bg="#dbeafe" if option.card_id in selected else "#ffffff")
             button.grid(row=i//6, column=i%6, sticky="nsew", padx=4, pady=4)
             self.palette_grid.columnconfigure(i%6, weight=1, uniform="library")
-        self.palette_canvas.yview_moveto(0)
+        self.palette_canvas.after_idle(lambda: self.palette_canvas.yview_moveto(scroll_position)
+                                       if self.palette and self.palette.winfo_exists() else None)
