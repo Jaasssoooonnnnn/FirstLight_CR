@@ -134,6 +134,7 @@ def test_ai_duel_launches_both_checkpoints_and_decks(monkeypatch, tmp_path: Path
     monkeypatch.setattr(interface, "REPOSITORY_ROOT", tmp_path)
     monkeypatch.setattr(interface, "_new_match_seed", lambda: 34567)
     app = object.__new__(interface.CRHarnessInterface)
+    app._append_log = lambda _message: None
     app.busy = False
     app.owns_native_session = True
     app.duel_checkpoint0_var = _FakeVar(str(checkpoints[0]))
@@ -710,3 +711,186 @@ def test_saved_decks_reject_invalid_file_without_replacing_it(tmp_path: Path) ->
         interface.load_saved_decks(path)
 
     assert path.read_text(encoding="utf-8").startswith('{"version": 1')
+
+
+@pytest.mark.parametrize(
+    "mode_name,expected_mode_id",
+    tuple((m.name, m.game_mode) for m in interface.DUEL_MODES if not m.unavailable_reason),
+)
+def test_ai_duel_game_modes(monkeypatch, tmp_path: Path, mode_name: str, expected_mode_id: int) -> None:
+    checkpoints = (tmp_path / "top.pt", tmp_path / "bottom.pt")
+    for checkpoint in checkpoints:
+        checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setattr(interface, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(interface, "_new_match_seed", lambda: 34567)
+    app = object.__new__(interface.CRHarnessInterface)
+    app._append_log = lambda _message: None
+    app.busy = False
+    app.owns_native_session = True
+    app.duel_checkpoint0_var = _FakeVar(str(checkpoints[0]))
+    app.duel_checkpoint1_var = _FakeVar(str(checkpoints[1]))
+    app.duel_game_mode_var = _FakeVar(mode_name)
+    test_deck = interface.PEKKA_BRIDGE_SPAM_DECK
+    test_forms = interface.PEKKA_BRIDGE_SPAM_FORMS
+    if expected_mode_id == 72000232:
+        test_deck = tuple(o.card_id for o in interface.load_card_options() if o.supports_evolution)[:8]
+        test_forms = (1,) * 8
+    app.duel_deck0_editor = SimpleNamespace(
+        values=lambda: (test_deck, test_forms),
+        tower_troop_id=lambda: 159_000_002,
+    )
+    app.duel_deck1_editor = SimpleNamespace(
+        values=app.duel_deck0_editor.values,
+        tower_troop_id=lambda: 159_000_004,
+    )
+    app.duel_status_var = _FakeVar()
+    app._confirm_replace_owned_session = lambda _kind: True
+    app._check_operation_conflicts = lambda: True
+    app.stop_replay = lambda: None
+    app._terminate_overlay = lambda: None
+    app._set_model_active = lambda _active: None
+    captured: dict[str, object] = {}
+
+    def launch(module, _log_path, **options):
+        captured.update(module=module, **options)
+        return SimpleNamespace(poll=lambda: 0, returncode=0), None
+
+    app._launch_python = launch
+    app._background = lambda _name, run, _success, _failed: run()
+
+    app.start_ai_duel()
+
+    config = json.loads((app.model_artifact_dir / "match.json").read_text(encoding="utf-8"))
+    assert config["game_mode"] == expected_mode_id
+    if mode_name == "全觉醒大战 (All Evolution)":
+        # In all evolution, cards with evo support should have bit 0 set
+        for f in config["deck0_form_availability"][:2]:
+            assert f & 1 == 1
+
+
+
+def test_failed_duel_surfaces_engine_error_and_releases_controls(tmp_path):
+    app = object.__new__(interface.CRHarnessInterface)
+    app.model_process = process = object()
+    app.model_log = None
+    app.model_artifact_dir = tmp_path
+    app.model_match_kind = "duel"
+    app.duel_status_var = _FakeVar()
+    app._terminate_overlay = lambda: None
+    active = []
+    app._set_model_active = active.append
+    app._after_model_stopped = lambda: active.append("released")
+    app._append_log = lambda _: None
+    (tmp_path / "result.json").write_text(json.dumps({"error": "native battle result is invalid"}))
+    app._model_finished(process, 1)
+    assert "native battle result is invalid" in app.duel_status_var.get()
+    assert active == [False, "released"]
+    assert app.model_process is None
+
+
+
+def test_7x_elixir_preserves_previewed_evolution_decks_and_standard_towers(monkeypatch, tmp_path: Path) -> None:
+    checkpoints = (tmp_path / "top.pt", tmp_path / "bottom.pt")
+    for checkpoint in checkpoints:
+        checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setattr(interface, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(interface, "_new_match_seed", lambda: 88888)
+    app = object.__new__(interface.CRHarnessInterface)
+    app._append_log = lambda _message: None
+    app.busy = False
+    app.owns_native_session = True
+    app.card_options = interface.load_card_options()
+    app.duel_checkpoint0_var = _FakeVar(str(checkpoints[0]))
+    app.duel_checkpoint1_var = _FakeVar(str(checkpoints[1]))
+    app.duel_game_mode_var = _FakeVar("7倍圣水无限火力 (7x Elixir)")
+
+    preview = tuple(o.card_id for o in app.card_options if o.supports_evolution)[:8]
+    deck0_state: list[object] = []
+    deck1_state: list[object] = []
+    app.duel_deck0_editor = SimpleNamespace(
+        values=lambda: (preview, (1,) * 8),
+        tower_troop_id=lambda: 159_000_000,
+        set_deck=lambda d, f: deck0_state.append((d, f)),
+    )
+    app.duel_deck1_editor = SimpleNamespace(
+        values=lambda: (preview, (1,) * 8),
+        tower_troop_id=lambda: 159_000_000,
+        set_deck=lambda d, f: deck1_state.append((d, f)),
+    )
+    app.duel_status_var = _FakeVar()
+    app._confirm_replace_owned_session = lambda _kind: True
+    app._check_operation_conflicts = lambda: True
+    app.stop_replay = lambda: None
+    app._terminate_overlay = lambda: None
+    app._set_model_active = lambda _active: None
+    captured: dict[str, object] = {}
+
+    def launch(module, _log_path, **options):
+        captured.update(module=module, **options)
+        return SimpleNamespace(poll=lambda: 0, returncode=0), None
+
+    app._launch_python = launch
+    app._background = lambda _name, run, _success, _failed: run()
+
+    app.start_ai_duel()
+
+    config = json.loads((app.model_artifact_dir / "match.json").read_text(encoding="utf-8"))
+    assert config["game_mode"] == 72000232
+    assert config["location"] == 15000199  # Standard 1v1 3-tower location
+    assert config["arena"] == 54000001
+    assert len(config["deck0"]) == 8 and len(set(config["deck0"])) == 8
+    assert len(config["deck1"]) == 8 and len(set(config["deck1"])) == 8
+    assert config["deck0_form_availability"] == [1] * 8
+    assert config["deck1_form_availability"] == [1] * 8
+
+    # All cards assigned must be valid evolutions
+    options = {opt.card_id: opt for opt in app.card_options}
+    for card_id in config["deck0"] + config["deck1"]:
+        assert options[card_id].supports_evolution
+
+    assert config["deck0"] == list(preview)
+    assert config["deck1"] == list(preview)
+    # Starting a duel must preserve the visible preview.
+    assert len(deck0_state) == 1
+    assert len(deck1_state) == 1
+
+
+
+def test_randomize_duel_evolution_decks_deals_fresh_cards() -> None:
+    app = object.__new__(interface.CRHarnessInterface)
+    app._append_log = lambda _message: None
+    app.card_options = interface.load_card_options()
+    deals0 = []
+    deals1 = []
+    app.duel_deck0_editor = SimpleNamespace(set_deck=lambda d, f: deals0.append((d, f)))
+    app.duel_deck1_editor = SimpleNamespace(set_deck=lambda d, f: deals1.append((d, f)))
+
+    app.randomize_duel_evolution_decks()
+
+    assert len(deals0) == 1
+    assert len(deals1) == 1
+    deck0, forms0 = deals0[0]
+    deck1, forms1 = deals1[0]
+    assert len(deck0) == 8 and len(set(deck0)) == 8
+    assert len(deck1) == 8 and len(set(deck1)) == 8
+    assert forms0 == (1,) * 8
+    assert forms1 == (1,) * 8
+
+
+
+def test_builtin_decks_are_valid_and_support_meta() -> None:
+    options = {opt.card_id: opt for opt in interface.load_card_options()}
+    assert len(interface.BUILTIN_DECKS) >= 8
+    for preset in interface.BUILTIN_DECKS:
+        assert len(preset.deck) == 8, f"{preset.name} card count != 8"
+        assert len(set(preset.deck)) == 8, f"{preset.name} has duplicate cards"
+        assert len(preset.forms) == 8, f"{preset.name} form count != 8"
+        interface.validate_model_deck_roles(preset.forms)
+        for card_id, mask in zip(preset.deck, preset.forms):
+            assert card_id in options, f"{preset.name} contains unknown card {card_id}"
+            opt = options[card_id]
+            if mask == 1:
+                assert opt.supports_evolution, f"{preset.name}: {opt.name} lacks evo"
+            elif mask == 2:
+                assert opt.supports_hero, f"{preset.name}: {opt.name} lacks hero"
+        assert preset.tower_troop_id in interface.TOWER_TROOP_BY_ID
