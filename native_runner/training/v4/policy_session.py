@@ -271,6 +271,14 @@ class PolicySessionV4:
         self._episode_started = False
         self._first_decision = True
 
+    def warmup(self, observation: ObservationV1, *, initial_elixir: Mapping[int, float]) -> None:
+        """Prime inference kernels without retaining a fictitious policy turn."""
+        try:
+            self.decide(observation)
+        finally:
+            self.end_episode()
+            self.start_episode(observation, initial_elixir=initial_elixir)
+
     @torch.inference_mode()
     def decide(self, observation: ObservationV1, *, force_act: bool = False) -> PolicyDecisionV4:
         if not self._episode_started or self.state is None:

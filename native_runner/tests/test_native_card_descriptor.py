@@ -243,11 +243,23 @@ def test_absolute_hand_queue_rejects_a_late_native_injection(
         )
 
 
+@pytest.mark.parametrize(
+    ("initially_paused", "expected_events", "expected_paused"),
+    [
+        (False, ["pause", "inject", "resume"], False),
+        (True, ["inject"], True),
+    ],
+)
+@pytest.mark.parametrize("fail_injection", [False, True])
 def test_next_tick_model_queue_holds_renderer_until_command_is_injected(
     monkeypatch: pytest.MonkeyPatch,
+    initially_paused: bool,
+    fail_injection: bool,
+    expected_events: list[str],
+    expected_paused: bool,
 ) -> None:
     env = NativeClashEnv()
-    clock = {"tick": 130, "paused": False}
+    clock = {"tick": 130, "paused": initially_paused}
     events: list[str] = []
     observation = {
         "players": [{
@@ -274,18 +286,28 @@ def test_next_tick_model_queue_holds_renderer_until_command_is_injected(
         assert clock["paused"] is True
         assert command["c"]["t2"] == 130  # type: ignore[index]
         events.append("inject")
+        if fail_injection:
+            raise RunnerError("injection failed")
         return {"ok": True, "tick": clock["tick"]}
 
     monkeypatch.setattr(env, "pause", pause)
     monkeypatch.setattr(env, "resume", resume)
     monkeypatch.setattr(env, "observe", lambda: {"tick": clock["tick"], **observation})
     monkeypatch.setattr(env, "inject_command", inject)
+    monkeypatch.setattr(
+        env, "status", lambda: {"ok": True, "mode": "native-render", "paused": clock["paused"]}
+    )
 
-    receipt = env.queue_hand_action_next_tick(HandAction(0, 0, 9_000, 10_000))
-
-    assert receipt["executeTick"] == 131
-    assert events == ["pause", "inject", "resume"]
-    assert clock["paused"] is False
+    if fail_injection:
+        with pytest.raises(RunnerError, match="injection failed"):
+            env.queue_hand_action_next_tick(HandAction(0, 0, 9_000, 10_000))
+    else:
+        receipt = env.queue_hand_action_next_tick(HandAction(0, 0, 9_000, 10_000))
+        assert receipt["executeTick"] == 131
+    assert events == expected_events
+    # A renderer that was already paused for exact synchronized steps must stay
+    # paused; only a renderer this helper found running is resumed again.
+    assert clock["paused"] is expected_paused
 
 
 def test_observation_anchored_hand_queue_falls_back_after_missed_deadline(

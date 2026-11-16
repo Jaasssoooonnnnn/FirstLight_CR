@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from native_runner.contracts import ActionKind, ActionV1, TargetKind
 from native_runner.match_factory import MatchConfig
 from native_runner.training.v4 import offline_duel
 
 
-def test_duel_infers_both_owners_and_consumes_force_request(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("fail_reset", [False, True])
+def test_duel_infers_both_owners_and_consumes_force_request(monkeypatch, tmp_path, fail_reset) -> None:
     calls: list[tuple[int, bool]] = []
+    cleanup = []
     observations = {
         owner: SimpleNamespace(owner=owner, tick=90, players=[SimpleNamespace(owner=owner, elixir_exact=6.0)])
         for owner in (0, 1)
@@ -22,17 +26,20 @@ def test_duel_infers_both_owners_and_consumes_force_request(monkeypatch, tmp_pat
             assert speed == 1.0
 
         def resume(self):
-            pass
+            raise AssertionError("duel must stay paused between exact steps")
 
         def pause(self):
-            pass
+            cleanup.append("pause")
 
         def close_transport(self):
-            pass
+            cleanup.append("close")
 
     class Environment:
         def reset(self, *, match_config, options):
             assert options["render_mode"] == "native-render"
+            assert options["synchronize_native_render_steps"] is True
+            if fail_reset:
+                raise RuntimeError("invalid mode configuration")
             return observations, {}
 
         def step(self, commands, *, record_trace):
@@ -59,7 +66,7 @@ def test_duel_infers_both_owners_and_consumes_force_request(monkeypatch, tmp_pat
             )
             return SimpleNamespace(decoded=SimpleNamespace(actions=actions), inference_ms=1.0)
 
-        return SimpleNamespace(start_episode=lambda *_args, **_kwargs: None, end_episode=lambda: None, decide=decide)
+        return SimpleNamespace(warmup=lambda *_args, **_kwargs: None, start_episode=lambda *_args, **_kwargs: None, end_episode=lambda: None, decide=decide)
 
     monkeypatch.setattr(offline_duel, "NativeClashEnv", lambda *_args, **_kwargs: Native())
     monkeypatch.setattr(offline_duel, "BattleEnvV1", lambda **_kwargs: Environment())
@@ -79,9 +86,18 @@ def test_duel_infers_both_owners_and_consumes_force_request(monkeypatch, tmp_pat
     monkeypatch.setattr(offline_duel, "build_policy_session_v4", session)
     (tmp_path / "force-1").touch()
 
+    if fail_reset:
+        with pytest.raises(RuntimeError, match="invalid mode"):
+            offline_duel.run_ai_duel(("top.pt", "bottom.pt"), MatchConfig(), artifact_dir=tmp_path)
+        result = json.loads((tmp_path / "result.json").read_text())
+        assert result["error"] == "invalid mode configuration"
+        assert not (tmp_path / "ready.json").exists()
+        assert cleanup == ["pause", "close"]
+        return
     result = offline_duel.run_ai_duel(("top.pt", "bottom.pt"), MatchConfig(), artifact_dir=tmp_path)
 
     assert calls == [(0, False), (1, True)]
     assert result["forced_plays"] == [0, 1]
+    assert cleanup == ["pause", "close"]
     assert not (tmp_path / "force-1").exists()
     assert json.loads((tmp_path / "identity.json").read_text(encoding="utf-8"))["checkpoints"][1]["path"] == "bottom.pt"

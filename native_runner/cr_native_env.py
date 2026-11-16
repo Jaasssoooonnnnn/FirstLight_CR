@@ -2725,8 +2725,18 @@ class NativeClashEnv:
         """Start a caller-configured match in Null's Royale's real renderer."""
 
         payload = config.to_json() if template_path is None else config.to_json(template_path)
+        deadline = time.monotonic() + wait_timeout
         self.configure_native_render(payload, wait_timeout=wait_timeout)
-        observation = self.observe()
+        while True:
+            try:
+                observation = self.observe()
+                break
+            except RunnerError as error:
+                # The scene-ready flag precedes construction of its object graph.
+                # Invalid battle results and other engine errors remain fatal.
+                if str(error) != "active object graph is not ready" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
         observed_decks = tuple(
             tuple(card["cardId"] for card in player["deck"])
             for player in sorted(observation["players"], key=lambda item: item["owner"])
@@ -2871,14 +2881,23 @@ class NativeClashEnv:
         return self._request(f"inject {payload}")
 
     def queue_hand_action_next_tick(self, action: HandAction) -> dict[str, Any]:
-        """Queue a model play for the next tick without a live-render clock race."""
+        """Queue a model play for the next tick without a live-render clock race.
+
+        The renderer is resumed only when this helper found it running.  A caller
+        that already holds it paused (exact synchronized stepping, for example)
+        keeps that gate closed, because releasing it would invalidate the next
+        ``advance-native`` boundary.
+        """
 
         with self._lock:
-            self.pause()
+            resume_after_queueing = not bool(self.status().get("paused"))
+            if resume_after_queueing:
+                self.pause()
             try:
                 return self.queue_hand_action_at(action, execute_in_ticks=1)
             finally:
-                self.resume()
+                if resume_after_queueing:
+                    self.resume()
 
     def queue_hand_action_at(
         self,

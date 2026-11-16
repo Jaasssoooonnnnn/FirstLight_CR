@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, fields
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -14,6 +15,7 @@ from ...contracts import ActionKind, ActionV1
 from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT, NATIVE_RENDER_SPEEDS, NativeClashEnv, RunnerError
 from ...match_factory import MatchConfig
 from ...rich_telemetry_adapter import RuntimeEffectCatalog
+from ...timeline import load_game_mode_timeline
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .offline_agent import _rendered_action
@@ -47,16 +49,20 @@ def run_ai_duel(
     bundle = production_semantic_bundle()
     native = NativeClashEnv(host, port, timeout=30.0)
     native.public_card_play_events_from_combat_ring = True
+    timeline = load_game_mode_timeline(match.game_mode)
     environment = BattleEnvV1(
         native=native,
         card_catalog=bundle.native_card_catalog,
         semantic_subset_contract=bundle.semantic_subset_contract,
         effect_catalog=RuntimeEffectCatalog.from_catalog(bundle.native_effect_catalog),
+        mode_timeline=timeline,
     )
     sessions = []
     decisions = [0, 0]
     actions = [0, 0]
     forced_actions = [0, 0]
+    inference_totals = [0.0, 0.0]
+    rejected_events: set[str] = set()
     terminated = truncated = False
     result: dict = {}
     try:
@@ -68,6 +74,7 @@ def run_ai_duel(
                 "allow_initial_remaining_runtime_rejections": True,
                 "decision_ticks": POLICY_DECISION_TICKS,
                 "event_driven_decisions": False,
+                "synchronize_native_render_steps": True,
             },
         )
         initial_elixir = {
@@ -79,6 +86,7 @@ def run_ai_duel(
             )
             sessions.append(session)
             session.start_episode(observations[owner], initial_elixir=initial_elixir)
+            session.warmup(observations[owner], initial_elixir=initial_elixir)
         identity = {
             "mode": "native-render-ai-duel",
             "checkpoints": [
@@ -89,7 +97,8 @@ def run_ai_duel(
         }
         (artifact_dir / "identity.json").write_text(json.dumps(identity, indent=2), encoding="utf-8")
         native.set_speed(speed)
-        native.resume()
+        # Exact advancement keeps both recurrent policies on the trained 5-tick
+        # cadence even when CPU inference takes longer than a real-time turn.
         (artifact_dir / "ready.json").write_text(json.dumps(identity), encoding="utf-8")
         with (artifact_dir / "decisions.jsonl").open("w", encoding="utf-8", buffering=1) as log:
             while not (artifact_dir / "stop").exists() and not terminated and not truncated:
@@ -103,7 +112,10 @@ def run_ai_duel(
                     forced = force_path.exists()
                     if forced:
                         force_path.unlink(missing_ok=True)
+                    started = time.perf_counter()
                     decision = sessions[owner].decide(observation, force_act=forced)
+                    decision_ms = (time.perf_counter() - started) * 1000
+                    inference_totals[owner] += decision_ms
                     selected = tuple(_rendered_action(action) for action in decision.decoded.actions)
                     commands[owner] = selected or commands[owner]
                     count = sum(action.kind == ActionKind.PLAY_CARD for action in selected)
@@ -118,12 +130,18 @@ def run_ai_duel(
                                 "owner": owner,
                                 "forced": forced,
                                 "inference_ms": decision.inference_ms,
+                                "decision_ms": decision_ms,
+                                "elixir": next(p.elixir_exact for p in observation.players if p.owner == owner),
                                 "actions": [action.to_dict() for action in commands[owner]],
                             }
                         )
                         + "\n"
                     )
                 observations, rewards, terms, truncs, info = environment.step(commands, record_trace=False)
+                for observation in observations.values():
+                    for event in getattr(observation, "events", ()):
+                        if event.event_type == "action_rejected":
+                            rejected_events.add(json.dumps(event.to_dict(), sort_keys=True))
                 terminated = bool(terms.get("__all__", all(terms.values())))
                 truncated = bool(truncs.get("__all__", all(truncs.values())))
                 result = {"tick": observations[0].tick, "rewards": rewards, "info": info}
@@ -134,9 +152,17 @@ def run_ai_duel(
             decisions=decisions,
             model_actions=actions,
             forced_plays=forced_actions,
+            rejected_actions=len(rejected_events),
+            mean_decision_ms=[inference_totals[o] / max(decisions[o], 1) for o in (0, 1)],
         )
         (artifact_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
+    except Exception as error:
+        (artifact_dir / "result.json").write_text(
+            json.dumps({"error": str(error), "error_type": type(error).__name__,
+                        "terminated": False, "decisions": decisions}, indent=2), encoding="utf-8"
+        )
+        raise
     finally:
         for session in sessions:
             session.end_episode()

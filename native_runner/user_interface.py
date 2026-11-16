@@ -30,6 +30,8 @@ from .paths import REPOSITORY_ROOT, WORKSPACE_ROOT
 from .card_names import CARD_NAMES
 from .contracts import COMPETITIVE_TOWER_TROOP_IDS
 from .local_config import setting
+from .duel_modes import DUEL_MODES, resolve_duel_mode, validate_mode_towers
+from .visual_deck import VisualDeckMixin, scrollable_tab
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 MUMU_MANAGER = Path(setting("CR_MUMU_MANAGER", "MuMuManager.exe"))
@@ -61,6 +63,9 @@ TOWER_TROOP_OPTIONS = (
 TOWER_TROOP_BY_NAME = dict(TOWER_TROOP_OPTIONS)
 TOWER_TROOP_BY_ID = {card_id: name for name, card_id in TOWER_TROOP_OPTIONS}
 
+DUEL_GAME_MODES = tuple((mode.name, mode.game_mode) for mode in DUEL_MODES)
+DUEL_GAME_MODE_BY_NAME = dict(DUEL_GAME_MODES)
+
 
 def validate_model_deck_roles(forms: Sequence[int]) -> None:
     """Reject model form selections that exceed the loaded V4 input contract."""
@@ -76,6 +81,90 @@ def validate_model_deck_roles(forms: Sequence[int]) -> None:
             "请把多余的形态改为“基础”后再开始。"
         )
 
+
+@dataclass(frozen=True, slots=True)
+class BuiltinDeck:
+    name: str
+    deck: tuple[int, ...]
+    forms: tuple[int, ...]
+    tower_troop_id: int = 159_000_000
+    description: str = ""
+
+
+# 预设现代天梯高胜率卡组（15 版本 / 觉醒时代热门主流体系）
+BUILTIN_DECKS = (
+    BuiltinDeck(
+        "2.6 经典速猪 (觉醒加农炮+小骷髅)",
+        (26000021, 28000000, 28000011, 27000000, 26000014, 26000030, 26000038, 26000010),
+        (0, 0, 0, 1, 0, 0, 0, 1),
+        159_000_000,
+        "天梯常青树极速过牌防反，觉醒加农炮高额输出 + 觉醒小骷髅无限分裂防守",
+    ),
+    BuiltinDeck(
+        "皮卡攻城槌 (觉醒皮卡+攻城槌)",
+        (26000004, 26000036, 26000050, 26000093, 26000046, 26000042, 28000008, 28000009),
+        (1, 1, 0, 0, 0, 0, 0, 0),
+        159_000_000,
+        "强力桥头压制，觉醒大皮卡击杀吸血回血 + 觉醒攻城槌弹飞防守单位强撞破塔",
+    ),
+    BuiltinDeck(
+        "皇家巨人速转 (觉醒家驹+猎人)",
+        (26000024, 26000061, 26000044, 26000010, 26000030, 28000000, 28000011, 26000050),
+        (1, 0, 1, 0, 0, 0, 0, 0),
+        159_000_000,
+        "顶级稳定推进体系，觉醒家驹自带开炮震退击飞，渔夫猎人铜墙铁壁反制大单位",
+    ),
+    BuiltinDeck(
+        "钻头迫击炮 (觉醒钻机+迫击炮)",
+        (27000013, 27000002, 26000000, 26000040, 26000010, 28000009, 28000011, 26000064),
+        (1, 1, 0, 0, 0, 0, 0, 0),
+        159_000_001,
+        "双进攻核心骚扰消耗流，觉醒钻机地下突袭 + 觉醒迫击炮发射哥布林持续压制",
+    ),
+    BuiltinDeck(
+        "经典龙骑毒墓 (觉醒骑士+飞龙宝宝)",
+        (28000010, 28000009, 26000000, 26000015, 26000039, 27000009, 28000015, 28000012),
+        (0, 0, 1, 1, 0, 0, 0, 0),
+        159_000_000,
+        "控制防守反击天花板，觉醒骑士减伤承伤 + 觉醒飞龙大范围清场，反手毒药墓园致命破塔",
+    ),
+    BuiltinDeck(
+        "超骑攻城炸弹人 (觉醒超骑+炸弹人)",
+        (26000055, 26000058, 26000032, 26000049, 26000040, 26000041, 28000008, 28000000),
+        (1, 1, 0, 0, 0, 0, 0, 0),
+        159_000_002,
+        "极强压制与极限抢血，觉醒超骑上勾拳抓人击飞 + 觉醒双炸弹人二次爆破轰击",
+    ),
+    BuiltinDeck(
+        "雷电巨人牢笼 (觉醒牢笼+飞龙宝宝)",
+        (26000085, 27000012, 26000035, 26000042, 26000015, 28000007, 28000012, 28000015),
+        (0, 1, 0, 0, 1, 0, 0, 0),
+        159_000_000,
+        "稳健重装推进，觉醒牢笼反手硬汉搏击，雷电巨人配合大电飓风粉碎一切防守人海",
+    ),
+    BuiltinDeck(
+        "皇家卫队双猪流 (觉醒卫队+皇家野猪)",
+        (26000047, 26000059, 27000012, 26000064, 26000002, 26000057, 28000001, 28000011),
+        (1, 1, 0, 0, 0, 0, 0, 0),
+        159_000_001,
+        "双路分推大师，觉醒卫队全图横排推线附带冲锋伤害，觉醒皇家野猪分路高额偷塔",
+    ),
+    BuiltinDeck(
+        "经典自闭飞桶 (觉醒飞桶+女武神)",
+        (28000004, 26000026, 26000040, 26000041, 26000011, 27000006, 28000011, 28000003),
+        (1, 0, 0, 0, 1, 0, 0, 0),
+        159_000_000,
+        "法术诱导自闭流鼻祖，觉醒飞桶真假假分身迷惑对手，觉醒女武神旋风引力聚怪防守",
+    ),
+    BuiltinDeck(
+        "狂暴精锐突袭 (觉醒精锐+攻城槌)",
+        (26000043, 26000036, 26000035, 26000042, 26000049, 28000002, 28000001, 26000038),
+        (1, 1, 0, 0, 0, 0, 0, 0),
+        159_000_000,
+        "极致暴力肉搏冲锋，觉醒精锐狂战横扫 + 觉醒攻城槌强力击退，一波狂暴直接推平",
+    ),
+)
+BUILTIN_DECK_BY_NAME = {d.name: d for d in BUILTIN_DECKS}
 
 SPEED_XBOW_DECK = (27000008, 26000000, 26000001, 27000006, 26000010, 26000084, 28000000, 28000011)
 SPEED_XBOW_FORMS = (0, 2, 1, 1, 0, 0, 0, 0)
@@ -767,7 +856,7 @@ def load_replay_entries(directory: Path) -> tuple[ReplayEntry, ...]:
     return tuple(output)
 
 
-class DeckEditor:
+class DeckEditor(VisualDeckMixin):
     def __init__(
         self, parent: Any, *, title: str, options: Sequence[CardOption],
         on_save: Callable[[DeckEditor], None], on_load: Callable[[DeckEditor], None],
@@ -780,8 +869,21 @@ class DeckEditor:
         self.by_display = {item.display: item for item in self.options}
         self.by_id = {item.card_id: item for item in self.options}
         self.frame = ttk.LabelFrame(parent, text=title, padding=10)
+
+        preset_row = ttk.Frame(self.frame)
+        preset_row.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        ttk.Label(preset_row, text="内置卡组").pack(side="left", padx=(0, 6))
+        self.preset_deck_var = tk.StringVar(value="")
+        self.preset_deck_box = ttk.Combobox(
+            preset_row, textvariable=self.preset_deck_var, state="readonly", width=24,
+            values=tuple(preset.name for preset in BUILTIN_DECKS),
+        )
+        self.preset_deck_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.preset_deck_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_builtin_preset())
+        ttk.Button(preset_row, text="应用", command=self._apply_builtin_preset).pack(side="left", padx=(0, 4))
+
         saved = ttk.Frame(self.frame)
-        saved.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        saved.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 6))
         ttk.Label(saved, text="自定义牌组").pack(side="left", padx=(0, 6))
         self.saved_deck_var = tk.StringVar()
         self.saved_deck_box = ttk.Combobox(saved, textvariable=self.saved_deck_var, state="readonly", width=17)
@@ -789,69 +891,27 @@ class DeckEditor:
         for label, command in (("载入", on_load), ("保存", on_save), ("删除", on_delete)):
             ttk.Button(saved, text=label, command=lambda action=command: action(self)).pack(side="left", padx=(0, 4))
         tower = ttk.Frame(self.frame)
-        tower.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        tower.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 6))
         ttk.Label(tower, text="塔楼兵种").pack(side="left", padx=(0, 8))
         self.tower_troop_var = tk.StringVar(value=TOWER_TROOP_OPTIONS[0][0])
-        ttk.Combobox(
+        self.tower_box = ttk.Combobox(
             tower, textvariable=self.tower_troop_var,
             values=tuple(name for name, _card_id in TOWER_TROOP_OPTIONS),
             state="readonly", width=27,
-        ).pack(side="left", fill="x", expand=True)
-        for column, label in enumerate(("槽位", "卡牌", "形态")):
-            ttk.Label(self.frame, text=label, style="Muted.TLabel").grid(
-                row=2, column=column, padx=(0, 8 if column < 2 else 0), sticky="w"
-            )
-        self.card_vars: list[Any] = []
-        self.card_boxes: list[Any] = []
-        self.selected_cards = [""] * 8
-        self.form_vars: list[Any] = []
-        self.form_boxes: list[Any] = []
-        values = tuple(item.display for item in self.options)
-        for slot in range(8):
-            ttk.Label(self.frame, text=str(slot + 1)).grid(row=slot + 3, column=0, padx=(0, 8), pady=3, sticky="e")
-            for column, choices, width, variables in (
-                (1, values, 31, self.card_vars),
-                (2, (FORM_BASE,), 14, self.form_vars),
-            ):
-                variable = tk.StringVar(value=FORM_BASE if column == 2 else "")
-                box = ttk.Combobox(
-                    self.frame, textvariable=variable, values=choices,
-                    state="normal" if column == 1 else "readonly", width=width,
-                )
-                box.grid(row=slot + 3, column=column, padx=(0, 8 if column == 1 else 0), pady=3, sticky="ew")
-                variables.append(variable)
-                if column == 1:
-                    self.card_boxes.append(box)
-                    variable.trace_add("write", lambda *_args, index=slot: self._filter_card(index))
-                    box.bind("<FocusIn>", lambda _event, widget=box: widget.selection_range(0, "end"))
-                    box.bind(
-                        "<FocusOut>",
-                        lambda _event, index=slot: self.frame.after_idle(lambda: self._restore_card(index)),
-                    )
-                    box.bind("<<ComboboxSelected>>", lambda _event, index=slot: self._card_changed(index))
-                else:
-                    self.form_boxes.append(box)
+        )
+        self.tower_box.pack(side="left", fill="x", expand=True)
+        self.tower_ids = dict(TOWER_TROOP_BY_NAME)
+        self.tower_preview = ttk.Button(tower, text="看图选择", compound="left", command=self.open_tower_palette)
+        self.tower_preview.pack(side="left", padx=4)
+        self._build_visual_slots(self.frame, 3)
+        self.tower_troop_var.trace_add("write", lambda *_: self.refresh_visuals())
         self.frame.columnconfigure(1, weight=1)
 
-    def _filter_card(self, index: int) -> None:
-        query = self.card_vars[index].get().strip().casefold()
-        if self.card_vars[index].get() in self.by_display:
-            query = ""
-        values = tuple(
-            item.display
-            for item in self.options
-            if not query or any(query in name.casefold() for name in CARD_NAMES[item.card_id])
-        )
-        self.card_boxes[index].configure(values=values)
-
-    def _restore_card(self, index: int) -> None:
-        focus = str(self.frame.tk.call("focus"))
-        if focus.startswith(f"{self.card_boxes[index]}.popdown"):
-            return
-        if self.card_vars[index].get() in self.by_display:
-            self._card_changed(index)
-        else:
-            self.card_vars[index].set(self.selected_cards[index])
+    def _apply_builtin_preset(self) -> None:
+        name = self.preset_deck_var.get()
+        preset = BUILTIN_DECK_BY_NAME.get(name)
+        if preset is not None:
+            self.set_deck(preset.deck, preset.forms, preset.tower_troop_id)
 
     def _card_changed(self, index: int) -> None:
         option = self.by_display.get(self.card_vars[index].get())
@@ -861,6 +921,7 @@ class DeckEditor:
         self.form_boxes[index].configure(values=forms)
         if self.form_vars[index].get() not in forms:
             self.form_vars[index].set(FORM_BASE)
+        self.refresh_visuals()
 
     def set_deck(self, deck: Sequence[int], forms: Sequence[int], tower_troop_id: int | None = None) -> None:
         if len(deck) != 8 or len(forms) != 8:
@@ -879,6 +940,17 @@ class DeckEditor:
             self.form_vars[index].set(form)
         if tower_troop_id is not None:
             self.tower_troop_var.set(TOWER_TROOP_BY_ID[tower_troop_id])
+        deck_tuple = tuple(int(c) for c in deck)
+        matched = False
+        for p in BUILTIN_DECKS:
+            if p.deck == deck_tuple:
+                self.preset_deck_var.set(p.name)
+                matched = True
+                break
+        if not matched:
+            self.preset_deck_var.set("")
+        self.refresh_visuals()
+        self._refresh_palette_if_open()
 
     def tower_troop_id(self) -> int:
         try:
@@ -902,6 +974,7 @@ class DeckEditor:
         if len(set(ids)) != 8:
             raise ValueError("同一方牌组不能包含重复卡牌")
         return ids, tuple(masks)
+
 
 
 class CRHarnessInterface:
@@ -977,14 +1050,14 @@ class CRHarnessInterface:
         self._build_header()
         notebook = ttk.Notebook(root)
         notebook.pack(fill=tk.BOTH, expand=True, padx=14, pady=(12, 8))
-        self.model_tab = ttk.Frame(notebook, padding=12)
-        self.duel_tab = ttk.Frame(notebook, padding=12)
-        self.match_tab = ttk.Frame(notebook, padding=12)
+        self.model_page, self.model_tab = scrollable_tab(notebook)
+        self.duel_page, self.duel_tab = scrollable_tab(notebook)
+        self.match_page, self.match_tab = scrollable_tab(notebook)
         self.replay_tab = ttk.Frame(notebook, padding=12)
         self.collected_replay_tab = ttk.Frame(notebook, padding=12)
-        notebook.add(self.model_tab, text="1  Human VS AI")
-        notebook.add(self.duel_tab, text="2  AI VS AI")
-        notebook.add(self.match_tab, text="3  手动 native 对局")
+        notebook.add(self.model_page, text="1  Human VS AI")
+        notebook.add(self.duel_page, text="2  AI VS AI")
+        notebook.add(self.match_page, text="3  手动 native 对局")
         notebook.add(self.replay_tab, text="4  训练回放")
         notebook.add(self.collected_replay_tab, text="5  采集回放")
         self._build_model_tab()
@@ -1110,7 +1183,27 @@ class CRHarnessInterface:
         self.refresh_model_checkpoints()
 
     def _build_duel_tab(self) -> None:
+        import tkinter as tk
         from tkinter import ttk
+
+        mode_row = self._row(self.duel_tab, "对战玩法与预设")
+        ttk.Label(mode_row, text="玩法模式：").pack(side="left")
+        self.duel_mode_box = self._input(
+            mode_row, "duel_game_mode", values=tuple(name for name, _ in DUEL_GAME_MODES), width=28
+        )
+        self.duel_mode_box.pack(side="left", padx=8)
+        self.duel_game_mode_var.set(DUEL_GAME_MODES[0][0])
+        self.duel_mode_box.bind("<<ComboboxSelected>>", lambda _event: self._duel_mode_changed())
+
+        ttk.Label(mode_row, text="双方卡组模板：").pack(side="left", padx=(10, 0))
+        self.duel_preset_var = tk.StringVar(value=MATCH_PRESETS[0].name)
+        self.duel_preset_box = ttk.Combobox(
+            mode_row, textvariable=self.duel_preset_var, values=tuple(p.name for p in MATCH_PRESETS),
+            state="readonly", width=30,
+        )
+        self.duel_preset_box.pack(side="left", padx=8)
+        ttk.Button(mode_row, text="套用模板", command=self.apply_duel_preset).pack(side="left", padx=4)
+        ttk.Button(mode_row, text="🎲 随机全觉醒卡组", command=self.randomize_duel_evolution_decks).pack(side="left", padx=4)
 
         checkpoints = self._row(self.duel_tab, "双方模型")
         for owner, label in enumerate(("上方 AI Checkpoint", "下方 AI Checkpoint")):
@@ -1144,6 +1237,52 @@ class CRHarnessInterface:
         ))
         self._status(self.duel_tab, "duel_status", "选择双方模型和卡组，然后开始对局。", fill="x", pady=(8, 0), align="w")
         self.refresh_duel_checkpoints()
+
+
+    def apply_duel_preset(self) -> None:
+        name = self.duel_preset_var.get()
+        for preset in MATCH_PRESETS:
+            if preset.name == name:
+                self.duel_deck0_editor.set_deck(preset.deck0, preset.forms0)
+                self.duel_deck1_editor.set_deck(preset.deck1, preset.forms1)
+                self._append_log(f"已为 AI 对局双方套用模板：{preset.name}")
+                break
+
+
+    def _duel_mode_changed(self) -> None:
+        try:
+            mode = resolve_duel_mode(self.duel_game_mode_var.get())
+        except ValueError as error:
+            self.duel_status_var.set(str(error))
+            return
+        for editor in (self.duel_deck0_editor, self.duel_deck1_editor):
+            editor.experimental = mode.evolutions
+            editor.disallowed_towers = {tower: "七倍玩法尚未验证皇家大厨，请选择其他塔兵。" for tower in mode.blocked_towers}
+            editor.tower_box.configure(values=tuple(name for name, tower in editor.tower_ids.items() if tower not in mode.blocked_towers))
+            if mode.evolutions and not mode.random_decks:
+                for i, variable in enumerate(editor.card_vars):
+                    option = editor.by_display.get(variable.get())
+                    if option and option.supports_evolution:
+                        editor.form_vars[i].set(FORM_EVOLUTION)
+            editor.refresh_visuals()
+        if mode.random_decks:
+            self.randomize_duel_evolution_decks()
+        self.duel_status_var.set(f"当前玩法：{mode.name}；卡组已显示，确认后点击开始。")
+
+
+    def randomize_duel_evolution_decks(self) -> None:
+        card_options = getattr(self, "card_options", None)
+        if not card_options:
+            card_options = load_card_options()
+        evo_options = [opt.card_id for opt in card_options if opt.supports_evolution]
+        if len(evo_options) < 8:
+            return
+        deck0 = tuple(secrets.SystemRandom().sample(evo_options, 8))
+        deck1 = tuple(secrets.SystemRandom().sample(evo_options, 8))
+        self.duel_deck0_editor.set_deck(deck0, (1,) * 8)
+        self.duel_deck1_editor.set_deck(deck1, (1,) * 8)
+        self._append_log("已为上方与下方 AI 各自随机抽取 8 张全觉醒卡牌组。")
+
 
     def refresh_duel_checkpoints(self) -> None:
         values = tuple(str(path) for path in discover_model_checkpoints())
@@ -1422,21 +1561,57 @@ class CRHarnessInterface:
                     raise FileNotFoundError(checkpoint)
             deck0, forms0 = self.duel_deck0_editor.values()
             deck1, forms1 = self.duel_deck1_editor.values()
-            validate_model_deck_roles(forms0)
-            validate_model_deck_roles(forms1)
+            selected_mode_name = self.duel_game_mode_var.get() if hasattr(self, "duel_game_mode_var") else DUEL_MODES[0].name
+            mode = resolve_duel_mode(selected_mode_name)
+            game_mode_id = mode.game_mode
+            is_7x = mode.random_decks
+            is_all_evo = mode.evolutions
+            if is_7x:
+                if forms0 != (1,) * 8 or forms1 != (1,) * 8:
+                    raise ValueError("请先点击随机全觉醒卡组，预览双方卡组后再开始。")
+            elif is_all_evo:
+                from .competitive_data import load_competitive_data
+                support_map = {
+                    int(r["card_id"]): int(r.get("form_availability", 0))
+                    for r in load_competitive_data("card_support")["supported_cards"]
+                }
+                forms0 = tuple(1 if (support_map.get(c, 0) & 1) else int(f) for c, f in zip(deck0, forms0))
+                forms1 = tuple(1 if (support_map.get(c, 0) & 1) else int(f) for c, f in zip(deck1, forms1))
+            else:
+                validate_model_deck_roles(forms0)
+                validate_model_deck_roles(forms1)
+            tower_troop0 = self.duel_deck0_editor.tower_troop_id()
+            tower_troop1 = self.duel_deck1_editor.tower_troop_id()
+            validate_mode_towers(mode, tower_troop0, tower_troop1)
             config = MatchConfig(
                 deck0=deck0, deck1=deck1,
                 deck0_form_availability=forms0, deck1_form_availability=forms1,
-                tower_troop0_id=self.duel_deck0_editor.tower_troop_id(),
-                tower_troop1_id=self.duel_deck1_editor.tower_troop_id(),
+                tower_troop0_id=tower_troop0,
+                tower_troop1_id=tower_troop1,
                 seed=_new_match_seed(), level_cap=11, minimum_card_level=11, king_tower_level=11,
                 owner0_name="AI-0", owner1_name="AI-1",
+                game_mode=game_mode_id,
+                arena=54000001,
+                location=15000199,
             )
         except (ValueError, OSError) as error:
             self._show_error(error)
             return
+        if mode.evolutions:
+            self._append_log("实验玩法：V4 静态特征最多标记两张觉醒、两张英雄，合计三张；超出部分会投影为普通角色，AI 策略可能下降。觉醒仍遵循卡牌循环规则。")
+        self._append_log(f"本局规则：{mode.name} · 上方 {deck0} / 形态 {forms0} · 下方 {deck1} / 形态 {forms1}")
         if not self._confirm_replace_owned_session("AI 对局") or not self._check_operation_conflicts():
             return
+        if mode.evolutions:
+            try:
+                for editor, deck, forms in (
+                    (self.duel_deck0_editor, deck0, forms0), (self.duel_deck1_editor, deck1, forms1)
+                ):
+                    if hasattr(editor, "set_deck"):
+                        editor.set_deck(deck, forms)
+            except ValueError as error:
+                self._show_error(error)
+                return
         self.stop_replay()
         self._terminate_overlay()
         self.model_match_kind = "duel"
@@ -1477,6 +1652,8 @@ class CRHarnessInterface:
             self._after_model_stopped()
 
         self._background("offline-duel", run, lambda result: self._model_finished(*result), failed)
+
+
 
     def start_model_match(self) -> None:
         from .match_factory import MatchConfig
@@ -1591,11 +1768,17 @@ class CRHarnessInterface:
             decisions = result.get("decisions", 0)
             status.set(f"{label} · 模型决策 {sum(decisions) if isinstance(decisions, list) else decisions} 次")
         else:
-            status.set(
-                f"模型进程已退出（exit={exit_code}），日志：{self.model_artifact_dir / 'console.log'}"
-            )
+            detail = ""
+            if result_path.is_file():
+                try:
+                    detail = json.loads(result_path.read_text(encoding="utf-8")).get("error", "")
+                except (ValueError, OSError):
+                    pass
+            status.set(f"对局失败（exit={exit_code}）：{detail or '请查看控制台日志'}")
+            self._append_log(f"对局失败：{detail}；日志：{self.model_artifact_dir / 'console.log'}")
 
         self._after_model_stopped()
+
 
     def _after_model_stopped(self) -> None:
         callback, self.model_after_stop = self.model_after_stop, None

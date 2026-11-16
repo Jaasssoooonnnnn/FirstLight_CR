@@ -102,6 +102,24 @@ class _FakeModel:
         return SimpleNamespace(actions=self.actions, next_state=f"state-{len(self.calls)}", value=torch.tensor([0.25]))
 
 
+def test_warmup_discards_recurrent_state_and_action_history(monkeypatch):
+    tensorizer = _FakeTensorizer()
+    model = _FakeModel()
+    monkeypatch.setattr(
+        "native_runner.training.v4.policy_session.decode_action_sequence_v4",
+        lambda *a, **k: DecodedActionSequenceV4(owner=0),
+    )
+    session = PolicySessionV4(model, tensorizer, device="cpu")
+    observation = _observation()
+    elixir = {0: 6.0, 1: 6.0}
+    session.start_episode(observation, initial_elixir=elixir)
+    session.warmup(observation, initial_elixir=elixir)
+    assert tensorizer.ended == 1
+    assert session.state == "state-0"
+    session.decide(observation)
+    assert model.calls == [("state-0", True, False), ("state-0", True, False)]
+
+
 def test_offline_session_keeps_lstm_actions_and_ability_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
     tensorizer = _FakeTensorizer()
     model = _FakeModel()
