@@ -2589,10 +2589,19 @@ class BattleEnvV1:
                 x, y = self._world_target(action)
                 execute_in = max(1, action.execute_offset_ticks or 1)
                 hand_action = HandAction(action.owner, action.hand_slot, x, y)
-                if (
+                immediate_model_play = (
                     action.metadata.get("model_delay_ignored") is True
                     and self.episode_config.render_mode == "native-render"
-                ):
+                )
+                if immediate_model_play and self._synchronize_native_render_steps:
+                    # Synchronized native-render steps own the stock renderer's
+                    # pause gate: it must stay closed between exact
+                    # ``advance-native`` calls.  The live helper below briefly
+                    # pauses and then resumes, which would release that gate and
+                    # make the next synchronized advance fail, so queue the play
+                    # on the frozen clock without touching the gate.
+                    queued = self.native.queue_hand_action_at(hand_action, execute_in_ticks=execute_in)
+                elif immediate_model_play:
                     queued = self.native.queue_hand_action_next_tick(hand_action)
                 elif action.metadata.get("native_command_age_ticks") is not None:
                     # The renderer continues during inference.  Policy offsets

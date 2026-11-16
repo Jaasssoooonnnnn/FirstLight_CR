@@ -57,7 +57,10 @@ role projection and now emit an explicit warning. Their strategy is experimental
 changing a mode ID cannot remove that training limitation.
 
 AI-versus-AI duels warm up while paused, reset policy state, then advance exactly
-five ticks between decisions. This avoids CPU inference causing different game
+five ticks between decisions. Model plays in synchronized episodes queue on the
+frozen clock without resuming the renderer. The live next-tick helper restores
+the original running/paused state, including when injection fails.
+This avoids CPU inference causing different game
 times for the two actors. On slow hardware playback may run slower than real time.
 Decision logs include full decision latency and elixir; results include action
 rejections and mean decision latency. Engine failures write their cause into

@@ -28,7 +28,7 @@ from native_runner.contracts import (
     ActionV1,
     ObservationTier,
 )
-from native_runner.cr_native_env import FIRST_PLAYABLE_TICK, HandAction
+from native_runner.cr_native_env import FIRST_PLAYABLE_TICK, HandAction, RunnerError
 from native_runner.match_factory import MatchConfig
 from native_runner.semantic_subset import SEMANTIC_BASELINE_DECK
 from native_runner.timeline import load_game_mode_timeline
@@ -279,6 +279,84 @@ class FakeNativeEnv:
         return self.observe()
 
 
+class SynchronizedFakeNativeEnv(FakeNativeEnv):
+    """FakeNativeEnv that also models the stock renderer's pause gate.
+
+    ``advance_native_render`` refuses to move the clock while the gate is open,
+    exactly like the probe, so a released gate surfaces as a failure instead of
+    a silent clock drift.
+    """
+
+    def __init__(self, *, paused: bool = True) -> None:
+        super().__init__()
+        self.paused = paused
+        self.pause_calls = 0
+        self.resume_calls = 0
+        self.advance_calls: list[int] = []
+        self.next_tick_plays: list[HandAction] = []
+
+    def pause(self) -> dict[str, Any]:
+        self.pause_calls += 1
+        self.paused = True
+        return {"ok": True, "mode": "native-render", "paused": True, "tick": int(self.state["tick"])}
+
+    def resume(self) -> dict[str, Any]:
+        self.resume_calls += 1
+        self.paused = False
+        return {"ok": True, "mode": "native-render", "paused": False, "tick": int(self.state["tick"])}
+
+    def status(self) -> dict[str, Any]:
+        return {"ok": True, "mode": "native-render", "paused": self.paused, "tick": int(self.state["tick"])}
+
+    def observe(self) -> dict[str, Any]:
+        # A running stock renderer keeps its own clock; a paused one is frozen.
+        if not self.paused and self.state:
+            self._advance_clock(1)
+        return super().observe()
+
+    def _advance_clock(self, ticks: int) -> None:
+        """Mutate the fake world exactly like ``FakeNativeEnv.step`` does."""
+
+        self.state = copy.deepcopy(self.state)
+        old_tick = int(self.state["tick"])
+        new_tick = old_tick + int(ticks)
+        self.state["tick"] = new_tick
+        self._apply_queued(old_tick, new_tick)
+        if self.step_mutators:
+            self.step_mutators.pop(0)(self.state, old_tick, new_tick)
+        self.state["count"] = len(self.state["objects"])
+        self.state["returned"] = len(self.state["objects"])
+
+    def queue_hand_action_next_tick(self, action: HandAction) -> dict[str, Any]:
+        """Mirror the live helper's pause/resume behaviour exactly."""
+
+        self.next_tick_plays.append(action)
+        resume_after_queueing = not self.paused
+        if resume_after_queueing:
+            self.pause()
+        try:
+            return self.queue_hand_action_at(action, execute_in_ticks=1)
+        finally:
+            if resume_after_queueing:
+                self.resume()
+
+    def advance_native_render(self, ticks: int) -> dict[str, Any]:
+        if not self.paused:
+            raise RunnerError("native renderer must be idle and paused before synchronized advance")
+        self.advance_calls.append(int(ticks))
+        target_tick = int(self.state["tick"]) + int(ticks)
+        self._advance_clock(int(ticks))
+        return {
+            "ok": True,
+            "mode": "native-render",
+            "requestedTicks": int(ticks),
+            "targetTick": target_tick,
+            "tick": int(self.state["tick"]),
+            "ended": False,
+            "paused": True,
+        }
+
+
 
 
 @lru_cache(maxsize=1)
@@ -310,6 +388,34 @@ def _reset(env: BattleEnvV1, *, seed: int = 7):
         deck1=SEMANTIC_BASELINE_DECK,
         seed=seed,
     ))
+
+
+def _make_gated_env() -> tuple[BattleEnvV1, SynchronizedFakeNativeEnv]:
+    native = SynchronizedFakeNativeEnv()
+    env = BattleEnvV1(
+        native=native,  # type: ignore[arg-type]
+        card_catalog=_test_catalog(),
+        ruleset_id="a" * 64,
+        warmup_ticks=0,
+    )
+    return env, native
+
+
+def _reset_native_render(env: BattleEnvV1, *, synchronize: bool) -> None:
+    env.reset(
+        match_config=MatchConfig(
+            deck0=SEMANTIC_BASELINE_DECK,
+            deck1=SEMANTIC_BASELINE_DECK,
+            seed=7,
+        ),
+        options={
+            "render_mode": "native-render",
+            "pause_native_render": True,
+            "synchronize_native_render_steps": synchronize,
+            "decision_ticks": 5,
+            "event_driven_decisions": False,
+        },
+    )
 
 
 class ArenaCoordinateTests(unittest.TestCase):
@@ -785,6 +891,60 @@ class BattleEnvironmentTests(unittest.TestCase):
             [event.tick for event in env.observe(owner=0).events if event.event_type == "action_executed"],
             [decision_tick + 5],
         )
+
+    def test_synchronized_step_keeps_the_renderer_paused_for_model_plays(self) -> None:
+        from native_runner.training.v4.offline_agent import _rendered_action
+
+        env, native = _make_gated_env()
+        _reset_native_render(env, synchronize=True)
+        start_tick = int(env.raw_observation["tick"])
+        original_card = native.state["players"][0]["hand"][0]["cardId"]
+        play = _rendered_action(ActionV1.play(
+            owner=0,
+            hand_slot=0,
+            grid=(8, 10),
+            execute_offset_ticks=1,
+            next_decision_ticks=5,
+        ))
+
+        observations, _, _, _, _ = env.step({0: play, 1: ActionV1.wait(1, ticks=5)})
+
+        # A synchronized episode owns the stock renderer's pause gate.  Routing
+        # a model play through the live pause/resume helper would release it and
+        # abort the match with "native renderer must be idle and paused before
+        # synchronized advance", so the play must be queued on the frozen clock.
+        self.assertNotEqual(native.state["players"][0]["hand"][0]["cardId"], original_card)
+        self.assertEqual(native.queued, [])
+        self.assertEqual(native.next_tick_plays, [])
+        self.assertEqual(native.resume_calls, 0)
+        self.assertTrue(native.paused)
+        self.assertEqual(native.advance_calls, [5])
+        self.assertEqual(observations[0].tick, start_tick + 5)
+        observations, _, _, _, _ = env.step({0: ActionV1.wait(0, ticks=5), 1: ActionV1.wait(1, ticks=5)})
+        self.assertEqual(native.advance_calls, [5, 5])
+        self.assertEqual(observations[0].tick, start_tick + 10)
+        self.assertTrue(native.paused)
+
+    def test_live_native_render_step_keeps_using_the_pausing_helper(self) -> None:
+        from native_runner.training.v4.offline_agent import _rendered_action
+
+        env, native = _make_gated_env()
+        _reset_native_render(env, synchronize=False)
+        native.resume()
+        play = _rendered_action(ActionV1.play(
+            owner=0,
+            hand_slot=0,
+            grid=(8, 10),
+            execute_offset_ticks=1,
+            next_decision_ticks=5,
+        ))
+
+        env.step({0: play, 1: ActionV1.wait(1, ticks=5)})
+
+        # The live renderer keeps its own clock, so it keeps the helper that
+        # holds the gate closed only while the command is queued.
+        self.assertEqual(len(native.next_tick_plays), 1)
+        self.assertFalse(native.paused)
 
     def test_five_tick_offset_executes_before_next_policy_observation(self) -> None:
         env, native = _make_env()

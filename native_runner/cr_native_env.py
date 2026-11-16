@@ -2881,14 +2881,23 @@ class NativeClashEnv:
         return self._request(f"inject {payload}")
 
     def queue_hand_action_next_tick(self, action: HandAction) -> dict[str, Any]:
-        """Queue a model play for the next tick without a live-render clock race."""
+        """Queue a model play for the next tick without a live-render clock race.
+
+        The renderer is resumed only when this helper found it running.  A caller
+        that already holds it paused (exact synchronized stepping, for example)
+        keeps that gate closed, because releasing it would invalidate the next
+        ``advance-native`` boundary.
+        """
 
         with self._lock:
-            self.pause()
+            resume_after_queueing = not bool(self.status().get("paused"))
+            if resume_after_queueing:
+                self.pause()
             try:
                 return self.queue_hand_action_at(action, execute_in_ticks=1)
             finally:
-                self.resume()
+                if resume_after_queueing:
+                    self.resume()
 
     def queue_hand_action_at(
         self,
